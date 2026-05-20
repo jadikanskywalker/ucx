@@ -1,0 +1,11 @@
+#
+# Copyright (c) 2026. ALL RIGHTS RESERVED.
+#
+# See file LICENSE for terms.
+#
+
+Name: @PACKAGE@-cxi
+Description: Unified Communication X Library CXI module
+Version: @VERSION@
+Libs:
+Libs.private:

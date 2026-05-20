@@ -6,6 +6,7 @@
 
 uct_modules=""
 m4_include([src/uct/cuda/configure.m4])
+m4_include([src/uct/cxi/configure.m4])
 m4_include([src/uct/ib/configure.m4])
 m4_include([src/uct/rocm/configure.m4])
 m4_include([src/uct/sm/configure.m4])

@@ -264,6 +264,14 @@ gtest_SOURCES += \
 endif
 endif # HAVE_IB
 
+if HAVE_CXI
+gtest_SOURCES += \
+    uct/cxi/test_cxi_md.cc
+gtest_LDADD += \
+    $(top_builddir)/src/uct/cxi/libuct_cxi.la \
+    $(CXI_LIBS)
+endif # HAVE_CXI
+
 if HAVE_CUDA
 gtest_SOURCES += \
 	ucm/cuda_hooks.cc \
@@ -318,6 +326,7 @@ noinst_HEADERS = \
 	common/test_helpers.h \
 	common/test_perf.h \
 	\
+	uct/cxi/test_cxi_md.h \
 	uct/ib/test_rc.h \
 	uct/ib/ud_base.h \
 	uct/ib/test_ib.h \
