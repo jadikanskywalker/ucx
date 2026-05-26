@@ -8,12 +8,16 @@
 #include "cxi_device.h"
 
 #include <uct/base/uct_md.h>
+#include <ucs/memory/rcache.h>
 
 #include <libcxi/libcxi.h>
 
 
 typedef struct uct_cxi_md_config {
-    uct_md_config_t super;
+    uct_md_config_t          super;
+    ucs_ternary_auto_value_t enable_ats;    /**< Enable PCIe ATS scalable map */
+    ucs_ternary_auto_value_t enable_rcache; /**< Enable registration cache */
+    ucs_rcache_config_t      rcache;        /**< Registration cache config */
 } uct_cxi_md_config_t;
 
 
@@ -31,6 +35,9 @@ typedef struct uct_cxi_md {
     struct cxil_lni  *cxi_lni;    /**< LNI allocated for svc_id */
     uint32_t          svc_id;     /**< Service ID from SLINGSHOT_SVC_IDS */
     uint16_t          vni;        /**< VNI from SLINGSHOT_VNIS */
+    uint8_t           pid_bits;   /**< NIC PID width (cxil_dev->info.pid_bits) */
+    ucs_rcache_t     *rcache;     /**< Registration cache; NULL if disabled */
+    struct cxi_md    *ats_md;    /**< Scalable ATS mapping; NULL if ATS disabled */
 } uct_cxi_md_t;
 
 
@@ -45,14 +52,28 @@ typedef struct uct_cxi_mem_handle {
 
 
 /**
+ * Registration cache region.  One is allocated per unique (page-aligned) VA
+ * range by the rcache infrastructure; mem_reg callbacks fill @a memh.  The
+ * embedded @a memh is handed to callers as uct_mem_h so the two structs have
+ * the same lifetime.
+ */
+typedef struct uct_cxi_rcache_region {
+    ucs_rcache_region_t  super; /**< Base class — must be first */
+    uct_cxi_mem_handle_t memh;  /**< Embedded handle exposed as uct_mem_h */
+} uct_cxi_rcache_region_t;
+
+
+/**
  * Remote key packed by mkey_pack and unpacked by rkey_unpack.
- * Contains enough information to address a DMA target: the peer's NIC
- * address, the IOVA of the registered buffer, and the LAC tag.
+ *
+ * In restricted-mode DMA the initiator drives the memory access entirely:
+ * routing uses {nid, pid, ptn} from the connected EP's device_addr and
+ * iface_addr; the memory itself is addressed by {iova, lac} from the rkey.
+ * nid is not packed here — the EP already has it from device_addr.
  */
 typedef struct uct_cxi_rkey {
-    uint32_t nid;  /**< Peer NIC address */
-    uint64_t iova; /**< Base IOVA in the peer's address space */
-    uint8_t  lac;  /**< Memory access class from the peer's cxi_md */
+    uint64_t iova; /**< Base IOVA of the registered region (from cxil_map) */
+    uint8_t  lac;  /**< Logical Address Context (memory access class) */
 } UCS_S_PACKED uct_cxi_rkey_t;
 
 

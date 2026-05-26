@@ -8,7 +8,7 @@
  *   query_md_resources  — enumerate physical CXI devices
  *   md_open             — open device, validate service, alloc LNI
  *   mem_reg             — cxil_map (pin pages, get IOVA + LAC)
- *   mkey_pack           — serialize {nid, iova, lac} for remote peer
+ *   mkey_pack           — serialize {iova, lac} for remote peer
  *   mem_dereg           — cxil_unmap
  *   md_close            — destroy LNI, close device
  */
@@ -27,14 +27,39 @@
 #include <ucs/sys/sys.h>
 #include <ucs/type/status.h>
 
+#include <ucm/api/ucm.h>
+
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
 
 static ucs_config_field_t uct_cxi_md_config_table[] = {
-    {"", "", NULL, ucs_offsetof(uct_cxi_md_config_t, super),
+    {"", "", NULL,
+     ucs_offsetof(uct_cxi_md_config_t, super),
      UCS_CONFIG_TYPE_TABLE(uct_md_config_table)},
+
+    {"ATS", "no",
+     "Enable PCIe ATS scalable memory mapping.\n"
+     "  yes: require ATS (fail md_open if hardware does not support it)\n"
+     "  no:  disable ATS (use pinned registration)\n"
+     "  try: use ATS if hardware supports it, fall back silently otherwise\n"
+     "Requires AMD IOMMU enabled in the kernel; defaults to no on COSMOS.",
+     ucs_offsetof(uct_cxi_md_config_t, enable_ats),
+     UCS_CONFIG_TYPE_TERNARY},
+
+    {"RCACHE", "try",
+     "Enable memory registration cache.\n"
+     "  yes: require cache (fail md_open if unavailable)\n"
+     "  no:  disable cache (every mem_reg calls cxil_map directly)\n"
+     "  try: enable if possible, fall back silently otherwise",
+     ucs_offsetof(uct_cxi_md_config_t, enable_rcache),
+     UCS_CONFIG_TYPE_TERNARY},
+
+    {"", "", NULL,
+     ucs_offsetof(uct_cxi_md_config_t, rcache),
+     UCS_CONFIG_TYPE_TABLE(ucs_config_rcache_table)},
+
     {NULL}
 };
 
@@ -178,8 +203,7 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
         return uct_md_query_empty_md_resource(resources_p, num_resources_p);
     }
 
-    resources = ucs_calloc(dev_list->count, sizeof(*resources),
-                           "cxi md resources");
+    resources = ucs_calloc(dev_list->count, sizeof(*resources), "cxi md resources");
     if (resources == NULL) {
         cxil_free_device_list(dev_list);
         return UCS_ERR_NO_MEMORY;
@@ -197,7 +221,7 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
     cxil_free_device_list(dev_list);
 
     *resources_p     = resources;
-    *num_resources_p = dev_list->count;
+    *num_resources_p = i;
     return UCS_OK;
 }
 
@@ -231,6 +255,20 @@ void uct_cxi_md_close(uct_md_h mdh)
     ucs_debug("cxi md close device %s lni_id %u",
               md->device.name, md->cxi_lni->id);
 
+    /* Release ATS scalable mapping before the LNI (cxil_unmap needs live LNI). */
+    if (md->ats_md != NULL) {
+        ret = cxil_unmap(md->ats_md);
+        if (ret != 0) {
+            ucs_warn("cxi ATS cxil_unmap failed: %s", strerror(-ret));
+        }
+    }
+
+    /* Destroy the rcache before the LNI: the eviction callback calls
+     * cxil_unmap, which requires a live LNI handle. */
+    if (md->rcache != NULL) {
+        ucs_rcache_destroy(md->rcache);
+    }
+
     ret = cxil_destroy_lni(md->cxi_lni);
     if (ret != 0) {
         ucs_warn("cxil_destroy_lni failed: %s", strerror(-ret));
@@ -248,60 +286,191 @@ void uct_cxi_md_close(uct_md_h mdh)
  */
 
 /*
- * uct_cxi_md_mem_reg - pin host memory and obtain a libcxi memory descriptor.
+ * uct_cxi_do_map - call cxil_map and fill a mem handle.
  *
- * cxil_map() pins the pages, programs the NIC's ATU, and returns a
- * struct cxi_md containing:
+ * Shared by the direct registration path (uct_cxi_md_mem_reg) and the
+ * rcache miss callback (uct_cxi_rcache_mem_reg_cb).  Both paths produce a
+ * uct_cxi_mem_handle_t with a valid cxi_md; only the allocation strategy
+ * differs (ucs_malloc vs embedded in the rcache region).
+ *
+ * cxil_map() pins the pages, programs the NIC's ATU, and fills cxi_md with:
  *   .iova  — NIC-visible base address (used in DMA descriptors)
- *   .lac   — memory access class tag (must accompany every DMA reference)
- *   .len   — length of the mapping
+ *   .lac   — memory access class (shared across all same-page-size mappings)
+ *   .len   — page-aligned length of the mapping
  *
  * CXI_MAP_PIN ensures physical page pinning (required for DMA).
  * CXI_MAP_READ | CXI_MAP_WRITE grants bidirectional NIC access.
  */
+static ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
+                                   size_t length, uct_cxi_mem_handle_t *mh)
+{
+    int flags = CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE;
+    int ret;
+
+    ret = cxil_map(lni, address, length, flags, NULL, &mh->cxi_md);
+    if (ret != 0) {
+        ucs_error("cxi cxil_map lni_id %u addr %p len %zu failed: %s",
+                  lni->id, address, length, strerror(-ret));
+        return UCS_ERR_IO_ERROR;
+    }
+
+    ucs_debug("cxi map addr %p len %zu iova 0x%"PRIx64" lac %u",
+              address, length, (uint64_t)mh->cxi_md->iova,
+              (unsigned)mh->cxi_md->lac);
+    return UCS_OK;
+}
+
+/* Counterpart to uct_cxi_do_map — shared by direct and rcache paths. */
+static void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh)
+{
+    int ret = cxil_unmap(mh->cxi_md);
+    if (ret != 0) {
+        ucs_warn("cxi cxil_unmap failed: %s", strerror(-ret));
+    }
+}
+
+/* Direct (non-cached) path: allocate a handle, call cxil_map. */
 static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
                                        size_t length,
                                        const uct_md_mem_reg_params_t *params,
                                        uct_mem_h *memh_p)
 {
-    uct_cxi_md_t          *md = ucs_derived_of(mdh, uct_cxi_md_t);
-    uct_cxi_mem_handle_t  *mh;
-    int                    flags = CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE;
-    int                    ret;
+    uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    uct_cxi_mem_handle_t *mh;
+    ucs_status_t          status;
 
     mh = ucs_malloc(sizeof(*mh), "uct_cxi_mem_handle");
     if (mh == NULL) {
         return UCS_ERR_NO_MEMORY;
     }
 
-    ret = cxil_map(md->cxi_lni, address, length, flags, NULL, &mh->cxi_md);
-    if (ret != 0) {
-        ucs_error("cxil_map lni_id %u addr %p len %zu failed: %s",
-                  md->cxi_lni->id, address, length, strerror(-ret));
+    status = uct_cxi_do_map(md->cxi_lni, address, length, mh);
+    if (status != UCS_OK) {
         ucs_free(mh);
-        return UCS_ERR_IO_ERROR;
+        return status;
     }
-
-    ucs_debug("cxi mem reg addr %p len %zu iova 0x%"PRIx64" lac %u",
-              address, length, (uint64_t)mh->cxi_md->iova,
-              (unsigned)mh->cxi_md->lac);
 
     *memh_p = mh;
     return UCS_OK;
 }
 
+/* Direct (non-cached) path: call cxil_unmap and free the handle. */
 static ucs_status_t
 uct_cxi_md_mem_dereg(uct_md_h mdh, const uct_md_mem_dereg_params_t *params)
 {
     uct_cxi_mem_handle_t *mh = params->memh;
-    int                   ret;
 
-    ret = cxil_unmap(mh->cxi_md);
-    if (ret != 0) {
-        ucs_warn("cxil_unmap failed: %s", strerror(-ret));
+    UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+    uct_cxi_do_unmap(mh);
+    ucs_free(mh);
+    return UCS_OK;
+}
+
+
+/* -------------------------------------------------------------------------
+ * Registration cache — callbacks, ops table, user-facing wrappers
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * Cache miss: the rcache calls this to create a new entry for a VA range it
+ * has not seen before.  The region struct is already allocated by the rcache;
+ * we only need to fill region->memh via cxil_map.  The rcache uses the
+ * page-aligned (start, end) rather than the caller's original (va, len) so
+ * that overlapping requests can share a single underlying mapping.
+ */
+static ucs_status_t
+uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
+                          void *arg, ucs_rcache_region_t *rregion,
+                          uint16_t rcache_mem_reg_flags)
+{
+    uct_cxi_md_t            *md     = context;
+    uct_cxi_rcache_region_t *region = ucs_derived_of(rregion,
+                                                     uct_cxi_rcache_region_t);
+
+    return uct_cxi_do_map(md->cxi_lni,
+                          (void *)rregion->super.start,
+                          rregion->super.end - rregion->super.start,
+                          &region->memh);
+}
+
+/*
+ * Cache eviction: called when the region's refcount drops to zero and the
+ * entry is removed from the page table.  Must release the cxil mapping
+ * before the region struct is freed by the rcache.
+ */
+static void
+uct_cxi_rcache_mem_dereg_cb(void *context, ucs_rcache_t *rcache,
+                            ucs_rcache_region_t *rregion)
+{
+    uct_cxi_rcache_region_t *region = ucs_derived_of(rregion,
+                                                     uct_cxi_rcache_region_t);
+    uct_cxi_do_unmap(&region->memh);
+}
+
+static void
+uct_cxi_rcache_dump_region_cb(void *context, ucs_rcache_t *rcache,
+                              ucs_rcache_region_t *rregion, char *buf,
+                              size_t max)
+{
+    uct_cxi_rcache_region_t *region = ucs_derived_of(rregion,
+                                                     uct_cxi_rcache_region_t);
+    snprintf(buf, max, "iova 0x%"PRIx64" lac %u",
+             (uint64_t)region->memh.cxi_md->iova,
+             (unsigned)region->memh.cxi_md->lac);
+}
+
+static ucs_rcache_ops_t uct_cxi_rcache_ops = {
+    .mem_reg     = uct_cxi_rcache_mem_reg_cb,
+    .mem_dereg   = uct_cxi_rcache_mem_dereg_cb,
+    .merge       = (void *)ucs_empty_function,
+    .dump_region = uct_cxi_rcache_dump_region_cb
+};
+
+/*
+ * Cached mem_reg: look up (or create) a cache entry for the requested range.
+ * On a cache hit the reference count of the existing region is incremented and
+ * no cxil_map call is made.  The returned uct_mem_h points directly into the
+ * region struct and is valid as long as the caller holds its reference.
+ */
+static ucs_status_t
+uct_cxi_md_mem_rcache_reg(uct_md_h uct_md, void *address, size_t length,
+                          const uct_md_mem_reg_params_t *params,
+                          uct_mem_h *memh_p)
+{
+    uct_cxi_md_t        *md = ucs_derived_of(uct_md, uct_cxi_md_t);
+    ucs_rcache_region_t *rregion;
+    ucs_status_t         status;
+
+    status = ucs_rcache_get(md->rcache, address, length,
+                            ucs_get_page_size(), PROT_READ | PROT_WRITE,
+                            NULL, &rregion);
+    if (status != UCS_OK) {
+        return status;
     }
 
-    ucs_free(mh);
+    ucs_assert(rregion->refcount > 0);
+    *memh_p = &ucs_derived_of(rregion, uct_cxi_rcache_region_t)->memh;
+    return UCS_OK;
+}
+
+/*
+ * Cached mem_dereg: release the caller's reference.  The cxil_unmap is
+ * deferred until all references (user + cache's own page-table entry) are
+ * dropped, at which point the rcache calls uct_cxi_rcache_mem_dereg_cb.
+ */
+static ucs_status_t
+uct_cxi_md_mem_rcache_dereg(uct_md_h uct_md,
+                            const uct_md_mem_dereg_params_t *params)
+{
+    uct_cxi_md_t            *md     = ucs_derived_of(uct_md, uct_cxi_md_t);
+    uct_cxi_mem_handle_t    *mh     = params->memh;
+    uct_cxi_rcache_region_t *region;
+
+    UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+
+    region = ucs_container_of(mh, uct_cxi_rcache_region_t, memh);
+    ucs_rcache_region_put(md->rcache, &region->super);
     return UCS_OK;
 }
 
@@ -312,33 +481,27 @@ uct_cxi_md_mem_dereg(uct_md_h mdh, const uct_md_mem_dereg_params_t *params)
  */
 
 /*
- * uct_cxi_md_mkey_pack - serialize enough information for a remote peer to
- * DMA into/from this buffer.
+ * uct_cxi_md_mkey_pack - serialize the memory descriptor for restricted-mode
+ * DMA.
  *
- * The packed key contains:
- *   nid   — this NIC's address (peer uses it to route the DMA)
+ * The initiator EP has the peer's {nid, pid, ptn} from device_addr and
+ * iface_addr already; it needs only the memory-access fields from the rkey:
  *   iova  — NIC-visible base address of the registered region
- *   lac   — memory access class (must appear in every NIC DMA command that
- *            references this mapping)
- *
- * The peer stores this in a uct_cxi_rkey_t and uses CXI_VA_TO_IOVA() to
- * compute the exact target IOVA for a sub-region request.
+ *   lac   — Logical Address Context (page-table slot assigned by cxil_map)
  */
 static ucs_status_t
 uct_cxi_md_mkey_pack(uct_md_h mdh, uct_mem_h memh, void *address,
                      size_t length, const uct_md_mkey_pack_params_t *params,
                      void *mkey_buffer)
 {
-    uct_cxi_md_t          *md = ucs_derived_of(mdh, uct_cxi_md_t);
-    uct_cxi_mem_handle_t  *mh = memh;
+    uct_cxi_mem_handle_t  *mh   = memh;
     uct_cxi_rkey_t        *rkey = mkey_buffer;
 
-    rkey->nid  = md->device.nid;
     rkey->iova = mh->cxi_md->iova;
     rkey->lac  = mh->cxi_md->lac;
 
-    ucs_debug("cxi mkey pack nid 0x%x iova 0x%"PRIx64" lac %u",
-              rkey->nid, rkey->iova, (unsigned)rkey->lac);
+    ucs_debug("cxi mkey pack iova 0x%"PRIx64" lac %u",
+              rkey->iova, (unsigned)rkey->lac);
     return UCS_OK;
 }
 
@@ -358,8 +521,8 @@ static ucs_status_t uct_cxi_rkey_unpack(uct_component_h component,
     *rkey_p  = (uct_rkey_t)(uintptr_t)rkey;
     *handle_p = NULL;
 
-    ucs_debug("cxi rkey unpack nid 0x%x iova 0x%"PRIx64" lac %u",
-              rkey->nid, rkey->iova, (unsigned)rkey->lac);
+    ucs_debug("cxi rkey unpack iova 0x%"PRIx64" lac %u",
+              rkey->iova, (unsigned)rkey->lac);
     return UCS_OK;
 }
 
@@ -386,6 +549,119 @@ uct_cxi_md_detect_memory_type(uct_md_h md, const void *address, size_t length,
 
 
 /* -------------------------------------------------------------------------
+ * ATS (PCIe Address Translation Services) — capability probe, scalable
+ * init, and ops callbacks.
+ *
+ * ATS mode uses a single cxil_map over the full 48-bit VA space
+ * (CXI_MAP_ATS, no CXI_MAP_PIN).  The NIC translates VAs on-demand via
+ * the host IOMMU rather than pinning pages at registration time.
+ *
+ * Modeled on cxip_ats_check() and cxip_scalable_iomm_init() in
+ * libfabric's cxip_iomm.c.
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * uct_cxi_ats_check - probe whether this LNI's hardware supports ATS.
+ *
+ * Attempts to map a small stack variable with CXI_MAP_ATS|CXI_MAP_PIN
+ * (the probe flags used by libfabric).  A successful map + immediate unmap
+ * confirms ATS is available; failure means the kernel or firmware does not
+ * support it (returns 0 in that case).
+ */
+static int uct_cxi_ats_check(struct cxil_lni *lni)
+{
+    int            stack_var;
+    struct cxi_md *md;
+    int            ret;
+
+    ret = cxil_map(lni, &stack_var, sizeof(stack_var),
+                   CXI_MAP_READ | CXI_MAP_WRITE | CXI_MAP_ATS | CXI_MAP_PIN,
+                   NULL, &md);
+    if (ret != 0) {
+        ucs_debug("cxi PCIe ATS not supported: %s", strerror(-ret));
+        return 0;
+    }
+
+    cxil_unmap(md);
+    ucs_debug("cxi PCIe ATS supported");
+    return 1;
+}
+
+/*
+ * uct_cxi_ats_init - create the full-VA-space scalable ATS mapping.
+ *
+ * Maps VA 0 to 0xfffffffffffff000 with CXI_MAP_ATS (no CXI_MAP_PIN).
+ * The resulting cxi_md carries a single LAC that is valid for every
+ * subsequent mem_reg / mkey_pack call.  IOVA for a buffer at VA addr is:
+ *   rkey.iova = md->ats_md->iova + (uintptr_t)addr
+ */
+static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
+{
+    int ret;
+
+    ret = cxil_map(md->cxi_lni, 0, 0xfffffffffffff000,
+                   CXI_MAP_READ | CXI_MAP_WRITE | CXI_MAP_ATS,
+                   NULL, &md->ats_md);
+    if (ret != 0) {
+        ucs_error("cxi ATS scalable map failed: %s", strerror(-ret));
+        md->ats_md = NULL;
+        return UCS_ERR_IO_ERROR;
+    }
+
+    ucs_debug("cxi ATS scalable map iova 0x%"PRIx64" lac %u",
+              (uint64_t)md->ats_md->iova, (unsigned)md->ats_md->lac);
+    return UCS_OK;
+}
+
+/*
+ * ATS mem_reg: the scalable mapping already covers every VA.
+ * Return the shared ats_md pointer as a non-NULL sentinel handle so that
+ * UCT_MEM_HANDLE_NULL checks pass and mkey_pack can reach md->ats_md.
+ */
+static ucs_status_t
+uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
+                       const uct_md_mem_reg_params_t *params,
+                       uct_mem_h *memh_p)
+{
+    uct_cxi_md_t *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    *memh_p = md->ats_md;
+    return UCS_OK;
+}
+
+/* ATS mem_dereg: no per-buffer mapping to release. */
+static ucs_status_t
+uct_cxi_md_mem_ats_dereg(uct_md_h mdh,
+                         const uct_md_mem_dereg_params_t *params)
+{
+    UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+    return UCS_OK;
+}
+
+/*
+ * ATS mkey_pack: compute IOVA as scalable-map base + VA offset.
+ * The scalable mapping starts at VA 0, so IOVA = ats_md->iova + addr.
+ * LAC is fixed for the scalable mapping — all buffers share it.
+ */
+static ucs_status_t
+uct_cxi_md_mkey_pack_ats(uct_md_h mdh, uct_mem_h memh, void *address,
+                         size_t length,
+                         const uct_md_mkey_pack_params_t *params,
+                         void *mkey_buffer)
+{
+    uct_cxi_md_t   *md   = ucs_derived_of(mdh, uct_cxi_md_t);
+    uct_cxi_rkey_t *rkey = mkey_buffer;
+
+    rkey->iova = md->ats_md->iova + (uintptr_t)address;
+    rkey->lac  = md->ats_md->lac;
+
+    ucs_debug("cxi ATS mkey pack iova 0x%"PRIx64" lac %u",
+              rkey->iova, (unsigned)rkey->lac);
+    return UCS_OK;
+}
+
+
+/* -------------------------------------------------------------------------
  * ops table and md_open — after all static functions they reference
  * -------------------------------------------------------------------------
  */
@@ -404,10 +680,43 @@ static uct_md_ops_t uct_cxi_md_ops = {
     .detect_memory_type = uct_cxi_md_detect_memory_type
 };
 
+/* ATS variant — mem_reg/mem_dereg are no-ops; mkey_pack uses VA arithmetic. */
+static uct_md_ops_t uct_cxi_md_ats_ops = {
+    .close              = uct_cxi_md_close,
+    .query              = uct_cxi_md_query,
+    .mem_alloc          = (uct_md_mem_alloc_func_t)ucs_empty_function_return_unsupported,
+    .mem_free           = (uct_md_mem_free_func_t)ucs_empty_function_return_unsupported,
+    .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+    .mem_reg            = uct_cxi_md_mem_ats_reg,
+    .mem_dereg          = uct_cxi_md_mem_ats_dereg,
+    .mem_query          = uct_cxi_md_mem_query,
+    .mkey_pack          = uct_cxi_md_mkey_pack_ats,
+    .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+    .detect_memory_type = uct_cxi_md_detect_memory_type
+};
+
+/* Registration-cached variant — identical except for mem_reg / mem_dereg. */
+static uct_md_ops_t uct_cxi_md_rcache_ops = {
+    .close              = uct_cxi_md_close,
+    .query              = uct_cxi_md_query,
+    .mem_alloc          = (uct_md_mem_alloc_func_t)ucs_empty_function_return_unsupported,
+    .mem_free           = (uct_md_mem_free_func_t)ucs_empty_function_return_unsupported,
+    .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+    .mem_reg            = uct_cxi_md_mem_rcache_reg,
+    .mem_dereg          = uct_cxi_md_mem_rcache_dereg,
+    .mem_query          = uct_cxi_md_mem_query,
+    .mkey_pack          = uct_cxi_md_mkey_pack,
+    .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+    .detect_memory_type = uct_cxi_md_detect_memory_type
+};
+
 ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
                              const uct_md_config_t *md_config, uct_md_h *md_p)
 {
+    const uct_cxi_md_config_t *cfg = ucs_derived_of(md_config,
+                                                    uct_cxi_md_config_t);
     struct cxi_svc_desc  svc_desc = {};
+    ucs_rcache_params_t  rcache_params;
     uct_cxi_md_t        *md;
     uint32_t             nid    = 0;
     uint32_t             dev_id = 0;
@@ -504,12 +813,88 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     md->refcount        = 1;
     md->svc_id          = (uint32_t)svc_id;
     md->vni             = vni;
+    md->pid_bits        = (uint8_t)md->cxi_dev->info.pid_bits;
+    md->rcache          = NULL;
+    md->ats_md          = NULL;
+
+    /*
+     * Optionally enable PCIe ATS scalable mapping.  ATS replaces per-buffer
+     * pinning with a single full-VA-space cxil_map; mem_reg becomes a no-op
+     * and IOVA is computed as ats_md->iova + VA at mkey_pack time.
+     *
+     * ATS takes priority over the rcache: if ATS is active there are no
+     * cxil_map calls per registration, so the cache would be pointless.
+     *
+     * Must be set up BEFORE uct_md_vfs_init and destroyed BEFORE the LNI.
+     */
+    if (cfg->enable_ats != UCS_NO) {
+        if (uct_cxi_ats_check(md->cxi_lni)) {
+            status = uct_cxi_ats_init(md);
+            if (status == UCS_OK) {
+                md->super.ops = &uct_cxi_md_ats_ops;
+                ucs_debug("cxi ATS enabled for %s", md_name);
+            } else if (cfg->enable_ats == UCS_YES) {
+                ucs_error("cxi ATS required but scalable map failed for %s",
+                          md_name);
+                goto err_destroy_lni;
+            } else {
+                ucs_debug("cxi ATS scalable map failed for %s (%s), "
+                          "falling back to pinned registration",
+                          md_name, ucs_status_string(status));
+            }
+        } else if (cfg->enable_ats == UCS_YES) {
+            ucs_error("cxi ATS required but hardware does not support it: %s",
+                      md_name);
+            status = UCS_ERR_UNSUPPORTED;
+            goto err_destroy_lni;
+        }
+    }
+
+    /*
+     * Optionally create a registration cache (skipped when ATS is active).
+     * The cache eliminates repeated cxil_map/cxil_unmap calls for overlapping
+     * VA ranges.  When active, md->super.ops is replaced with the rcache
+     * variant.
+     *
+     * The rcache must be created BEFORE uct_md_vfs_init so that the VFS
+     * node can inspect rcache stats if desired.  It must be destroyed
+     * BEFORE the LNI in md_close because eviction calls cxil_unmap.
+     */
+    if (md->ats_md == NULL && cfg->enable_rcache != UCS_NO) {
+        ucs_rcache_set_params(&rcache_params, &cfg->rcache);
+        rcache_params.region_struct_size = sizeof(uct_cxi_rcache_region_t);
+        rcache_params.ucm_events         = UCM_EVENT_VM_UNMAPPED;
+        rcache_params.ucm_event_priority = cfg->rcache.event_prio;
+        rcache_params.context            = md;
+        rcache_params.ops                = &uct_cxi_rcache_ops;
+        rcache_params.flags              = UCS_RCACHE_FLAG_PURGE_ON_FORK;
+
+        status = ucs_rcache_create(&rcache_params, md_name, NULL, &md->rcache);
+        if (status == UCS_OK) {
+            md->super.ops = &uct_cxi_md_rcache_ops;
+            ucs_debug("cxi rcache enabled for %s", md_name);
+        } else {
+            ucs_assert(md->rcache == NULL);
+            if (cfg->enable_rcache == UCS_YES) {
+                ucs_error("cxi failed to create rcache for %s: %s",
+                          md_name, ucs_status_string(status));
+                status = UCS_ERR_IO_ERROR;
+                goto err_destroy_lni;
+            }
+            ucs_debug("cxi rcache unavailable for %s (%s); "
+                      "using direct registration",
+                      md_name, ucs_status_string(status));
+        }
+    }
 
     uct_md_vfs_init(component, &md->super, md_name);
 
-    ucs_debug("cxi md open device %s nid 0x%x svc_id %u vni %u lni_id %u",
+    ucs_debug("cxi md open device %s nid 0x%x svc_id %u vni %u lni_id %u "
+              "ats %s rcache %s",
               md->device.name, nid, md->svc_id, (unsigned)md->vni,
-              md->cxi_lni->id);
+              md->cxi_lni->id,
+              md->ats_md  != NULL ? "enabled" : "disabled",
+              md->rcache  != NULL ? "enabled" : "disabled");
 
     *md_p = &md->super;
     return UCS_OK;

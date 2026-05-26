@@ -266,7 +266,8 @@ endif # HAVE_IB
 
 if HAVE_CXI
 gtest_SOURCES += \
-    uct/cxi/test_cxi_md.cc
+    uct/cxi/test_cxi_md.cc \
+    uct/cxi/test_cxi_iface.cc
 gtest_LDADD += \
     $(top_builddir)/src/uct/cxi/libuct_cxi.la \
     $(CXI_LIBS)

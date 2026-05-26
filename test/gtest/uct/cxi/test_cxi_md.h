@@ -32,6 +32,12 @@ protected:
      * as a uint16_t.  Returns 0 if the variable is absent.
      */
     uint16_t env_vni() const;
+
+    /*
+     * Convenience wrapper for uct_md_mem_dereg_v2 so that rcache tests
+     * can release references without repeating the params boilerplate.
+     */
+    ucs_status_t dereg_mem(uct_mem_h memh);
 };
 
 #endif /* UCT_CXI_TEST_MD_H */
