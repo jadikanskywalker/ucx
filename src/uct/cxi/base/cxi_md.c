@@ -294,14 +294,18 @@ void uct_cxi_md_close(uct_md_h mdh)
  * differs (ucs_malloc vs embedded in the rcache region).
  *
  * cxil_map() pins the pages, programs the NIC's ATU, and fills cxi_md with:
- *   .iova  — NIC-visible base address (used in DMA descriptors)
+ *   .iova  — page-aligned NIC-visible base address of the registration
+ *   .va    — page-aligned virtual address base of the registration
  *   .lac   — memory access class (shared across all same-page-size mappings)
  *   .len   — page-aligned length of the mapping
+ *
+ * Both .iova and .va are page-aligned — they correspond to the page start,
+ * not the exact buffer pointer passed to cxil_map.
  *
  * CXI_MAP_PIN ensures physical page pinning (required for DMA).
  * CXI_MAP_READ | CXI_MAP_WRITE grants bidirectional NIC access.
  */
-static ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
+ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
                                    size_t length, uct_cxi_mem_handle_t *mh)
 {
     int flags = CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE;
@@ -314,14 +318,29 @@ static ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
         return UCS_ERR_IO_ERROR;
     }
 
-    ucs_debug("cxi map addr %p len %zu iova 0x%"PRIx64" lac %u",
+    /*
+     * Precompute iova_offset = page_IOVA - page_VA.
+     *
+     * For any buffer VA within this registration:
+     *   NIC_IOVA(buf) = iova_offset + buf_VA
+     *               = (page_IOVA - page_VA) + buf_VA
+     *               = page_IOVA + (buf_VA - page_VA)
+     *
+     * Using cxi_md->va (the page-aligned VA) instead of the raw `address`
+     * parameter is critical: `address` may be non-page-aligned, which would
+     * cause `iova_offset + buf_VA` to resolve to `page_IOVA` (page start)
+     * rather than the correct per-byte IOVA.
+     */
+    mh->iova_offset = mh->cxi_md->iova - mh->cxi_md->va;
+
+    ucs_debug("cxi map addr %p len %zu iova 0x%"PRIx64" lac %u offset 0x%"PRIx64,
               address, length, (uint64_t)mh->cxi_md->iova,
-              (unsigned)mh->cxi_md->lac);
+              (unsigned)mh->cxi_md->lac, mh->iova_offset);
     return UCS_OK;
 }
 
-/* Counterpart to uct_cxi_do_map — shared by direct and rcache paths. */
-static void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh)
+/* Counterpart to uct_cxi_do_map — shared by direct, rcache, and iface paths. */
+void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh)
 {
     int ret = cxil_unmap(mh->cxi_md);
     if (ret != 0) {
@@ -486,7 +505,8 @@ uct_cxi_md_mem_rcache_dereg(uct_md_h uct_md,
  *
  * The initiator EP has the peer's {nid, pid, ptn} from device_addr and
  * iface_addr already; it needs only the memory-access fields from the rkey:
- *   iova  — NIC-visible base address of the registered region
+ *   iova  — iova_offset = cxi_md->iova - base_VA; lets ep_put_zcopy compute
+ *            remote_iova = rkey->iova + remote_addr with a single addition
  *   lac   — Logical Address Context (page-table slot assigned by cxil_map)
  */
 static ucs_status_t
@@ -497,10 +517,10 @@ uct_cxi_md_mkey_pack(uct_md_h mdh, uct_mem_h memh, void *address,
     uct_cxi_mem_handle_t  *mh   = memh;
     uct_cxi_rkey_t        *rkey = mkey_buffer;
 
-    rkey->iova = mh->cxi_md->iova;
+    rkey->iova = mh->iova_offset;  /* = cxi_md->iova - base_VA */
     rkey->lac  = mh->cxi_md->lac;
 
-    ucs_debug("cxi mkey pack iova 0x%"PRIx64" lac %u",
+    ucs_debug("cxi mkey pack iova_offset 0x%"PRIx64" lac %u",
               rkey->iova, (unsigned)rkey->lac);
     return UCS_OK;
 }
@@ -592,9 +612,9 @@ static int uct_cxi_ats_check(struct cxil_lni *lni)
  * uct_cxi_ats_init - create the full-VA-space scalable ATS mapping.
  *
  * Maps VA 0 to 0xfffffffffffff000 with CXI_MAP_ATS (no CXI_MAP_PIN).
- * The resulting cxi_md carries a single LAC that is valid for every
- * subsequent mem_reg / mkey_pack call.  IOVA for a buffer at VA addr is:
- *   rkey.iova = md->ats_md->iova + (uintptr_t)addr
+ * The resulting cxi_md carries a single LAC valid for every buffer.
+ * Because the map starts at VA 0, iova_offset = ats_md->iova (base_VA = 0),
+ * so ep_put_zcopy computes local_iova = ats_md->iova + buffer_VA uniformly.
  */
 static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
 {
@@ -615,33 +635,46 @@ static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
 }
 
 /*
- * ATS mem_reg: the scalable mapping already covers every VA.
- * Return the shared ats_md pointer as a non-NULL sentinel handle so that
- * UCT_MEM_HANDLE_NULL checks pass and mkey_pack can reach md->ats_md.
+ * ATS mem_reg: the scalable mapping covers every VA in the process.
+ * Allocate a real uct_cxi_mem_handle_t so that ep_put_zcopy can access
+ * iova_offset and lac uniformly regardless of ATS vs pinned mode.
+ * iova_offset = ats_md->iova because the map starts at VA 0 (base_VA = 0).
  */
 static ucs_status_t
 uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
                        const uct_md_mem_reg_params_t *params,
                        uct_mem_h *memh_p)
 {
-    uct_cxi_md_t *md = ucs_derived_of(mdh, uct_cxi_md_t);
-    *memh_p = md->ats_md;
+    uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    uct_cxi_mem_handle_t *mh;
+
+    mh = ucs_malloc(sizeof(*mh), "uct_cxi_ats_memh");
+    if (mh == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    mh->cxi_md      = md->ats_md;
+    /* ATS maps from VA 0, so cxi_md->va = 0 and
+     * iova_offset = page_IOVA - page_VA = ats_md->iova - 0 = ats_md->iova. */
+    mh->iova_offset = (uint64_t)md->ats_md->iova;
+
+    *memh_p = mh;
     return UCS_OK;
 }
 
-/* ATS mem_dereg: no per-buffer mapping to release. */
+/* ATS mem_dereg: free the per-registration handle (no cxil_unmap needed). */
 static ucs_status_t
 uct_cxi_md_mem_ats_dereg(uct_md_h mdh,
                          const uct_md_mem_dereg_params_t *params)
 {
     UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+    ucs_free(params->memh);
     return UCS_OK;
 }
 
 /*
- * ATS mkey_pack: compute IOVA as scalable-map base + VA offset.
- * The scalable mapping starts at VA 0, so IOVA = ats_md->iova + addr.
- * LAC is fixed for the scalable mapping — all buffers share it.
+ * ATS mkey_pack: iova_offset = ats_md->iova (base_VA = 0), so the initiator
+ * computes remote_iova = rkey->iova + remote_addr — same formula as pinned.
  */
 static ucs_status_t
 uct_cxi_md_mkey_pack_ats(uct_md_h mdh, uct_mem_h memh, void *address,
@@ -649,13 +682,13 @@ uct_cxi_md_mkey_pack_ats(uct_md_h mdh, uct_mem_h memh, void *address,
                          const uct_md_mkey_pack_params_t *params,
                          void *mkey_buffer)
 {
-    uct_cxi_md_t   *md   = ucs_derived_of(mdh, uct_cxi_md_t);
-    uct_cxi_rkey_t *rkey = mkey_buffer;
+    uct_cxi_mem_handle_t *mh   = memh;
+    uct_cxi_rkey_t       *rkey = mkey_buffer;
 
-    rkey->iova = md->ats_md->iova + (uintptr_t)address;
-    rkey->lac  = md->ats_md->lac;
+    rkey->iova = mh->iova_offset;  /* = ats_md->iova */
+    rkey->lac  = mh->cxi_md->lac;
 
-    ucs_debug("cxi ATS mkey pack iova 0x%"PRIx64" lac %u",
+    ucs_debug("cxi ATS mkey pack iova_offset 0x%"PRIx64" lac %u",
               rkey->iova, (unsigned)rkey->lac);
     return UCS_OK;
 }

@@ -375,12 +375,12 @@ UCS_TEST_P(test_cxi_md, rcache_refcount)
 
 
 /*
- * ATS shared-sentinel test.
+ * ATS shared-backing-md test.
  *
- * When PCIe ATS is active, every mem_reg returns the same shared ats_md
- * pointer (the scalable mapping) as the uct_mem_h — no per-buffer cxil_map
- * is performed.  Verify that two distinct buffer registrations return
- * identical memh values, and that both dereg calls succeed.
+ * When PCIe ATS is active, every mem_reg allocates a fresh uct_cxi_mem_handle_t
+ * wrapper but all wrappers point to the single shared scalable cxi_md.  Verify
+ * that two distinct buffer registrations produce different handle pointers yet
+ * embed the same cxi_md pointer, and that both dereg calls succeed.
  */
 UCS_TEST_P(test_cxi_md, ats_shared_memh)
 {
@@ -396,8 +396,13 @@ UCS_TEST_P(test_cxi_md, ats_shared_memh)
     ASSERT_UCS_OK(reg_mem(UCT_MD_MEM_ACCESS_RMA, buf2.data(), buf2.size(),
                           &memh2));
 
-    EXPECT_EQ(memh1, memh2)
-            << "ATS mode: all registrations must return the shared scalable md";
+    const uct_cxi_mem_handle_t *mh1 =
+            static_cast<const uct_cxi_mem_handle_t *>(memh1);
+    const uct_cxi_mem_handle_t *mh2 =
+            static_cast<const uct_cxi_mem_handle_t *>(memh2);
+
+    EXPECT_EQ(mh1->cxi_md, mh2->cxi_md)
+            << "ATS mode: all handles must share the same scalable cxi_md";
 
     EXPECT_UCS_OK(dereg_mem(memh1));
     EXPECT_UCS_OK(dereg_mem(memh2));
@@ -406,12 +411,18 @@ UCS_TEST_P(test_cxi_md, ats_shared_memh)
 /*
  * ATS rkey IOVA formula test.
  *
- * In ATS mode mkey_pack computes:
- *   rkey.iova = ats_md->iova + (uintptr_t)address
+ * In ATS mode mkey_pack stores the iova_offset in rkey.iova.  Because the
+ * ATS scalable mapping covers the full virtual address space starting at
+ * VA = 0, iova_offset = ats_md->iova − 0 = ats_md->iova.
+ *
+ *   rkey.iova = ats_md->iova   (iova_offset; base_VA = 0 for scalable map)
  *   rkey.lac  = ats_md->lac
  *
- * Verify both formulae hold by comparing the packed rkey against the
- * raw ats_md fields.
+ * An initiator EP computes the remote IOVA as:
+ *   remote_iova = rkey.iova + remote_addr
+ *               = ats_md->iova + remote_VA
+ *
+ * Verify both fields match the raw ats_md values.
  */
 UCS_TEST_P(test_cxi_md, ats_rkey_iova)
 {
@@ -434,7 +445,8 @@ UCS_TEST_P(test_cxi_md, ats_rkey_iova)
             reinterpret_cast<const uct_cxi_rkey_t *>(rkey_buf.data());
     const struct cxi_md  *ats  = cxi_md().ats_md;
 
-    EXPECT_EQ(ats->iova + (uintptr_t)buf.data(), rkey->iova);
+    /* rkey.iova is iova_offset = ats_md->iova (base_VA = 0 for ATS). */
+    EXPECT_EQ((uint64_t)ats->iova, rkey->iova);
     EXPECT_EQ((unsigned)ats->lac, (unsigned)rkey->lac);
 
     EXPECT_UCS_OK(dereg_mem(memh));

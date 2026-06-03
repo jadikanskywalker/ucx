@@ -14,12 +14,16 @@ libuct_cxi_la_LIBADD     = $(top_builddir)/src/ucs/libucs.la \
 libuct_cxi_la_LDFLAGS    = -version-info $(SOVERSION)
 
 noinst_HEADERS = \
+    base/cxi_ep.h \
     base/cxi_iface.h \
+    base/cxi_rma.h \
     base/cxi_device.h \
     base/cxi_md.h
 
 libuct_cxi_la_SOURCES = \
+    base/cxi_ep.c \
     base/cxi_iface.c \
+    base/cxi_rma.c \
     base/cxi_device.c \
     base/cxi_md.c
 

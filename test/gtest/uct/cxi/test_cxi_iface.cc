@@ -72,10 +72,10 @@ protected:
 /**
  * Verify the capability report from uct_cxi_iface_query.
  *
- * Phase 2: no data-path operations are wired, so cap.flags must be 0.
- * Bandwidth (200 Gb/s dedicated, 0 shared), latency (1500 ns constant),
- * and address-length fields are checked against the values hard-coded in
- * uct_cxi_iface_query.
+ * Phase 3: ep_put_zcopy is wired; the iface must advertise PUT_ZCOPY and
+ * PENDING.  Bandwidth (200 Gb/s dedicated, 0 shared), latency (1500 ns
+ * constant), and address-length fields are checked against the values
+ * hard-coded in uct_cxi_iface_query.
  */
 UCS_TEST_P(test_cxi_iface, iface_query)
 {
@@ -96,8 +96,13 @@ UCS_TEST_P(test_cxi_iface, iface_query)
     /* Latency constant: 1500 ns. */
     EXPECT_DOUBLE_EQ(1500e-9, attr.latency.c);
 
-    /* Phase 2: no data-path ops yet; cap.flags must match the ops table. */
-    EXPECT_EQ(0u, attr.cap.flags);
+    /* Phase 3: PUT_ZCOPY and PENDING must be advertised. */
+    EXPECT_TRUE(attr.cap.flags & UCT_IFACE_FLAG_PUT_ZCOPY)
+            << "cxi iface must advertise UCT_IFACE_FLAG_PUT_ZCOPY";
+    EXPECT_TRUE(attr.cap.flags & UCT_IFACE_FLAG_PENDING)
+            << "cxi iface must advertise UCT_IFACE_FLAG_PENDING";
+    EXPECT_EQ(1u,        attr.cap.put.max_iov);
+    EXPECT_EQ(0u,        attr.cap.put.min_zcopy);
 }
 
 /**
@@ -126,15 +131,15 @@ UCS_TEST_P(test_cxi_iface, get_device_address)
 }
 
 /**
- * Verify that uct_cxi_iface_get_address returns a valid {pid, ptn} pair.
+ * Verify that uct_cxi_iface_get_address returns a valid pid.
  *
- * pid  — CXI Port ID, range 0–510 (9-bit value assigned by the kernel when
- *         cxil_alloc_domain is called).
- * ptn  — portal table entry number, hardware-assigned; 0 is the first valid
- *         index, not a sentinel for invalid.
+ * pid — CXI Port ID, range 0–510 (9-bit value assigned by the kernel when
+ *       cxil_alloc_domain is called).
  *
- * Both fields together form the routing anchor a remote EP needs to construct
- * the Destination Fabric Address (DFA) for restricted-mode DMA.
+ * The pid is the only field in uct_cxi_iface_addr_t; per-operation
+ * pid_offsets (0 for RMA/LAC-0, UCT_CXI_PTE_TAG for tag, UCT_CXI_PTE_AM
+ * for AM) are protocol constants added by the initiator when building the
+ * DFA, so they are not exchanged in the iface address.
  */
 UCS_TEST_P(test_cxi_iface, get_address)
 {
@@ -150,8 +155,7 @@ UCS_TEST_P(test_cxi_iface, get_address)
     /* CXI PIDs are 9-bit values in the range 0–510. */
     EXPECT_LE(addr->pid, 510u);
 
-    UCS_TEST_MESSAGE << "cxi iface addr: pid=" << addr->pid
-                     << " ptn=" << addr->ptn;
+    UCS_TEST_MESSAGE << "cxi iface addr: pid=" << addr->pid;
 }
 
 /**

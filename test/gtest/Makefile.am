@@ -267,7 +267,9 @@ endif # HAVE_IB
 if HAVE_CXI
 gtest_SOURCES += \
     uct/cxi/test_cxi_md.cc \
-    uct/cxi/test_cxi_iface.cc
+    uct/cxi/test_cxi_iface.cc \
+    uct/cxi/test_cxi_ep.cc \
+    uct/cxi/test_cxi_rma.cc
 gtest_LDADD += \
     $(top_builddir)/src/uct/cxi/libuct_cxi.la \
     $(CXI_LIBS)
@@ -328,6 +330,7 @@ noinst_HEADERS = \
 	common/test_perf.h \
 	\
 	uct/cxi/test_cxi_md.h \
+	uct/cxi/test_cxi_rma.h \
 	uct/ib/test_rc.h \
 	uct/ib/ud_base.h \
 	uct/ib/test_ib.h \

@@ -42,12 +42,25 @@ typedef struct uct_cxi_md {
 
 
 /**
- * Memory handle returned by mem_reg.  Wraps the libcxi memory descriptor,
- * which carries the IOVA, length, and LAC needed for DMA descriptors.
- * Keep this struct small: one exists per registered memory region.
+ * Memory handle returned by mem_reg.  Wraps the libcxi memory descriptor
+ * plus one precomputed field for the DMA hot path.
+ *
+ * iova_offset = cxi_md->iova - base_VA
+ *
+ * This lets ep_put_zcopy compute the local NIC-visible address with a single
+ * addition: local_iova = iova_offset + buffer_VA.  Without it the initiator
+ * would need base_VA as a separate field and perform a subtraction per send.
+ *
+ * For ATS mode iova_offset = ats_md->iova (base_VA = 0 for the scalable map).
+ * For pinned mode iova_offset = cxi_md->iova - address (address from cxil_map).
  */
 typedef struct uct_cxi_mem_handle {
-    struct cxi_md *cxi_md; /**< Memory descriptor from cxil_map */
+    struct cxi_md *cxi_md;      /**< Libcxi descriptor; needed for cxil_unmap
+                                 *   and for cxi_md->lac in DMA commands       */
+    uint64_t       iova_offset; /**< Precomputed: cxi_md->iova - cxi_md->va
+                                 *   (page_IOVA - page_VA).
+                                 *   NIC address of any buf in this registration:
+                                 *   IOVA(buf) = iova_offset + buf_VA          */
 } uct_cxi_mem_handle_t;
 
 
@@ -71,13 +84,30 @@ typedef struct uct_cxi_rcache_region {
  * iface_addr; the memory itself is addressed by {iova, lac} from the rkey.
  * nid is not packed here — the EP already has it from device_addr.
  */
+/**
+ * Remote key packed by mkey_pack and unpacked by rkey_unpack.
+ *
+ * iova stores iova_offset = cxi_md->iova - base_VA, so the initiator can
+ * compute the target's NIC-visible address with one addition:
+ *   remote_iova = rkey->iova + remote_addr
+ *
+ * This works for both pinned and ATS registrations.  The initiator's NIC
+ * cannot resolve the target's VA directly — IOVAs are per-LNI and private
+ * to the target's IOMMU namespace — so the target must include IOVA info.
+ */
 typedef struct uct_cxi_rkey {
-    uint64_t iova; /**< Base IOVA of the registered region (from cxil_map) */
-    uint8_t  lac;  /**< Logical Address Context (memory access class) */
+    uint64_t iova; /**< iova_offset = cxi_md->iova - base_VA (see above) */
+    uint8_t  lac;  /**< Logical Address Context (memory access class)     */
 } UCS_S_PACKED uct_cxi_rkey_t;
 
 
 extern uct_component_t uct_cxi_component;
+
+/* Shared registration helpers used by both cxi_md.c and cxi_iface.c. */
+struct cxil_lni;
+ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address, size_t length,
+                             uct_cxi_mem_handle_t *mh);
+void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh);
 
 
 ucs_status_t uct_cxi_query_md_resources(uct_component_h component,

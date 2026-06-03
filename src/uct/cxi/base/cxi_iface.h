@@ -13,6 +13,7 @@
 #include <uct/base/uct_iface.h>
 #include <uct/base/uct_md.h>
 #include <uct/api/uct.h>
+#include <ucs/datastruct/mpool.h>
 
 #include <libcxi/libcxi.h>
 
@@ -27,6 +28,30 @@
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     256U
 
+/*
+ * Number of Logical Address Contexts (LACs) supported per iface.
+ *
+ * Default (1): only LAC 0 is used; standard 4 KiB-page registrations always
+ * land in LAC 0.  Build with --enable-huge-pages (sets UCT_CXI_ENABLE_HUGE_PAGES)
+ * to support LACs 1-7 for huge-page registrations.
+ *
+ * This is a compile-time constant because it controls array sizes in
+ * uct_cxi_iface_t and uct_cxi_ep_t; a runtime flag would not shrink them.
+ *
+ * Portal table entry (PTE) pid_offset assignment:
+ *   pid_offsets 0 .. UCT_CXI_MAX_LACS-1  → RMA/AMO, one per LAC
+ *   pid_offset  UCT_CXI_MAX_LACS          → Tag-matching (Phase 7)
+ *   pid_offset  UCT_CXI_MAX_LACS + 1      → Active messages (Phase 6)
+ */
+#ifdef UCT_CXI_ENABLE_HUGE_PAGES
+#  define UCT_CXI_MAX_LACS   8
+#else
+#  define UCT_CXI_MAX_LACS   1
+#endif
+#define UCT_CXI_PTE_TAG    UCT_CXI_MAX_LACS
+#define UCT_CXI_PTE_AM    (UCT_CXI_MAX_LACS + 1)
+#define UCT_CXI_PTE_COUNT (UCT_CXI_MAX_LACS + 2)
+
 
 /**
  * Node-level address — one per physical NIC.
@@ -39,18 +64,13 @@ typedef struct uct_cxi_device_addr {
 /**
  * Per-iface address.
  *
- * Both fields are required by the initiator EP to construct the DFA
- * (Destination Fabric Address) for restricted-mode DMA:
- *
- *   cxi_build_dfa(nid, pid, md->pid_bits, ptn, &dfa, &idx_ext)
- *
- * nid comes from device_addr; {iova, lac} come from the rkey.
- * ptn is the portal table entry used as a routing anchor on the target —
- * in restricted mode the PTE receives completion events but posts no LEs.
+ * Advertises only the PID.  Per-operation pid_offsets (0..UCT_CXI_MAX_LACS-1
+ * for RMA, UCT_CXI_PTE_TAG for tag, UCT_CXI_PTE_AM for AM) are protocol
+ * constants; the initiator adds them when building the DFA so iface_addr
+ * stays compact.
  */
 typedef struct uct_cxi_iface_addr {
-    uint32_t pid; /**< CXI Port ID assigned by cxil_alloc_domain (0-510) */
-    uint32_t ptn; /**< Portal table number; routing anchor for restricted DMA */
+    uint32_t pid; /**< CXI Port ID assigned by cxil_alloc_domain */
 } UCS_S_PACKED uct_cxi_iface_addr_t;
 
 
@@ -58,34 +78,73 @@ typedef struct uct_cxi_iface_addr {
  * CXI interface configuration.
  */
 typedef struct uct_cxi_iface_config {
-    uct_iface_config_t super;
+    uct_iface_config_t       super;
+    uct_iface_mpool_config_t bcopy_mp;  /**< desc_pool config (bufs_grow, max_bufs) */
+    size_t                   max_bcopy; /**< Max payload for put_bcopy/get_bcopy    */
 } uct_cxi_iface_config_t;
 
 
 /**
  * CXI interface instance.
  *
- * Holds all libcxi hardware resources allocated at iface_open.  Resources are
- * listed in allocation order and must be destroyed in strict reverse order.
- *
- * The PTE is used in routing-only mode (no list entries posted): restricted
- * mode DMA bypasses LE matching and addresses memory directly via {lac, iova}
- * from the rkey.  The PTE exists solely so the NIC has a valid endpoint at
- * {pid, ptn} to route completion events.
+ * Hardware resources are grouped into sub-structs by function.  Resources
+ * are allocated in a fixed order in UCS_CLASS_INIT_FUNC and must be
+ * destroyed in strict reverse order.
  */
 typedef struct uct_cxi_iface {
-    uct_base_iface_t      super;    /**< Must be first */
-    /* libcxi resources — allocated in order below, destroyed in reverse */
-    struct cxil_wait_obj *wait_obj; /**< Interrupt / epoll fd for progress */
-    void                 *eq_buf;   /**< mmap backing buffer for evtq */
-    struct cxi_md        *eq_md;    /**< cxil_map registration of eq_buf */
-    struct cxi_eq        *evtq;     /**< Event queue (shared by CMDQs & PTE) */
-    struct cxi_cp        *cp;       /**< TX communication profile */
-    struct cxi_cq        *tx_cmdq; /**< TX command queue (CXI_CQ_IS_TX) */
-    struct cxi_cq        *tg_cmdq; /**< Target (initiator-side) command queue */
-    struct cxil_domain   *domain;  /**< VNI + PID domain binding */
-    struct cxil_pte      *pte;     /**< Portal table entry (routing; no LEs) */
-    struct cxil_pte_map  *pte_map; /**< Active domain → PTE mapping */
+    uct_base_iface_t  super;               /**< Must be first */
+
+    /* ── Shared initiator-side TX hardware ──────────────────────────── */
+    struct {
+        struct cxi_cq   *cmdq;             /**< TX command queue (CXI_CQ_IS_TX) */
+        struct cxi_cp   *cp;               /**< Communication profile / TC */
+        ucs_mpool_t      op_pool;          /**< uct_cxi_send_op_t — zcopy/short ops */
+        ucs_mpool_t      desc_pool;        /**< uct_cxi_send_desc_t — bcopy bounce bufs */
+        size_t           max_bcopy;        /**< Max payload per bcopy op (from config) */
+        unsigned         outstanding;      /**< Total in-flight sends (all EPs) */
+        /* Short-GET scratch: a page-aligned heap allocation so the NIC's DMA
+         * writes land in their own page, away from CPU-hot iface struct
+         * fields (prevents false sharing / cache line invalidation).
+         * Single-threaded poll model guarantees at most one get_short in
+         * flight at a time; the implementation spins until C_EVENT_REPLY
+         * and then memcpy's into the caller's buffer. */
+        uint8_t              *get_short_buf; /**< Page-aligned, NIC DMA target    */
+        uct_cxi_mem_handle_t  get_short_mh;  /**< cxil_map handle for get_short_buf */
+    } tx;
+
+    /* ── Shared target-side hardware ────────────────────────────────── */
+    struct {
+        struct cxi_cq   *cmdq;             /**< Target command queue for LE management */
+    } tgt;
+
+    /* ── Event queue (single EQ; event_type dispatches to handler) ─── */
+    struct cxil_wait_obj *wait_obj;        /**< Interrupt / epoll fd for progress */
+    void                 *eq_buf;          /**< mmap backing buffer for evtq */
+    struct cxi_md        *eq_md;           /**< cxil_map registration of eq_buf */
+    struct cxi_eq        *evtq;            /**< Event queue (shared by all CMDQs & PTEs) */
+
+    /* ── RMA/AMO portals (restricted, pid_offset = LAC index) ───────── */
+    struct {
+        struct cxil_pte     *pte[UCT_CXI_MAX_LACS];     /**< NULL until LAC used */
+        struct cxil_pte_map *pte_map[UCT_CXI_MAX_LACS];
+        uint8_t              lac_count;                   /**< # of open RMA PTEs */
+    } rma;
+
+    /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) — Phase 7 */
+    struct {
+        struct cxil_pte     *pte;          /**< NULL until tag ops enabled */
+        struct cxil_pte_map *pte_map;
+    } tag;
+
+    /* ── Active-message portal (unrestricted, pid_offset = UCT_CXI_PTE_AM) — Phase 6 */
+    struct {
+        struct cxil_pte     *pte;          /**< NULL until AM ops enabled */
+        struct cxil_pte_map *pte_map;
+    } am;
+
+    /* ── Domain (VNI + PID) ─────────────────────────────────────────── */
+    struct cxil_domain   *domain;
+
 } uct_cxi_iface_t;
 
 
