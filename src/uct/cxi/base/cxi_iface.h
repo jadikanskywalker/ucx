@@ -28,6 +28,11 @@
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     256U
 
+/* AM receive buffer: 1 MiB OVERFLOW LE backing.
+ * Large enough to absorb bursts of small AM messages before iface_progress
+ * drains the EQ; reuses the same 1 MiB page for all AM traffic. */
+#define UCT_CXI_AM_RX_BUF_SIZE  (1u << 20)
+
 /*
  * Number of Logical Address Contexts (LACs) supported per iface.
  *
@@ -136,10 +141,12 @@ typedef struct uct_cxi_iface {
         struct cxil_pte_map *pte_map;
     } tag;
 
-    /* ── Active-message portal (unrestricted, pid_offset = UCT_CXI_PTE_AM) — Phase 6 */
+    /* ── Active-message portal (unrestricted, pid_offset = UCT_CXI_PTE_AM) */
     struct {
-        struct cxil_pte     *pte;          /**< NULL until AM ops enabled */
-        struct cxil_pte_map *pte_map;
+        struct cxil_pte      *pte;         /**< Unrestricted AM portal */
+        struct cxil_pte_map  *pte_map;
+        uint8_t              *rx_buf;      /**< Page-aligned OVERFLOW backing buffer */
+        uct_cxi_mem_handle_t  rx_mh;      /**< cxil_map handle for rx_buf */
     } am;
 
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */

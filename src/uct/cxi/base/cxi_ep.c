@@ -78,8 +78,9 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->rem_pid     = iface_addr->pid;
     ep->outstanding = 0;
 
-    /* Build all UCT_CXI_MAX_LACS DFAs at creation time (pid_offset = lac index)
-     * so the hot path can index ep->dfa_rma[rkey->lac] without any check. */
+    /* Build all DFAs at creation time so the hot path needs no check.
+     * RMA DFAs: pid_offset = lac index (one per LAC).
+     * AM DFA:   pid_offset = UCT_CXI_PTE_AM (fixed protocol constant). */
     {
         uint8_t lac;
         for (lac = 0; lac < UCT_CXI_MAX_LACS; lac++) {
@@ -88,6 +89,8 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
                           &ep->dfa_rma[lac], &ep->dfa_rma_idx_ext[lac]);
         }
     }
+    cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
+                  (uint32_t)UCT_CXI_PTE_AM, &ep->dfa_am, &ep->dfa_am_idx_ext);
 
     ucs_debug("cxi ep %p create nid 0x%x pid %u",
               ep, ep->rem_nid, ep->rem_pid);

@@ -58,13 +58,12 @@ typedef struct uct_cxi_send_desc {
 /**
  * CXI endpoint.
  *
- * rem_nid and rem_pid identify the remote peer.  A per-LAC DFA (Destination
- * Fabric Address) is built lazily on first use: dfa_rma_valid is a bitmask
- * where bit N indicates that dfa_rma[N] has been computed.
+ * rem_nid and rem_pid identify the remote peer.  All DFAs are built eagerly
+ * at ep_create — no hot-path conditional needed.
  *
- * All UCT_CXI_MAX_LACS DFAs are built eagerly at ep_create — no hot-path
- * conditional needed.  With the default build (UCT_CXI_MAX_LACS = 1) only
- * one DFA is built; with --enable-huge-pages all 8 are built up front.
+ * dfa_rma[lac]: per-LAC DFA for restricted-mode RMA/AMO (pid_offset = lac).
+ *   With the default build (UCT_CXI_MAX_LACS = 1) only dfa_rma[0] is built.
+ * dfa_am: DFA for unrestricted Active Messages (pid_offset = UCT_CXI_PTE_AM).
  */
 typedef struct uct_cxi_ep {
     uct_base_ep_t     super;                              /**< Must be first */
@@ -72,6 +71,8 @@ typedef struct uct_cxi_ep {
     uint32_t          rem_pid;                            /**< Remote PID */
     union c_fab_addr  dfa_rma[UCT_CXI_MAX_LACS];         /**< Per-LAC DFAs (pid_offset=lac) */
     uint8_t           dfa_rma_idx_ext[UCT_CXI_MAX_LACS]; /**< Per-LAC idx_ext */
+    union c_fab_addr  dfa_am;                             /**< AM DFA (pid_offset=UCT_CXI_PTE_AM) */
+    uint8_t           dfa_am_idx_ext;                    /**< AM idx_ext */
     unsigned          outstanding;     /**< In-flight send ops for this EP */
 } uct_cxi_ep_t;
 
