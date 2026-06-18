@@ -270,6 +270,14 @@ UCS_TEST_P(test_cxi_am, am_bcopy_multiple)
     }
     ASSERT_TRUE(all_fired) << "Not all bcopy AM handlers fired within 5 s";
 
+    /* Drain sender C_EVENT_SEND completions so descs are returned to the pool
+     * before fixture teardown (C_EVENT_SEND is the AM bcopy completion). */
+    ucs_status_t flush_st;
+    do {
+        uct_iface_progress(sender().iface());
+        flush_st = uct_ep_flush(ep, 0, NULL);
+    } while (flush_st == UCS_INPROGRESS && ucs_get_time() < deadline);
+
     for (size_t i = 0; i < N; i++) {
         ASSERT_EQ(PAY_LEN, ctx[i].data.size())
                 << "bcopy handler " << i << " wrong data size";

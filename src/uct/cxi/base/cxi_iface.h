@@ -28,10 +28,18 @@
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     256U
 
-/* AM receive buffer: 1 MiB OVERFLOW LE backing.
- * Large enough to absorb bursts of small AM messages before iface_progress
- * drains the EQ; reuses the same 1 MiB page for all AM traffic. */
-#define UCT_CXI_AM_RX_BUF_SIZE  (1u << 20)
+/* AM receive buffers: two 512 KiB OVERFLOW LEs (ping-pong).
+ * When the active buffer fills to within UCT_CXI_AM_MIN_FREE bytes, the NIC
+ * auto-unlinks it (sets auto_unlinked=1 in the final C_EVENT_PUT) and we post
+ * the spare buffer.  This prevents data races without requiring handler-level
+ * acknowledgement.  Messages may be dropped if both buffers are simultaneously
+ * full, but in-progress data is never corrupted. */
+#define UCT_CXI_AM_RX_BUF_SIZE  (512u * 1024u)  /* 512 KiB per buffer */
+#define UCT_CXI_AM_RX_NUM_BUFS  2
+/* min_free threshold: max possible message size aligned to 64 B.
+ * ceil((sizeof(uint64_t) + C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t) + 63) / 64) * 64
+ * = ceil(192/64)*64 = 192; use 256 for a one-slot safety margin. */
+#define UCT_CXI_AM_MIN_FREE     256u
 
 /*
  * Number of Logical Address Contexts (LACs) supported per iface.
@@ -145,8 +153,14 @@ typedef struct uct_cxi_iface {
     struct {
         struct cxil_pte      *pte;         /**< Unrestricted AM portal */
         struct cxil_pte_map  *pte_map;
-        uint8_t              *rx_buf;      /**< Page-aligned OVERFLOW backing buffer */
-        uct_cxi_mem_handle_t  rx_mh;      /**< cxil_map handle for rx_buf */
+        /* Two-buffer ping-pong receive ring.  Buffer 'active' is currently
+         * posted on the OVERFLOW list.  Buffer '1-active' is the spare (or
+         * draining after an auto-unlink).  See UCT_CXI_AM_MIN_FREE. */
+        uint8_t              *rx_buf[UCT_CXI_AM_RX_NUM_BUFS];
+        uct_cxi_mem_handle_t  rx_mh[UCT_CXI_AM_RX_NUM_BUFS];
+        size_t                cur_offset[UCT_CXI_AM_RX_NUM_BUFS];    /**< SW read pointer */
+        size_t                unlink_length[UCT_CXI_AM_RX_NUM_BUFS]; /**< SIZE_MAX = active */
+        int                   active; /**< Index of the currently posted buffer */
     } am;
 
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */

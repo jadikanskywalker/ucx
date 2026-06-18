@@ -6,26 +6,27 @@
  *
  * TX model
  * ────────
+ * Both ep_am_short and ep_am_bcopy use c_full_dma_cmd (restricted=0) targeting
+ * the remote AM PTE via ep->dfa_am.  No rkey is exchanged — unrestricted DMA
+ * routes by DFA (NID+PID+pid_offset) to the pre-posted OVERFLOW LE.
+ *
  * ep_am_short (≤ 184 B payload):
- *   Emit c_cstate_cmd (restricted=0, eq, index_ext from dfa_am_idx_ext) then
- *   c_idc_msg_hdr (dfa_am, match_bits=id, user_ptr=op, data=[hdr|payload]).
- *   The cstate sets the event queue; the IDC msg header carries user_ptr for
- *   the C_EVENT_ACK on the sender.  On C_EVENT_ACK the default progress path
- *   (handler=NULL) returns op to op_pool.
+ *   Acquires a desc from desc_pool, copies [header(8B)|payload] into desc+1,
+ *   then emits c_full_dma_cmd.  The NIC DMA's from the registered desc buffer
+ *   into the remote OVERFLOW LE, advancing the remote write pointer per message
+ *   (unlike IDC unrestricted, which always writes to le.start).  On C_EVENT_ACK
+ *   the bcopy_comp handler returns desc to desc_pool.  Returns UCS_OK (caller's
+ *   header+payload are copied into desc and reusable immediately).
  *
  * ep_am_bcopy (≤ max_bcopy):
- *   Acquires a desc from desc_pool (same pool as RMA put_bcopy), calls
- *   pack_cb to fill the data area, then emits c_full_dma_cmd (restricted=0,
- *   dfa_am, match_bits=id).  On C_EVENT_ACK the put_bcopy_comp handler returns
- *   desc to desc_pool.
- *
- * Both operations target the remote AM OVERFLOW LE via ep->dfa_am.
- * No remote registration or rkey needed — the LE is pre-posted at iface_open.
+ *   Same hardware path as ep_am_short but fills desc via pack_cb instead of
+ *   memcpy.  Returns ssize_t (bytes packed).
  *
  * RX model
  * ────────
- * Handled in cxi_iface.c: iface_progress sees C_EVENT_PUT on the AM OVERFLOW
- * LE, extracts am_id from match_bits[4:0], and calls uct_iface_invoke_am.
+ * iface_progress sees C_EVENT_PUT on the AM OVERFLOW LE, reads buffer_id to
+ * identify the receive buffer, and calls uct_iface_invoke_am.  The two-buffer
+ * ping-pong (UCT_CXI_AM_MIN_FREE, auto_unlinked) is managed in cxi_iface.c.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -67,18 +68,15 @@ static void uct_cxi_am_bcopy_comp(uct_cxi_send_op_t *op)
  */
 
 /*
- * uct_cxi_ep_am_short — post an unrestricted IDC AM message (≤ 184 B payload).
+ * uct_cxi_ep_am_short — unrestricted IDC AM send (≤ 184 B payload).
  *
- * Wire format: c_cstate_cmd (restricted=0, sets eq/index_ext) followed by
- * c_idc_msg_hdr (dfa_am, match_bits=id, user_ptr=op).  Data embedded in IDC:
- *   [uint64_t header (8 B)][uint8_t payload (length B)]
+ * Emits c_cstate_cmd (restricted=0, all events suppressed) followed by
+ * c_idc_msg_hdr carrying [header(8B)|payload] as inline data.  Pure
+ * fire-and-forget: no desc, no outstanding tracking, no events.  The NIC
+ * places the data in the remote OVERFLOW LE at its managed write pointer
+ * (manage_local=1 on the OVERFLOW LE).
  *
- * The receiver's C_EVENT_PUT carries match_bits (am_id), start (IOVA offset),
- * and mlength (8 + length).  iface_progress passes data directly from rx_buf
- * to uct_iface_invoke_am — zero-copy on the receive side.
- *
- * Returns UCS_OK (not UCS_INPROGRESS): source buffer reusable on return.
- * Remote visibility is not guaranteed until the next ep_flush returns UCS_OK.
+ * Returns UCS_OK on the same turn; caller's buffers are reusable immediately.
  */
 ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
                                   uint64_t header, const void *payload,
@@ -86,66 +84,51 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
 {
     uct_cxi_ep_t    *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t *iface = uct_cxi_am_ep_iface(ep);
-    uct_cxi_send_op_t *op;
-    int               ret;
+    uint8_t          buf[C_MAX_IDC_PAYLOAD_UNR]; /* stack: ≤192 B inline */
+    int              ret;
 
     UCT_CHECK_LENGTH(length, 0,
                      C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t), "am_short");
 
-    op = ucs_mpool_get(&iface->tx.op_pool);
-    if (ucs_unlikely(op == NULL)) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-    op->ep      = ep;
-    op->comp    = NULL;
-    op->handler = NULL;   /* default: mpool_put on C_EVENT_ACK */
+    memcpy(buf, &header, sizeof(uint64_t));
+    memcpy(buf + sizeof(uint64_t), payload, length);
 
-    /* c_cstate_cmd: unrestricted (restricted=0), sets EQ and idx_ext.
-     * user_ptr for C_EVENT_ACK goes in c_idc_msg_hdr.user_ptr, not here. */
     {
-        struct c_cstate_cmd cstate = {};
-        cstate.event_send_disable = 1;
-        cstate.restricted         = 0;
-        cstate.index_ext          = ep->dfa_am_idx_ext;
-        cstate.eq                 = iface->evtq->eqn;
+        struct c_cstate_cmd cstate    = {};
+        cstate.event_send_disable     = 1; /* fire-and-forget: no events */
+        cstate.event_success_disable  = 1;
+        cstate.restricted             = 0; /* unrestricted → AM OVERFLOW LE */
+        cstate.index_ext              = ep->dfa_am_idx_ext;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(op);
-        ucs_error("cxi ep %p am_short c_state emit failed: %d", ep, ret);
+        ucs_error("cxi ep %p am_short cstate emit failed: %d", ep, ret);
         return UCS_ERR_NO_RESOURCE;
     }
 
-    /* c_idc_msg_hdr + packed data: [header(8B)][payload(length B)].
-     * Fixed-size stack buffer (C_MAX_IDC_PAYLOAD_UNR = 192) avoids VLA.
-     * Scope limited to this block (OptimizationStyle: limit local lifetime). */
     {
-        uint8_t buf[C_MAX_IDC_PAYLOAD_UNR];
-        struct c_idc_msg_hdr idc = {};
+        struct c_idc_msg_hdr hdr = {};
+        hdr.dfa        = ep->dfa_am;
+        hdr.match_bits = (uint64_t)id;
 
-        memcpy(buf, &header, sizeof(uint64_t));
-        memcpy(buf + sizeof(uint64_t), payload, length);
-
-        idc.dfa        = ep->dfa_am;
-        idc.match_bits = (uint64_t)id;
-        idc.user_ptr   = (uint64_t)(uintptr_t)op; /* returned in C_EVENT_ACK */
-
-        ucs_info("cxi ep_am_short: id=%u payload_length=%zu match_bits=0x%lx",
+        ucs_info("cxi IDC_SEND: am_id=%u total_len=%zu "
+                 "nid=%u pid=%u idx_ext=%u "
+                 "wp32=%lu hw_wp32=%lu",
                  (unsigned)id, sizeof(uint64_t) + length,
-                 (unsigned long)idc.match_bits);
-        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &idc, buf,
-                                   sizeof(uint64_t) + length);
+                 ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
+                 (unsigned long)iface->tx.cmdq->wp32,
+                 (unsigned long)iface->tx.cmdq->hw_wp32);
+
+        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, buf,
+                                  sizeof(uint64_t) + length);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(op);
         ucs_error("cxi ep %p am_short idc_msg emit failed: %d", ep, ret);
         return UCS_ERR_NO_RESOURCE;
     }
 
     cxi_cq_ring(iface->tx.cmdq);
-    ep->outstanding++;
-    iface->tx.outstanding++;
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, SHORT, sizeof(uint64_t) + length);
@@ -194,18 +177,28 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
 
     {
         struct c_full_dma_cmd cmd = {};
-        cmd.command.opcode     = C_CMD_PUT;
-        cmd.index_ext          = ep->dfa_am_idx_ext;
-        cmd.lac                = desc->lac;
-        cmd.event_send_disable = 1;
-        cmd.restricted         = 0;   /* unrestricted: targets AM OVERFLOW LE */
-        cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_am;
-        cmd.match_bits         = (uint64_t)id;
-        cmd.remote_offset      = 0;   /* NIC places in OVERFLOW at its write ptr */
-        cmd.local_addr         = desc->iova;
-        cmd.request_len        = (uint32_t)length;
-        cmd.user_ptr           = (uint64_t)(uintptr_t)desc;
+        cmd.command.opcode       = C_CMD_PUT;
+        cmd.index_ext            = ep->dfa_am_idx_ext;
+        cmd.lac                  = desc->lac;
+        cmd.event_success_disable = 1; /* unrestricted PUT: no ACK; use SEND */
+        cmd.restricted           = 0;  /* unrestricted → AM OVERFLOW LE */
+        cmd.eq                   = iface->evtq->eqn;
+        cmd.dfa                  = ep->dfa_am;
+        cmd.match_bits           = (uint64_t)id;
+        cmd.remote_offset        = 0;  /* NIC places at its managed write pointer */
+        cmd.local_addr           = desc->iova;
+        cmd.request_len          = (uint32_t)length;
+        cmd.user_ptr             = (uint64_t)(uintptr_t)desc;
+
+        ucs_info("cxi DMA_PUT_SEND: am_id=%u len=%u "
+                 "nid=%u pid=%u idx_ext=%u eq=%u lac=%u "
+                 "local_addr=0x%lx wp32=%lu hw_wp32=%lu",
+                 (unsigned)id, cmd.request_len,
+                 ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
+                 (unsigned)cmd.eq, (unsigned)cmd.lac,
+                 (unsigned long)cmd.local_addr,
+                 (unsigned long)iface->tx.cmdq->wp32,
+                 (unsigned long)iface->tx.cmdq->hw_wp32);
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
     }

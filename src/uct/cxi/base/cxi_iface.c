@@ -39,6 +39,9 @@
 #include <errno.h>
 #include <string.h>
 
+// TEMPORARY
+#include <stdio.h>
+
 
 static UCS_F_ALWAYS_INLINE uct_cxi_md_t *
 uct_cxi_iface_md(uct_cxi_iface_t *iface)
@@ -163,18 +166,62 @@ err_destroy_pte:
 }
 
 /*
- * uct_cxi_iface_open_am_pte — open the unrestricted AM portal and post the
- * catch-all OVERFLOW LE backed by iface->am.rx_buf.
+ * uct_cxi_iface_post_am_le — post one OVERFLOW LE for AM receive buffer buf_idx.
  *
- * The PTE uses is_matching=1 (unrestricted mode).  A single OVERFLOW LE covers
- * the entire rx_buf with ignore_bits=UINT64_MAX (catch all AM IDs).
- * event_comm_disable is NOT set so C_EVENT_PUT fires for every received message.
+ * buffer_id=buf_idx is echoed in every C_EVENT_PUT from this LE, letting
+ * iface_progress identify which rx_buf the data landed in.  min_free causes
+ * the NIC to auto-unlink the LE (auto_unlinked=1 in the last C_EVENT_PUT)
+ * when the remaining free space drops below UCT_CXI_AM_MIN_FREE bytes.
+ */
+static ucs_status_t
+uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx)
+{
+    struct c_target_cmd le = {};
+    int                 ret;
+
+    le.command.opcode        = C_CMD_TGT_APPEND;
+    le.ptl_list              = C_PTL_LIST_OVERFLOW;
+    le.ptlte_index           = self->am.pte->ptn;
+    le.op_put                = 1;
+    le.op_get                = 0;
+    le.use_once              = 0;
+    le.manage_local          = 1;  /* NIC maintains write pointer; start advances per msg */
+    le.unrestricted_body_ro  = 1;  /* required companion to manage_local on OVERFLOW LEs */
+    le.unrestricted_end_ro   = 1;  /* required companion to manage_local on OVERFLOW LEs */
+    le.event_link_disable    = 1;
+    le.match_id              = CXI_MATCH_ID_ANY;
+    le.buffer_id             = (uint16_t)buf_idx;
+    le.lac                   = self->am.rx_mh[buf_idx].cxi_md->lac;
+    le.start                 = self->am.rx_mh[buf_idx].iova_offset +
+                               (uint64_t)(uintptr_t)self->am.rx_buf[buf_idx];
+    le.length                = UCT_CXI_AM_RX_BUF_SIZE;
+    le.min_free              = UCT_CXI_AM_MIN_FREE;
+    le.ignore_bits           = UINT64_MAX;
+    le.match_bits            = 0;
+
+    ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
+    if (ucs_unlikely(ret != 0)) {
+        ucs_error("cxi AM OVERFLOW LE APPEND buf %d: %d", buf_idx, ret);
+        return UCS_ERR_IO_ERROR;
+    }
+    cxi_cq_ring(self->tgt.cmdq);
+    return UCS_OK;
+}
+
+/*
+ * uct_cxi_iface_open_am_pte — open the unrestricted AM portal and post buffer 0
+ * as the initial OVERFLOW LE.  Buffer 1 is held in reserve (spare/draining).
+ *
+ * The PTE uses is_matching=1 (unrestricted mode) and use_long_event=1 to force
+ * 64-byte C_EVENT_TARGET_LONG events with valid rlength, mlength, and start.
  */
 static ucs_status_t
 uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
     const union c_event *ev;
+    ucs_status_t         status;
     int                  ret;
+    int                  i;
 
     {
         struct cxi_pt_alloc_opts pt_opts = {
@@ -223,38 +270,30 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
         }
     }
 
-    /* Post catch-all OVERFLOW LE for all AM IDs (ignore_bits = UINT64_MAX).
-     *
-     * event_link_disable=1: suppress C_EVENT_LINK; no drain needed.
-     * match_id=CXI_MATCH_ID_ANY: accept unrestricted messages from any initiator.
-     */
-    {
-        struct c_target_cmd le = {};
-        le.command.opcode     = C_CMD_TGT_APPEND;
-        le.ptl_list           = C_PTL_LIST_OVERFLOW;
-        le.ptlte_index        = self->am.pte->ptn;
-        le.op_put             = 1;
-        le.op_get             = 0;
-        le.use_once           = 0;
-        le.event_link_disable = 1;
-        le.match_id           = CXI_MATCH_ID_ANY;
-        le.lac                = self->am.rx_mh.cxi_md->lac;
-        le.start              = self->am.rx_mh.iova_offset +
-                                (uint64_t)(uintptr_t)self->am.rx_buf;
-        le.length             = UCT_CXI_AM_RX_BUF_SIZE;
-        le.ignore_bits        = UINT64_MAX;
-        le.match_bits         = 0;
-
-        ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
-        if (ret != 0) {
-            ucs_error("cxi AM OVERFLOW LE APPEND: %d", ret);
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(self->tgt.cmdq);
+    /* Initialise tracking state: buffer 0 is active, buffer 1 is spare. */
+    self->am.active = 0;
+    for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
+        self->am.cur_offset[i]    = 0;
+        self->am.unlink_length[i] = SIZE_MAX;  /* SIZE_MAX = active / not draining */
     }
 
-    ucs_info("cxi AM PTE ptn %u enabled rx_buf %p size %u",
-              self->am.pte->ptn, self->am.rx_buf, UCT_CXI_AM_RX_BUF_SIZE);
+    /* Post both buffers immediately so the OVERFLOW list is never empty
+     * even if one LE is silently invalidated by the NIC.  Both start as
+     * active; the auto-unlink / draining logic in iface_progress switches
+     * them over when min_free fires on whichever LE is first in the list. */
+    status = uct_cxi_iface_post_am_le(self, 0);
+    if (status != UCS_OK) {
+        goto err_unmap_pte;
+    }
+    status = uct_cxi_iface_post_am_le(self, 1);
+    if (status != UCS_OK) {
+        goto err_unmap_pte;
+    }
+
+    ucs_debug("cxi AM PTE ptn %u enabled rx_buf[0] %p rx_buf[1] %p size %u",
+              self->am.pte->ptn,
+              self->am.rx_buf[0], self->am.rx_buf[1],
+              UCT_CXI_AM_RX_BUF_SIZE);
     return UCS_OK;
 
 err_unmap_pte:
@@ -583,30 +622,39 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     /*
-     * Step 14: AM receive buffer + OVERFLOW LE.
+     * Step 14: AM receive buffers (two-buffer ping-pong) + OVERFLOW LE.
      *
-     * rx_buf is page-aligned so that iova_offset + rx_buf_va = rx_buf's exact
-     * IOVA — required for the start/offset arithmetic in iface_progress.
-     * The LE is appended to the OVERFLOW list of the AM PTE; it catches all
-     * incoming AM messages regardless of match_bits.
+     * Each rx_buf is page-aligned so that iova_offset + rx_buf_va gives the
+     * exact IOVA of the buffer start — required for start/offset arithmetic
+     * in iface_progress.  We post buffer 0 immediately; buffer 1 is held in
+     * reserve and posted when buffer 0 auto-unlinks (see UCT_CXI_AM_MIN_FREE).
      */
-    ret = ucs_posix_memalign((void **)&self->am.rx_buf,
-                             ucs_get_page_size(), UCT_CXI_AM_RX_BUF_SIZE,
-                             "cxi-am-rx-buf");
-    if (ret != 0) {
-        status = UCS_ERR_NO_MEMORY;
-        goto err_unmap_get_short;
-    }
-
-    status = uct_cxi_do_map(lni, self->am.rx_buf, UCT_CXI_AM_RX_BUF_SIZE,
-                            &self->am.rx_mh);
-    if (status != UCS_OK) {
-        goto err_free_am_rx_buf;
+    {
+        int i;
+        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
+            self->am.rx_buf[i] = NULL;
+        }
+        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
+            ret = ucs_posix_memalign((void **)&self->am.rx_buf[i],
+                                     ucs_get_page_size(), UCT_CXI_AM_RX_BUF_SIZE,
+                                     "cxi-am-rx-buf");
+            if (ret != 0) {
+                status = UCS_ERR_NO_MEMORY;
+                goto err_am_rx_bufs;
+            }
+            status = uct_cxi_do_map(lni, self->am.rx_buf[i],
+                                    UCT_CXI_AM_RX_BUF_SIZE, &self->am.rx_mh[i]);
+            if (status != UCS_OK) {
+                ucs_free(self->am.rx_buf[i]);
+                self->am.rx_buf[i] = NULL;
+                goto err_am_rx_bufs;
+            }
+        }
     }
 
     status = uct_cxi_iface_open_am_pte(self, lni);
     if (status != UCS_OK) {
-        goto err_unmap_am_rx_buf;
+        goto err_am_rx_bufs;
     }
 
     ucs_info("cxi iface open %p nid 0x%x pid %u ptn %u pid_bits %u "
@@ -616,10 +664,16 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
              (unsigned)UCT_CXI_MAX_LACS);
     return UCS_OK;
 
-err_unmap_am_rx_buf:
-    uct_cxi_do_unmap(&self->am.rx_mh);
-err_free_am_rx_buf:
-    ucs_free(self->am.rx_buf);
+err_am_rx_bufs:
+    {
+        int i;
+        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
+            if (self->am.rx_buf[i] != NULL) {
+                uct_cxi_do_unmap(&self->am.rx_mh[i]);
+                ucs_free(self->am.rx_buf[i]);
+            }
+        }
+    }
 err_unmap_get_short:
     uct_cxi_do_unmap(&self->tx.get_short_mh);
 err_free_get_short_buf:
@@ -681,8 +735,13 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
             ucs_warn("cxi cxil_destroy_pte AM failed: %s", strerror(-ret));
         }
     }
-    uct_cxi_do_unmap(&self->am.rx_mh);
-    ucs_free(self->am.rx_buf);
+    {
+        int i;
+        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
+            uct_cxi_do_unmap(&self->am.rx_mh[i]);
+            ucs_free(self->am.rx_buf[i]);
+        }
+    }
 
     uct_cxi_do_unmap(&self->tx.get_short_mh);
     ucs_free(self->tx.get_short_buf);
@@ -812,8 +871,14 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
 /*
  * uct_cxi_iface_progress — poll the event queue for send completions.
  *
- * Handles C_EVENT_ACK (PUT completions) and C_EVENT_REPLY (GET completions).
- * Both carry the send_op pointer in init_short.user_ptr.
+ * Handles initiator-side TX completions and target-side AM receives.
+ *
+ * C_EVENT_ACK  — restricted PUT (RMA) confirmed by remote NIC.
+ * C_EVENT_REPLY — GET data returned.
+ * C_EVENT_SEND  — unrestricted PUT (AM bcopy) locally sent; src buf safe to free.
+ * C_EVENT_PUT   — AM message landed in OVERFLOW LE on this iface.
+ *
+ * ACK, REPLY, and SEND all carry the send_op pointer in init_short.user_ptr.
  */
 static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
@@ -823,13 +888,17 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
     unsigned             n = 0;
 
     while ((event = cxi_eq_get_event(iface->evtq)) != NULL) {
-        if (event->hdr.event_type == C_EVENT_ACK ||
-            event->hdr.event_type == C_EVENT_REPLY) {
-            /* Initiator-side TX completion: ACK (PUT) or REPLY (GET). */
+        if (event->hdr.event_type == C_EVENT_ACK  ||
+            event->hdr.event_type == C_EVENT_REPLY ||
+            event->hdr.event_type == C_EVENT_SEND) {
+            /* Initiator-side TX completion.
+             * ACK   = restricted PUT confirmed by remote (RMA).
+             * REPLY = GET data returned (RMA).
+             * SEND  = unrestricted PUT sent into fabric (AM bcopy); desc safe. */
             op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
             if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
-                ucs_error("cxi %s error: rc=%d ep %p",
-                          event->hdr.event_type == C_EVENT_ACK ? "ACK" : "REPLY",
+                ucs_error("cxi TX event %d error: rc=%d ep %p",
+                          (int)event->hdr.event_type,
                           cxi_event_rc(event), op->ep);
             }
             op->ep->outstanding--;
@@ -843,40 +912,86 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                 ucs_mpool_put(op);     /* zcopy / short */
             }
         } else if (event->hdr.event_type == C_EVENT_PUT) {
-            if (ucs_unlikely(!event->tgt_long.rlength)) {
-                ucs_info("cxi C_EVENT_PUT filtered: rlength=0 mlength=%u "
-                         "start=0x%lx match_bits=0x%lx rc=%d",
-                         (unsigned)event->tgt_long.mlength,
-                         (unsigned long)event->tgt_long.start,
-                         (unsigned long)event->tgt_long.match_bits,
-                         cxi_event_rc(event));
-            } else {
-                /* Target-side AM receive: data landed in the OVERFLOW LE rx_buf.
-                 * event->tgt_long.start is the absolute IOVA of the data.
-                 * Convert to a VA by subtracting the rx_buf's iova_offset. */
-                uint64_t rx_buf_iova = iface->am.rx_mh.iova_offset +
-                                       (uint64_t)(uintptr_t)iface->am.rx_buf;
-                uint8_t  am_id       = (uint8_t)(event->tgt_long.match_bits & 0x1f);
-                void    *data        = (uint8_t *)iface->am.rx_buf +
-                                       (size_t)(event->tgt_long.start - rx_buf_iova);
-                uint32_t len         = event->tgt_long.mlength;
+            /* Target-side AM receive.  buffer_id identifies which rx_buf the
+             * NIC wrote into.  start is the absolute IOVA of the first byte. */
+            int      buf_idx  = (int)event->tgt_long.buffer_id;
+            uint64_t buf_iova = iface->am.rx_mh[buf_idx].iova_offset +
+                                (uint64_t)(uintptr_t)iface->am.rx_buf[buf_idx];
+            uint32_t len      = event->tgt_long.mlength;
+            uint8_t  am_id    = (uint8_t)(event->tgt_long.match_bits & 0x1f);
+            void    *data     = (uint8_t *)iface->am.rx_buf[buf_idx] +
+                                (size_t)(event->tgt_long.start - buf_iova);
+            size_t   msg_end  = (size_t)(event->tgt_long.start - buf_iova) + len;
 
-                ucs_info("cxi C_EVENT_PUT: am_id=%u mlength=%u rlength=%u "
-                         "start=0x%lx rx_buf_iova=0x%lx match_bits=0x%lx rc=%d",
-                         (unsigned)am_id, (unsigned)len,
-                         (unsigned)event->tgt_long.rlength,
-                         (unsigned long)event->tgt_long.start,
-                         (unsigned long)rx_buf_iova,
-                         (unsigned long)event->tgt_long.match_bits,
-                         cxi_event_rc(event));
+            ucs_info("cxi C_EVENT_PUT: event_type=%d buf=%d ptl_list=%d "
+                     "am_id=%u mlength=%u rlength=%u "
+                     "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
+                     "offset=%zu auto_unlinked=%u rc=%d "
+                     "lpe_stat_1=%u lpe_stat_2=%u",
+                     (int)event->hdr.event_type,
+                     buf_idx, (int)event->tgt_long.ptl_list,
+                     (unsigned)am_id, (unsigned)len,
+                     (unsigned)event->tgt_long.rlength,
+                     (unsigned long)event->tgt_long.start,
+                     (unsigned long)event->tgt_long.remote_offset,
+                     (unsigned long)buf_iova,
+                     (size_t)(event->tgt_long.start - buf_iova),
+                     (unsigned)event->tgt_long.auto_unlinked,
+                     cxi_event_rc(event),
+                     (unsigned)event->tgt_long.lpe_stat_1,
+                     (unsigned)event->tgt_long.lpe_stat_2);
 
-                uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
+            /* High-water-mark: advance software read pointer for this buffer. */
+            if (msg_end > iface->am.cur_offset[buf_idx]) {
+                iface->am.cur_offset[buf_idx] = msg_end;
             }
+
+            /* NIC auto-unlinked this buffer (min_free threshold reached).
+             * This is the last C_EVENT_PUT for this LE.  Post the spare buffer
+             * immediately so the OVERFLOW list is never empty. */
+            if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+                int fresh = 1 - buf_idx;
+                iface->am.unlink_length[buf_idx] = msg_end;
+                iface->am.cur_offset[fresh]      = 0;
+                iface->am.unlink_length[fresh]   = SIZE_MAX;
+                iface->am.active                 = fresh;
+                uct_cxi_iface_post_am_le(iface, fresh);
+            }
+
+            uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
+
+            /* If the draining buffer is now fully consumed, reset it for reuse. */
+            {
+                int draining = 1 - iface->am.active;
+                if (iface->am.unlink_length[draining] != SIZE_MAX &&
+                    iface->am.cur_offset[draining] >=
+                            iface->am.unlink_length[draining]) {
+                    iface->am.cur_offset[draining]    = 0;
+                    iface->am.unlink_length[draining] = SIZE_MAX;
+                }
+            }
+        } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
+            ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
+                     "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",
+                     (int)event->tgt_long.ptl_list,
+                     (unsigned)(event->tgt_long.match_bits & 0x1f),
+                     (unsigned)event->tgt_long.mlength,
+                     (unsigned long)event->tgt_long.start,
+                     (unsigned long)event->tgt_long.remote_offset,
+                     cxi_event_rc(event));
         } else {
             ucs_info("cxi iface_progress: unhandled event type %d",
                      (int)event->hdr.event_type);
         }
         n++;
+    }
+
+    // TEMPORARY
+    fflush(stdout);
+
+    if (ucs_unlikely(cxi_eq_get_drops(iface->evtq))) {
+        ucs_error("cxi EQ drop detected: events lost (EQ full)");
+        cxi_eq_ack_drops(iface->evtq);
     }
 
     if (n > 0) {
