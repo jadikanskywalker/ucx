@@ -41,6 +41,12 @@
  * = ceil(192/64)*64 = 192; use 256 for a one-slot safety margin. */
 #define UCT_CXI_AM_MIN_FREE     256u
 
+/* Proactive ULE rotation: after this many received messages on one OVERFLOW LE,
+ * issue async TGT_UNLINK to release ULE table entries before the NIC's per-PTE
+ * limit of 512 is reached.  Must be well below 512/2 so the total across both
+ * active+spare buffers never reaches the hardware limit. */
+#define UCT_CXI_AM_ULE_THRESH   200u
+
 /*
  * Number of Logical Address Contexts (LACs) supported per iface.
  *
@@ -155,12 +161,20 @@ typedef struct uct_cxi_iface {
         struct cxil_pte_map  *pte_map;
         /* Two-buffer ping-pong receive ring.  Buffer 'active' is currently
          * posted on the OVERFLOW list.  Buffer '1-active' is the spare (or
-         * draining after an auto-unlink).  See UCT_CXI_AM_MIN_FREE. */
+         * draining after an auto-unlink).  See UCT_CXI_AM_MIN_FREE.
+         *
+         * ULE rotation: each received message occupies one NIC ULE entry until
+         * the LE is unlinked.  After UCT_CXI_AM_ULE_THRESH messages we issue
+         * an async TGT_UNLINK; the C_EVENT_UNLINK handler reposts the buffer
+         * with a fresh ULE slot count.  See UCT_CXI_AM_ULE_THRESH. */
         uint8_t              *rx_buf[UCT_CXI_AM_RX_NUM_BUFS];
         uct_cxi_mem_handle_t  rx_mh[UCT_CXI_AM_RX_NUM_BUFS];
         size_t                cur_offset[UCT_CXI_AM_RX_NUM_BUFS];    /**< SW read pointer */
         size_t                unlink_length[UCT_CXI_AM_RX_NUM_BUFS]; /**< SIZE_MAX = active */
+        uint32_t              rx_count[UCT_CXI_AM_RX_NUM_BUFS];      /**< ULEs accumulated */
+        bool                  invalidating[UCT_CXI_AM_RX_NUM_BUFS];  /**< TGT_UNLINK pending */
         int                   active; /**< Index of the currently posted buffer */
+        uint32_t              rx_total; /**< Total messages received (never reset) */
     } am;
 
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */

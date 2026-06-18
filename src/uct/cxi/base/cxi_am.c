@@ -96,7 +96,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     {
         struct c_cstate_cmd cstate    = {};
         cstate.event_send_disable     = 1; /* fire-and-forget: no events */
-        cstate.event_success_disable  = 1;
+        cstate.event_success_disable  = 0;
         cstate.restricted             = 0; /* unrestricted → AM OVERFLOW LE */
         cstate.index_ext              = ep->dfa_am_idx_ext;
 
@@ -180,7 +180,8 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.command.opcode       = C_CMD_PUT;
         cmd.index_ext            = ep->dfa_am_idx_ext;
         cmd.lac                  = desc->lac;
-        cmd.event_success_disable = 1; /* unrestricted PUT: no ACK; use SEND */
+        cmd.event_send_disable     = 1; /* fire-and-forget: no events */
+        cmd.event_success_disable = 0; /* unrestricted PUT: no ACK; use SEND */
         cmd.restricted           = 0;  /* unrestricted → AM OVERFLOW LE */
         cmd.eq                   = iface->evtq->eqn;
         cmd.dfa                  = ep->dfa_am;
@@ -190,15 +191,15 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.request_len          = (uint32_t)length;
         cmd.user_ptr             = (uint64_t)(uintptr_t)desc;
 
-        ucs_info("cxi DMA_PUT_SEND: am_id=%u len=%u "
-                 "nid=%u pid=%u idx_ext=%u eq=%u lac=%u "
-                 "local_addr=0x%lx wp32=%lu hw_wp32=%lu",
-                 (unsigned)id, cmd.request_len,
-                 ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
-                 (unsigned)cmd.eq, (unsigned)cmd.lac,
-                 (unsigned long)cmd.local_addr,
-                 (unsigned long)iface->tx.cmdq->wp32,
-                 (unsigned long)iface->tx.cmdq->hw_wp32);
+        // ucs_info("cxi DMA_PUT_SEND: am_id=%u len=%u "
+        //          "nid=%u pid=%u idx_ext=%u eq=%u lac=%u "
+        //          "local_addr=0x%lx wp32=%lu hw_wp32=%lu",
+        //          (unsigned)id, cmd.request_len,
+        //          ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
+        //          (unsigned)cmd.eq, (unsigned)cmd.lac,
+        //          (unsigned long)cmd.local_addr,
+        //          (unsigned long)iface->tx.cmdq->wp32,
+        //          (unsigned long)iface->tx.cmdq->hw_wp32);
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
     }
