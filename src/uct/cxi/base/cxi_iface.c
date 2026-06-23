@@ -166,12 +166,11 @@ err_destroy_pte:
 }
 
 /*
- * uct_cxi_iface_post_am_le — post one OVERFLOW LE for AM receive buffer buf_idx.
+ * uct_cxi_iface_post_am_le — append one PRIORITY ME for AM receive buffer buf_idx.
  *
- * buffer_id=buf_idx is echoed in every C_EVENT_PUT from this LE, letting
- * iface_progress identify which rx_buf the data landed in.  min_free causes
- * the NIC to auto-unlink the LE (auto_unlinked=1 in the last C_EVENT_PUT)
- * when the remaining free space drops below UCT_CXI_AM_MIN_FREE bytes.
+ * buffer_id=buf_idx is echoed in every C_EVENT_PUT, letting iface_progress
+ * identify which rx_buf the data landed in.  min_free triggers NIC auto-unlink
+ * when remaining space drops below UCT_CXI_AM_MIN_FREE bytes.
  */
 static ucs_status_t
 uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
@@ -228,7 +227,6 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
     const union c_event *ev;
     ucs_status_t         status;
     int                  ret;
-    int                  i;
 
     {
         struct cxi_pt_alloc_opts pt_opts = {
@@ -277,19 +275,10 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
         }
     }
 
-    /* Initialise tracking state: buffer 0 is active, buffer 1 is spare. */
-    self->am.active = 0;
-    for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
-        self->am.cur_offset[i]    = 0;
-        self->am.unlink_length[i] = SIZE_MAX;  /* SIZE_MAX = active / not draining */
-        self->am.rx_count[i]      = 0;
-        self->am.invalidating[i]  = false;
-    }
+    self->am.rx_total = 0;
 
-    /* Post both buffers immediately so the OVERFLOW list is never empty
-     * even if one LE is silently invalidated by the NIC.  Both start as
-     * active; the auto-unlink / draining logic in iface_progress switches
-     * them over when min_free fires on whichever LE is first in the list. */
+    /* Post both buffers into the PRIORITY list.  The NIC writes to the
+     * head buffer first; auto-unlink rotates to the next one. */
     status = uct_cxi_iface_post_am_le(self, 0, 0);
     if (status != UCS_OK) {
         goto err_unmap_pte;
@@ -898,12 +887,10 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 
     while ((event = cxi_eq_get_event(iface->evtq)) != NULL) {
         if (event->hdr.event_type == C_EVENT_ACK  ||
-            event->hdr.event_type == C_EVENT_REPLY ||
-            event->hdr.event_type == C_EVENT_SEND) {
+            event->hdr.event_type == C_EVENT_REPLY) {
             /* Initiator-side TX completion.
              * ACK   = restricted PUT confirmed by remote (RMA).
-             * REPLY = GET data returned (RMA).
-             * SEND  = unrestricted PUT sent into fabric (AM bcopy); desc safe. */
+             * REPLY = GET data returned (RMA). */
             op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
             if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
                 ucs_error("cxi TX event %d error: rc=%d ep %p",
@@ -917,10 +904,6 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                                   pte_s.state, pte_s.drop_count, pte_s.ule_count);
                     }
                 }
-            } else if (event->hdr.event_type == C_EVENT_ACK) {
-                // ucs_info("cxi C_EVENT_ACK recieved");
-            } else if (event->hdr.event_type == C_EVENT_SEND) {
-                ucs_info("cxi C_EVENT_SEND recieved");
             }
             op->ep->outstanding--;
             iface->tx.outstanding--;
@@ -944,116 +927,55 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                                 (size_t)(event->tgt_long.start - buf_iova);
             size_t   msg_end  = (size_t)(event->tgt_long.start - buf_iova) + len;
 
-            ucs_info("cxi C_EVENT_PUT: event_type=%d buf=%d ptl_list=%d "
-                     "am_id=%u mlength=%u rlength=%u "
-                     "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
-                     "offset=%zu auto_unlinked=%u rc=%d "
-                     "lpe_stat_1=%u lpe_stat_2=%u",
-                     (int)event->hdr.event_type,
-                     buf_idx, (int)event->tgt_long.ptl_list,
-                     (unsigned)am_id, (unsigned)len,
-                     (unsigned)event->tgt_long.rlength,
-                     (unsigned long)event->tgt_long.start,
-                     (unsigned long)event->tgt_long.remote_offset,
-                     (unsigned long)buf_iova,
-                     (size_t)(event->tgt_long.start - buf_iova),
-                     (unsigned)event->tgt_long.auto_unlinked,
-                     cxi_event_rc(event),
-                     (unsigned)event->tgt_long.lpe_stat_1,
-                     (unsigned)event->tgt_long.lpe_stat_2);
-
-            /* High-water-mark: advance software read pointer for this buffer. */
-            if (msg_end > iface->am.cur_offset[buf_idx]) {
-                iface->am.cur_offset[buf_idx] = msg_end;
-            }
+            // ucs_info("cxi C_EVENT_PUT: event_type=%d buf=%d ptl_list=%d "
+            //          "am_id=%u mlength=%u rlength=%u "
+            //          "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
+            //          "offset=%zu auto_unlinked=%u rc=%d "
+            //          "lpe_stat_1=%u lpe_stat_2=%u",
+            //          (int)event->hdr.event_type,
+            //          buf_idx, (int)event->tgt_long.ptl_list,
+            //          (unsigned)am_id, (unsigned)len,
+            //          (unsigned)event->tgt_long.rlength,
+            //          (unsigned long)event->tgt_long.start,
+            //          (unsigned long)event->tgt_long.remote_offset,
+            //          (unsigned long)buf_iova,
+            //          (size_t)(event->tgt_long.start - buf_iova),
+            //          (unsigned)event->tgt_long.auto_unlinked,
+            //          cxi_event_rc(event),
+            //          (unsigned)event->tgt_long.lpe_stat_1,
+            //          (unsigned)event->tgt_long.lpe_stat_2);
 
             /* NIC auto-unlinked this buffer (min_free threshold reached).
-             * This is the last C_EVENT_PUT for this LE.  Post the spare buffer
-             * immediately so the OVERFLOW list is never empty.
-             * Also reset rx_count so the ULE rotation check below sees a clean
-             * slate and does not try to issue TGT_UNLINK on a buffer that is
-             * already gone from the OVERFLOW list. */
-            if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-                int fresh = 1 - buf_idx;
-                iface->am.unlink_length[buf_idx] = msg_end;
-                iface->am.cur_offset[fresh]      = 0;
-                iface->am.unlink_length[fresh]   = SIZE_MAX;
-                iface->am.active                 = fresh;
-                iface->am.rx_count[buf_idx]      = 0;
-                ucs_info("cxi AM LE auto_unlinked buf=%d at %zu bytes → posting spare buf=%d",
-                         buf_idx, msg_end, fresh);
-                uct_cxi_iface_post_am_le(iface, fresh, 1);
-            }
+             * This is the last C_EVENT_PUT for this LE; the NIC has already
+             * removed it from the PRIORITY list.  Switch active to the spare
+             * buffer (already posted, so no gap).  C_EVENT_UNLINK will follow
+             * and the handler there reposts this buffer at the end of the list. */
+            // if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+            //     ucs_info("cxi AM LE auto_unlinked buf=%d at offset=%zu",
+            //              buf_idx, msg_end);
+            // }
 
             uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
 
-            /* If the draining buffer is now fully consumed, reset it for reuse. */
-            {
-                int draining = 1 - iface->am.active;
-                if (iface->am.unlink_length[draining] != SIZE_MAX &&
-                    iface->am.cur_offset[draining] >=
-                            iface->am.unlink_length[draining]) {
-                    iface->am.cur_offset[draining]    = 0;
-                    iface->am.unlink_length[draining] = SIZE_MAX;
-                }
-            }
-
-            /* Periodic pte_status diagnostic: log les_allocated + ule_count
-             * every 50 total received messages to catch LE disappearance. */
-            if ((++iface->am.rx_total % 50) == 0 && iface->am.pte != NULL) {
-                struct cxi_pte_status pte_s = {};
-                if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
-                    ucs_info("cxi AM PTE periodic rx_total=%u: "
-                             "state=%u drop_count=%u les_alloc=%u ule_count=%u",
-                             iface->am.rx_total, pte_s.state,
-                             pte_s.drop_count, pte_s.les_allocated,
-                             pte_s.ule_count);
-                }
-            }
-
-            /* Proactive ULE rotation: each message occupies one NIC ULE entry
-             * until the LE is unlinked.  Issue async TGT_UNLINK before the
-             * per-PTE hardware limit (512) is reached.  The spare buffer is
-             * already posted, so no messages are lost during the transition.
-             * The C_EVENT_UNLINK handler below reposts this buffer fresh.
-             * Skip if the LE was already auto-unlinked (rx_count was reset to 0
-             * in the auto_unlinked branch above, keeping the check false). */
-            if (ucs_unlikely(!event->tgt_long.auto_unlinked &&
-                             ++iface->am.rx_count[buf_idx] >= UCT_CXI_AM_ULE_THRESH &&
-                             !iface->am.invalidating[buf_idx])) {
-                struct c_target_cmd ul = {};
-                ul.command.opcode = C_CMD_TGT_UNLINK;
-                ul.ptlte_index    = iface->am.pte->ptn;
-                ul.ptl_list       = C_PTL_LIST_PRIORITY;
-                ul.buffer_id      = (uint16_t)buf_idx;
-                iface->am.invalidating[buf_idx] = true;
-                iface->am.active                = 1 - buf_idx;
-                cxi_cq_emit_target(iface->tgt.cmdq, &ul);
-                cxi_cq_ring(iface->tgt.cmdq);
-                ucs_info("cxi AM LE TGT_UNLINK issued buf=%d rx_count=%u → active now buf=%d",
-                         buf_idx, iface->am.rx_count[buf_idx], iface->am.active);
-            }
+            // /* Periodic pte_status diagnostic: log les_allocated + ule_count
+            //  * every 50 total received messages to catch LE disappearance. */
+            // if ((++iface->am.rx_total % 50) == 0 && iface->am.pte != NULL) {
+            //     struct cxi_pte_status pte_s = {};
+            //     if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
+            //         ucs_info("cxi AM PTE periodic rx_total=%u: "
+            //                  "state=%u drop_count=%u les_alloc=%u ule_count=%u",
+            //                  iface->am.rx_total, pte_s.state,
+            //                  pte_s.drop_count, pte_s.les_allocated,
+            //                  pte_s.ule_count);
+            //     }
+            // }
         } else if (event->hdr.event_type == C_EVENT_UNLINK) {
-            /* TGT_UNLINK completed: the LE's ULE table entries are now freed.
-             * Reset all per-buffer state and repost it at the end of the
-             * OVERFLOW list so it can accept new messages with a fresh ULE
-             * allocation.  cur_offset is cleared because the NIC's managed
-             * write pointer restarts at buffer start on each fresh append. */
+            /* LE was auto-unlinked (min_free) or software-unlinked.  Repost
+             * at the tail of the PRIORITY list so the ring keeps rotating. */
             int u_buf = (int)event->tgt_long.buffer_id;
-            iface->am.rx_count[u_buf]      = 0;
-            iface->am.invalidating[u_buf]  = false;
-            iface->am.cur_offset[u_buf]    = 0;
-            iface->am.unlink_length[u_buf] = SIZE_MAX;
-            ucs_info("cxi AM LE C_EVENT_UNLINK buf=%d → reposting at end of OVERFLOW list",
-                     u_buf);
+            // ucs_info("cxi AM LE C_EVENT_UNLINK buf=%d → reposting",
+            //          u_buf);
             uct_cxi_iface_post_am_le(iface, u_buf, 1);
-        } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
-            /* PTE state transitions arrive here during normal init (DISABLED →
-             * ENABLED) and must not be treated as errors.  Any state change
-             * outside of open_am_pte's init spin-loop is unexpected. */
-            ucs_warn("cxi iface_progress: unexpected PTE state change "
-                     "(state=%u); possible ULE exhaustion",
-                     (unsigned)event->tgt_long.initiator.state_change.ptlte_state);
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                      "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",
