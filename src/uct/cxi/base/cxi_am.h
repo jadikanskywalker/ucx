@@ -30,4 +30,9 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h ep, uint8_t id,
                              uct_pack_callback_t pack_cb, void *arg,
                              unsigned flags);
 
+ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h ep, uint8_t id,
+                                  const void *header, unsigned header_length,
+                                  const uct_iov_t *iov, size_t iovcnt,
+                                  unsigned flags, uct_completion_t *comp);
+
 #endif /* UCT_CXI_AM_H */

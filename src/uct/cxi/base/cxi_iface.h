@@ -26,16 +26,13 @@
 #define UCT_CXI_EQ_BUF_LEN    (UCT_CXI_EQ_NUM_EVENTS * UCT_CXI_EQ_ENTRY_SIZE)
 
 /* Command queue depth. */
-#define UCT_CXI_CMDQ_DEPTH     256U
+#define UCT_CXI_CMDQ_DEPTH     512U
 
-/* AM receive buffers: two 512 KiB OVERFLOW LEs (ping-pong).
- * When the active buffer fills to within UCT_CXI_AM_MIN_FREE bytes, the NIC
- * auto-unlinks it (sets auto_unlinked=1 in the final C_EVENT_PUT) and we post
- * the spare buffer.  This prevents data races without requiring handler-level
- * acknowledgement.  Messages may be dropped if both buffers are simultaneously
- * full, but in-progress data is never corrupted. */
-#define UCT_CXI_AM_RX_BUF_SIZE  (512u * 1024u)  /* 512 KiB per buffer */
-#define UCT_CXI_AM_RX_NUM_BUFS  2
+/* AM receive buffer defaults.  Actual values are runtime-configurable
+ * via UCX_CXI_AM_RX_NUM_BUFS and UCX_CXI_AM_RX_BUF_SIZE. */
+#define UCT_CXI_AM_RX_BUF_SIZE_DEFAULT  (512u * 1024u)  /* 512 KiB per buffer */
+#define UCT_CXI_AM_RX_NUM_BUFS_DEFAULT  4
+#define UCT_CXI_AM_RX_NUM_BUFS_MAX      16
 /* min_free threshold: max possible message size aligned to 64 B.
  * ceil((sizeof(uint64_t) + C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t) + 63) / 64) * 64
  * = ceil(192/64)*64 = 192; use 256 for a one-slot safety margin. */
@@ -95,6 +92,9 @@ typedef struct uct_cxi_iface_config {
     uct_iface_config_t       super;
     uct_iface_mpool_config_t bcopy_mp;  /**< desc_pool config (bufs_grow, max_bufs) */
     size_t                   max_bcopy; /**< Max payload for put_bcopy/get_bcopy    */
+    unsigned                 am_rx_num_bufs; /**< # AM receive buffers (PRIORITY MEs) */
+    size_t                   am_rx_buf_size; /**< Size of each AM receive buffer     */
+    size_t                   am_max_zcopy;  /**< Max AM zcopy payload               */
 } uct_cxi_iface_config_t;
 
 
@@ -154,15 +154,16 @@ typedef struct uct_cxi_iface {
     struct {
         struct cxil_pte      *pte;         /**< Unrestricted AM portal */
         struct cxil_pte_map  *pte_map;
-        /* Two-buffer ping-pong on the PRIORITY list.  Both buffers are
-         * posted at init.  The NIC writes to the head buffer using
-         * manage_local=1 (hardware-managed write pointer).  When remaining
-         * space drops below UCT_CXI_AM_MIN_FREE, the NIC auto-unlinks that
-         * buffer and moves to the next.  C_EVENT_UNLINK reposts the
-         * consumed buffer at the tail of the list. */
-        uint8_t              *rx_buf[UCT_CXI_AM_RX_NUM_BUFS];
-        uct_cxi_mem_handle_t  rx_mh[UCT_CXI_AM_RX_NUM_BUFS];
-        uint32_t              rx_total; /**< Total messages received (never reset) */
+        /* N-buffer rotation on the PRIORITY list.  All buffers are posted
+         * at init.  The NIC writes to the head buffer using manage_local=1.
+         * When remaining space drops below UCT_CXI_AM_MIN_FREE, the NIC
+         * auto-unlinks that buffer and moves to the next.  C_EVENT_UNLINK
+         * reposts the consumed buffer at the tail of the list. */
+        uint8_t              *rx_base;     /**< Single contiguous allocation */
+        uct_cxi_mem_handle_t  rx_mh;       /**< Single cxil_map for rx_base  */
+        unsigned              num_bufs;    /**< Runtime buffer count          */
+        size_t                buf_size;    /**< Runtime per-buffer size       */
+        uint32_t              rx_total;    /**< Total messages received       */
     } am;
 
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */

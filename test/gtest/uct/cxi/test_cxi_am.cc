@@ -290,4 +290,123 @@ UCS_TEST_P(test_cxi_am, am_bcopy_multiple)
 }
 
 
+/* -------------------------------------------------------------------------
+ * ep_am_zcopy tests
+ * -------------------------------------------------------------------------
+ */
+
+/**
+ * Send a single am_zcopy with a 4096-byte payload from a registered buffer.
+ * The handler receives the raw payload (no header — max_hdr = 0).
+ */
+UCS_TEST_P(test_cxi_am, am_zcopy_single)
+{
+    static const uint8_t AM_ID    = 20;
+    static const size_t  PAY_LEN  = 4096;
+    static const uint8_t PAY_FILL = 0xE7;
+
+    uct_cxi_am_recv_ctx ctx = {false, {}};
+    set_am_handler(AM_ID, &ctx);
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> payload(PAY_LEN, PAY_FILL);
+    uct_mem_h memh = reg(sender(), payload.data(), PAY_LEN);
+
+    uct_iov_t iov;
+    iov.buffer = payload.data();
+    iov.length = PAY_LEN;
+    iov.memh   = memh;
+    iov.stride = 0;
+    iov.count  = 1;
+
+    ucs_status_t st = uct_ep_am_zcopy(ep, AM_ID, NULL, 0, &iov, 1, 0, NULL);
+    ASSERT_EQ(UCS_INPROGRESS, st);
+
+    poll_am(ep, ctx);
+
+    ASSERT_EQ(PAY_LEN, ctx.data.size());
+    for (size_t i = 0; i < PAY_LEN; i++) {
+        EXPECT_EQ(PAY_FILL, ctx.data[i]) << "zcopy byte " << i << " mismatch";
+    }
+
+    dereg(sender(), memh);
+}
+
+/**
+ * Send multiple am_zcopy messages with distinct patterns.
+ * Verifies that successive zcopy sends are independently delivered and
+ * that completions fire correctly.
+ */
+UCS_TEST_P(test_cxi_am, am_zcopy_multiple)
+{
+    static const size_t N       = 4;
+    static const size_t PAY_LEN = 1024;
+
+    uct_cxi_am_recv_ctx ctx[N];
+    for (size_t i = 0; i < N; i++) {
+        ctx[i].fired = false;
+        set_am_handler(static_cast<uint8_t>(21 + i), &ctx[i]);
+    }
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> bufs[N];
+    uct_mem_h memhs[N];
+    for (size_t i = 0; i < N; i++) {
+        bufs[i].assign(PAY_LEN, static_cast<uint8_t>(0xF0 + i));
+        memhs[i] = reg(sender(), bufs[i].data(), PAY_LEN);
+    }
+
+    for (size_t i = 0; i < N; i++) {
+        uct_iov_t iov;
+        iov.buffer = bufs[i].data();
+        iov.length = PAY_LEN;
+        iov.memh   = memhs[i];
+        iov.stride = 0;
+        iov.count  = 1;
+
+        ucs_status_t st = uct_ep_am_zcopy(ep,
+                                           static_cast<uint8_t>(21 + i),
+                                           NULL, 0, &iov, 1, 0, NULL);
+        ASSERT_EQ(UCS_INPROGRESS, st) << "zcopy " << i << " failed";
+    }
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+    bool all_fired = false;
+    while (!all_fired && ucs_get_time() < deadline) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+        all_fired = true;
+        for (size_t i = 0; i < N; i++) {
+            if (!ctx[i].fired) {
+                all_fired = false;
+                break;
+            }
+        }
+    }
+    ASSERT_TRUE(all_fired) << "Not all zcopy AM handlers fired within 5 s";
+
+    /* Drain sender completions. */
+    ucs_status_t flush_st;
+    do {
+        uct_iface_progress(sender().iface());
+        flush_st = uct_ep_flush(ep, 0, NULL);
+    } while (flush_st == UCS_INPROGRESS && ucs_get_time() < deadline);
+
+    for (size_t i = 0; i < N; i++) {
+        ASSERT_EQ(PAY_LEN, ctx[i].data.size())
+                << "zcopy handler " << i << " wrong data size";
+        uint8_t expected = static_cast<uint8_t>(0xF0 + i);
+        for (size_t j = 0; j < PAY_LEN; j++) {
+            EXPECT_EQ(expected, ctx[i].data[j])
+                    << "zcopy handler " << i << " byte " << j;
+        }
+        dereg(sender(), memhs[i]);
+    }
+}
+
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_am, cxi)

@@ -67,6 +67,24 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
                                   "\nDefault bufs_grow matches TX command queue depth "
                                   "so one chunk can saturate the cmdq without regrowth."),
 
+    {"AM_RX_NUM_BUFS", "4",
+     "Number of AM receive buffers rotated on the PRIORITY list.\n"
+     "More buffers reduce the chance of overflow under burst traffic.",
+     ucs_offsetof(uct_cxi_iface_config_t, am_rx_num_bufs),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"AM_RX_BUF_SIZE", "512k",
+     "Size of each AM receive buffer in bytes.\n"
+     "Automatically increased to AM_MAX_ZCOPY if that is larger.",
+     ucs_offsetof(uct_cxi_iface_config_t, am_rx_buf_size),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"AM_MAX_ZCOPY", "512k",
+     "Maximum AM zcopy payload in bytes.  Capped by AM_RX_BUF_SIZE;\n"
+     "if AM_MAX_ZCOPY exceeds AM_RX_BUF_SIZE, the buffer size is raised.",
+     ucs_offsetof(uct_cxi_iface_config_t, am_max_zcopy),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
     {NULL}
 };
 
@@ -194,29 +212,30 @@ uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
     le.restart_seq           = restart_seq; /* 1 on reposts: advance per-PTE seq window */
     le.match_id              = CXI_MATCH_ID_ANY;
     le.buffer_id             = (uint16_t)buf_idx;
-    le.lac                   = self->am.rx_mh[buf_idx].cxi_md->lac;
-    le.start                 = self->am.rx_mh[buf_idx].iova_offset +
-                               (uint64_t)(uintptr_t)self->am.rx_buf[buf_idx];
-    le.length                = UCT_CXI_AM_RX_BUF_SIZE;
+    le.lac                   = self->am.rx_mh.cxi_md->lac;
+    le.start                 = self->am.rx_mh.iova_offset +
+                               (uint64_t)(uintptr_t)(self->am.rx_base +
+                                                      buf_idx * self->am.buf_size);
+    le.length                = self->am.buf_size;
     le.min_free              = UCT_CXI_AM_MIN_FREE;
     le.ignore_bits           = UINT64_MAX;
     le.match_bits            = 0;
 
     ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
     if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi AM OVERFLOW LE APPEND buf %d: %d", buf_idx, ret);
+        ucs_error("cxi AM LE APPEND buf %d: %d", buf_idx, ret);
         return UCS_ERR_IO_ERROR;
     }
     cxi_cq_ring(self->tgt.cmdq);
-    ucs_info("cxi AM LE APPEND buf=%d ptn=%u start=0x%lx len=%u restart_seq=%d",
+    ucs_debug("cxi AM LE APPEND buf=%d ptn=%u start=0x%lx len=%zu restart_seq=%d",
              buf_idx, self->am.pte->ptn,
-             (unsigned long)le.start, UCT_CXI_AM_RX_BUF_SIZE, restart_seq);
+             (unsigned long)le.start, self->am.buf_size, restart_seq);
     return UCS_OK;
 }
 
 /*
- * uct_cxi_iface_open_am_pte — open the unrestricted AM portal and post buffer 0
- * as the initial OVERFLOW LE.  Buffer 1 is held in reserve (spare/draining).
+ * uct_cxi_iface_open_am_pte — open the unrestricted AM portal and post all N
+ * receive buffers into the PRIORITY list.
  *
  * The PTE uses is_matching=1 (unrestricted mode) and use_long_event=1 to force
  * 64-byte C_EVENT_TARGET_LONG events with valid rlength, mlength, and start.
@@ -277,21 +296,20 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
 
     self->am.rx_total = 0;
 
-    /* Post both buffers into the PRIORITY list.  The NIC writes to the
-     * head buffer first; auto-unlink rotates to the next one. */
-    status = uct_cxi_iface_post_am_le(self, 0, 0);
-    if (status != UCS_OK) {
-        goto err_unmap_pte;
-    }
-    status = uct_cxi_iface_post_am_le(self, 1, 0);
-    if (status != UCS_OK) {
-        goto err_unmap_pte;
+    /* Post all N buffers into the PRIORITY list. */
+    {
+        unsigned i;
+        for (i = 0; i < self->am.num_bufs; i++) {
+            status = uct_cxi_iface_post_am_le(self, (int)i, 0);
+            if (status != UCS_OK) {
+                goto err_unmap_pte;
+            }
+        }
     }
 
-    ucs_debug("cxi AM PTE ptn %u enabled rx_buf[0] %p rx_buf[1] %p size %u",
-              self->am.pte->ptn,
-              self->am.rx_buf[0], self->am.rx_buf[1],
-              UCT_CXI_AM_RX_BUF_SIZE);
+    ucs_debug("cxi AM PTE ptn %u enabled: %u bufs x %zu bytes at %p",
+              self->am.pte->ptn, self->am.num_bufs,
+              self->am.buf_size, self->am.rx_base);
     return UCS_OK;
 
 err_unmap_pte:
@@ -345,7 +363,7 @@ static uct_iface_ops_t uct_cxi_iface_ops = {
     .ep_am_short              = uct_cxi_ep_am_short,
     .ep_am_short_iov          = (uct_ep_am_short_iov_func_t)ucs_empty_function_return_unsupported,
     .ep_am_bcopy              = uct_cxi_ep_am_bcopy,
-    .ep_am_zcopy              = (uct_ep_am_zcopy_func_t)ucs_empty_function_return_unsupported,
+    .ep_am_zcopy              = uct_cxi_ep_am_zcopy,
     .ep_atomic_cswap64        = (uct_ep_atomic_cswap64_func_t)ucs_empty_function_return_unsupported,
     .ep_atomic_cswap32        = (uct_ep_atomic_cswap32_func_t)ucs_empty_function_return_unsupported,
     .ep_atomic32_post         = (uct_ep_atomic32_post_func_t)ucs_empty_function_return_unsupported,
@@ -620,33 +638,31 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     /*
-     * Step 14: AM receive buffers (two-buffer ping-pong) + OVERFLOW LE.
+     * Step 14: AM receive buffers — one contiguous allocation, single cxil_map.
      *
-     * Each rx_buf is page-aligned so that iova_offset + rx_buf_va gives the
-     * exact IOVA of the buffer start — required for start/offset arithmetic
-     * in iface_progress.  We post buffer 0 immediately; buffer 1 is held in
-     * reserve and posted when buffer 0 auto-unlinks (see UCT_CXI_AM_MIN_FREE).
+     * Page-aligned so that iova_offset + VA gives the exact IOVA of each
+     * buffer slice — required for start/offset arithmetic in iface_progress.
      */
+    self->am.num_bufs = ucs_min(config->am_rx_num_bufs,
+                                UCT_CXI_AM_RX_NUM_BUFS_MAX);
+    self->am.buf_size = ucs_max(config->am_rx_buf_size,
+                                config->am_max_zcopy);
+    self->am.rx_base  = NULL;
     {
-        int i;
-        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
-            self->am.rx_buf[i] = NULL;
+        size_t total = self->am.num_bufs * self->am.buf_size;
+        ret = ucs_posix_memalign((void **)&self->am.rx_base,
+                                 ucs_get_page_size(), total,
+                                 "cxi-am-rx-buf");
+        if (ret != 0) {
+            status = UCS_ERR_NO_MEMORY;
+            goto err_am_rx_bufs;
         }
-        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
-            ret = ucs_posix_memalign((void **)&self->am.rx_buf[i],
-                                     ucs_get_page_size(), UCT_CXI_AM_RX_BUF_SIZE,
-                                     "cxi-am-rx-buf");
-            if (ret != 0) {
-                status = UCS_ERR_NO_MEMORY;
-                goto err_am_rx_bufs;
-            }
-            status = uct_cxi_do_map(lni, self->am.rx_buf[i],
-                                    UCT_CXI_AM_RX_BUF_SIZE, &self->am.rx_mh[i]);
-            if (status != UCS_OK) {
-                ucs_free(self->am.rx_buf[i]);
-                self->am.rx_buf[i] = NULL;
-                goto err_am_rx_bufs;
-            }
+        status = uct_cxi_do_map(lni, self->am.rx_base, total,
+                                &self->am.rx_mh);
+        if (status != UCS_OK) {
+            ucs_free(self->am.rx_base);
+            self->am.rx_base = NULL;
+            goto err_am_rx_bufs;
         }
     }
 
@@ -663,14 +679,10 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     return UCS_OK;
 
 err_am_rx_bufs:
-    {
-        int i;
-        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
-            if (self->am.rx_buf[i] != NULL) {
-                uct_cxi_do_unmap(&self->am.rx_mh[i]);
-                ucs_free(self->am.rx_buf[i]);
-            }
-        }
+    if (self->am.rx_base != NULL) {
+        uct_cxi_do_unmap(&self->am.rx_mh);
+        ucs_free(self->am.rx_base);
+        self->am.rx_base = NULL;
     }
 err_unmap_get_short:
     uct_cxi_do_unmap(&self->tx.get_short_mh);
@@ -733,13 +745,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
             ucs_warn("cxi cxil_destroy_pte AM failed: %s", strerror(-ret));
         }
     }
-    {
-        int i;
-        for (i = 0; i < UCT_CXI_AM_RX_NUM_BUFS; i++) {
-            uct_cxi_do_unmap(&self->am.rx_mh[i]);
-            ucs_free(self->am.rx_buf[i]);
-        }
-    }
+    uct_cxi_do_unmap(&self->am.rx_mh);
+    ucs_free(self->am.rx_base);
 
     uct_cxi_do_unmap(&self->tx.get_short_mh);
     ucs_free(self->tx.get_short_buf);
@@ -824,6 +831,7 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
                                         UCT_IFACE_FLAG_GET_ZCOPY |
                                         UCT_IFACE_FLAG_AM_SHORT  |
                                         UCT_IFACE_FLAG_AM_BCOPY  |
+                                        UCT_IFACE_FLAG_AM_ZCOPY  |
                                         UCT_IFACE_FLAG_CB_SYNC   |
                                         UCT_IFACE_FLAG_PENDING;
 
@@ -843,11 +851,10 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
     iface_attr->cap.get.opt_zcopy_align = sizeof(uint64_t);
     iface_attr->cap.get.align_mtu     = 8;
 
-    /* Active Messages: short (IDC) + bcopy (DMA); zcopy deferred. */
     iface_attr->cap.am.max_short      = C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t);
     iface_attr->cap.am.max_bcopy      = iface->tx.max_bcopy;
     iface_attr->cap.am.max_hdr        = 0;
-    iface_attr->cap.am.max_zcopy      = 0;
+    iface_attr->cap.am.max_zcopy      = iface->am.buf_size;
     iface_attr->cap.am.opt_zcopy_align = sizeof(uint64_t);
     iface_attr->cap.am.align_mtu      = 1;
     iface_attr->cap.am.max_iov        = 1;
@@ -919,13 +926,14 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             /* Target-side AM receive.  buffer_id identifies which rx_buf the
              * NIC wrote into.  start is the absolute IOVA of the first byte. */
             int      buf_idx  = (int)event->tgt_long.buffer_id;
-            uint64_t buf_iova = iface->am.rx_mh[buf_idx].iova_offset +
-                                (uint64_t)(uintptr_t)iface->am.rx_buf[buf_idx];
+            uint8_t *buf_va   = iface->am.rx_base +
+                                buf_idx * iface->am.buf_size;
+            uint64_t buf_iova = iface->am.rx_mh.iova_offset +
+                                (uint64_t)(uintptr_t)buf_va;
             uint32_t len      = event->tgt_long.mlength;
             uint8_t  am_id    = (uint8_t)(event->tgt_long.match_bits & 0x1f);
-            void    *data     = (uint8_t *)iface->am.rx_buf[buf_idx] +
+            void    *data     = buf_va +
                                 (size_t)(event->tgt_long.start - buf_iova);
-            size_t   msg_end  = (size_t)(event->tgt_long.start - buf_iova) + len;
 
             // ucs_info("cxi C_EVENT_PUT: event_type=%d buf=%d ptl_list=%d "
             //          "am_id=%u mlength=%u rlength=%u "

@@ -38,6 +38,7 @@
 #include "cxi_md.h"
 
 #include <uct/base/uct_iface.h>
+#include <uct/base/uct_iov.inl>
 #include <ucs/debug/log.h>
 
 #include <cassini_user_defs.h>
@@ -112,13 +113,13 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
         hdr.dfa        = ep->dfa_am;
         hdr.match_bits = (uint64_t)id;
 
-        ucs_info("cxi IDC_SEND: am_id=%u total_len=%zu "
-                 "nid=%u pid=%u idx_ext=%u "
-                 "wp32=%lu hw_wp32=%lu",
-                 (unsigned)id, sizeof(uint64_t) + length,
-                 ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
-                 (unsigned long)iface->tx.cmdq->wp32,
-                 (unsigned long)iface->tx.cmdq->hw_wp32);
+        // ucs_debug("cxi IDC_SEND: am_id=%u total_len=%zu "
+        //          "nid=%u pid=%u idx_ext=%u "
+        //          "wp32=%lu hw_wp32=%lu",
+        //          (unsigned)id, sizeof(uint64_t) + length,
+        //          ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
+        //          (unsigned long)iface->tx.cmdq->wp32,
+        //          (unsigned long)iface->tx.cmdq->hw_wp32);
 
         ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, buf,
                                   sizeof(uint64_t) + length);
@@ -191,7 +192,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.request_len          = (uint32_t)length;
         cmd.user_ptr             = (uint64_t)(uintptr_t)desc;
 
-        // ucs_info("cxi DMA_PUT_SEND: am_id=%u len=%u "
+        // ucs_debug("cxi DMA_PUT_SEND: am_id=%u len=%u "
         //          "nid=%u pid=%u idx_ext=%u eq=%u lac=%u "
         //          "local_addr=0x%lx wp32=%lu hw_wp32=%lu",
         //          (unsigned)id, cmd.request_len,
@@ -216,4 +217,80 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, BCOPY, length);
     return (ssize_t)length;
+}
+
+
+/* -------------------------------------------------------------------------
+ * ep_am_zcopy
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * uct_cxi_ep_am_zcopy — unrestricted DMA AM send directly from user buffer.
+ *
+ * Zero-copy: the NIC DMAs from the caller's registered IOV buffer into the
+ * remote AM PRIORITY ME.  The caller must keep the buffer valid until the
+ * completion fires (C_EVENT_ACK → uct_invoke_completion).
+ *
+ * max_hdr = 0: CXI DMA has a single local_addr — no scatter-gather to
+ * combine a separate header with the IOV payload.  am_id is in match_bits.
+ *
+ * max_zcopy = buf_size: the payload must fit in one receiver ME buffer.
+ * Larger transfers should use RMA zcopy.
+ */
+ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
+                                  const void *header, unsigned header_length,
+                                  const uct_iov_t *iov, size_t iovcnt,
+                                  unsigned flags, uct_completion_t *comp)
+{
+    uct_cxi_ep_t         *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
+    uct_cxi_iface_t      *iface = uct_cxi_am_ep_iface(ep);
+    uct_cxi_mem_handle_t *memh  = (uct_cxi_mem_handle_t *)iov[0].memh;
+    size_t                length = uct_iov_get_length(iov);
+    uct_cxi_send_op_t    *op;
+    int                   ret;
+
+    UCT_CHECK_LENGTH(header_length, 0, 0, "am_zcopy header");
+    UCT_CHECK_LENGTH(length, 0, iface->am.buf_size, "am_zcopy payload");
+
+    op = ucs_mpool_get(&iface->tx.op_pool);
+    if (ucs_unlikely(op == NULL)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+    op->ep      = ep;
+    op->comp    = comp;
+    op->handler = NULL;
+
+    {
+        struct c_full_dma_cmd cmd = {};
+        cmd.command.opcode       = C_CMD_PUT;
+        cmd.index_ext            = ep->dfa_am_idx_ext;
+        cmd.lac                  = memh->cxi_md->lac;
+        cmd.event_send_disable   = 1;
+        cmd.event_success_disable = 0;
+        cmd.restricted           = 0;
+        cmd.eq                   = iface->evtq->eqn;
+        cmd.dfa                  = ep->dfa_am;
+        cmd.match_bits           = (uint64_t)id;
+        cmd.remote_offset        = 0;
+        cmd.local_addr           = memh->iova_offset +
+                                   (uint64_t)(uintptr_t)iov[0].buffer;
+        cmd.request_len          = (uint32_t)length;
+        cmd.user_ptr             = (uint64_t)(uintptr_t)op;
+
+        ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
+    }
+    if (ucs_unlikely(ret != 0)) {
+        ucs_mpool_put(op);
+        ucs_error("cxi ep %p ep_am_zcopy emit failed: %d", ep, ret);
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    cxi_cq_ring(iface->tx.cmdq);
+    ep->outstanding++;
+    iface->tx.outstanding++;
+
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
+                      AM, ZCOPY, length);
+    return UCS_INPROGRESS;
 }
