@@ -823,6 +823,7 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
     uct_base_iface_query(&iface->super, iface_attr);
 
     iface_attr->cap.flags             = UCT_IFACE_FLAG_CONNECT_TO_IFACE |
+                                        UCT_IFACE_FLAG_INTER_NODE |
                                         UCT_IFACE_FLAG_PUT_SHORT |
                                         UCT_IFACE_FLAG_PUT_BCOPY |
                                         UCT_IFACE_FLAG_PUT_ZCOPY |
@@ -914,6 +915,13 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             }
             op->ep->outstanding--;
             iface->tx.outstanding--;
+            if (op->ep->outstanding == 0 && op->ep->flush_comp != NULL) {
+                uct_invoke_completion(op->ep->flush_comp, UCS_OK);
+                op->ep->flush_comp = NULL;
+            }
+            ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
+                      (int)event->hdr.event_type,
+                      cxi_event_rc(event), op->ep, op->ep->outstanding);
             if (op->handler != NULL) {
                 op->handler(op);       /* bcopy: handler owns comp + mpool_put */
             } else {
@@ -935,23 +943,19 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             void    *data     = buf_va +
                                 (size_t)(event->tgt_long.start - buf_iova);
 
-            // ucs_info("cxi C_EVENT_PUT: event_type=%d buf=%d ptl_list=%d "
-            //          "am_id=%u mlength=%u rlength=%u "
-            //          "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
-            //          "offset=%zu auto_unlinked=%u rc=%d "
-            //          "lpe_stat_1=%u lpe_stat_2=%u",
-            //          (int)event->hdr.event_type,
-            //          buf_idx, (int)event->tgt_long.ptl_list,
-            //          (unsigned)am_id, (unsigned)len,
-            //          (unsigned)event->tgt_long.rlength,
-            //          (unsigned long)event->tgt_long.start,
-            //          (unsigned long)event->tgt_long.remote_offset,
-            //          (unsigned long)buf_iova,
-            //          (size_t)(event->tgt_long.start - buf_iova),
-            //          (unsigned)event->tgt_long.auto_unlinked,
-            //          cxi_event_rc(event),
-            //          (unsigned)event->tgt_long.lpe_stat_1,
-            //          (unsigned)event->tgt_long.lpe_stat_2);
+            // ucs_trace("cxi C_EVENT_PUT: buf=%d ptl_list=%d "
+            //           "am_id=%u mlength=%u rlength=%u "
+            //           "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
+            //           "offset=%zu auto_unlinked=%u rc=%d",
+            //           buf_idx, (int)event->tgt_long.ptl_list,
+            //           (unsigned)am_id, (unsigned)len,
+            //           (unsigned)event->tgt_long.rlength,
+            //           (unsigned long)event->tgt_long.start,
+            //           (unsigned long)event->tgt_long.remote_offset,
+            //           (unsigned long)buf_iova,
+            //           (size_t)(event->tgt_long.start - buf_iova),
+            //           (unsigned)event->tgt_long.auto_unlinked,
+            //           cxi_event_rc(event));
 
             /* NIC auto-unlinked this buffer (min_free threshold reached).
              * This is the last C_EVENT_PUT for this LE; the NIC has already
@@ -994,8 +998,8 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                      (unsigned long)event->tgt_long.remote_offset,
                      cxi_event_rc(event));
         } else {
-            ucs_info("cxi iface_progress: unhandled event type %d",
-                     (int)event->hdr.event_type);
+            ucs_info("cxi iface_progress: unhandled event type %d rc=%d",
+                     (int)event->hdr.event_type, cxi_event_rc(event));
         }
         n++;
     }

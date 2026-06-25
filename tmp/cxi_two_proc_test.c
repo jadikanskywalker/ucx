@@ -40,6 +40,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/mman.h>
 
 #include <uct/api/uct.h>
 #include <uct/api/v2/uct_v2.h>
@@ -326,7 +327,10 @@ int main(int argc, char **argv)
      * Rank 0: pre-filled with FILL_BYTE (source for PUT; zeroed for GET).
      * Rank 1: zeroed (sink for PUT; stays FILL_BYTE as source for GET).
      * ------------------------------------------------------------------ */
-    static uint8_t buf[BUF_SIZE];
+    /* Use mmap like UCP perftest does, not static BSS. */
+    uint8_t *buf = (uint8_t *)mmap(NULL, BUF_SIZE, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) DIE("mmap: %s", strerror(errno));
     memset(buf, (rank == 0) ? FILL_BYTE : 0x00, BUF_SIZE);
 
     uct_md_mem_reg_params_t reg_params;
@@ -401,57 +405,69 @@ int main(int argc, char **argv)
         status = uct_rkey_unpack(cxi_comp, peer.rkey, &rkey_bundle);
         CHECK_STATUS(status, "uct_rkey_unpack");
 
-        uct_iov_t iov;
-        iov.stride = 0;
-        iov.count  = 1;
-        iov.length = BUF_SIZE;
-        iov.memh   = memh;
+        /*
+         * Pingpong test mirroring UCP perftest put_lat:
+         *   - Both sides use 8-byte buffers, sn in last byte
+         *   - Rank 0: write sn → put_short to rank 1 → flush → poll own
+         *     recv buf for rank 1's reply
+         *   - Rank 1: poll recv buf for rank 0's data → write sn →
+         *     put_short to rank 0 → flush
+         *   - Repeat for N iterations
+         *
+         * Coordination: rank 1 also creates an EP + unpacks rank 0's rkey
+         * (handled in the rank==1 block below).
+         */
+        #define PINGPONG_ITERS 10
+        #define SN_LEN         8
 
-        /* ---- Phase A: PUT buf (0xAB) → rank 1's buf ---- */
-        iov.buffer = buf;
-        status = uct_ep_put_zcopy(ep, &iov, 1,
-                                   peer.buf_va, rkey_bundle.rkey, NULL);
-        if (status != UCS_INPROGRESS)
-            DIE("[PUT] ep_put_zcopy: %s", ucs_status_string(status));
+        /* Reset recv buffer to 0xff before starting. */
+        memset(buf, 0xFF, SN_LEN);
 
-        printf("rank 0: [PUT] posted %zu bytes, flushing...\n",
-               (size_t)BUF_SIZE);
-        fflush(stdout);
-
-        flush_ep(iface, ep, "PUT");
-        printf("rank 0: [PUT] ACK received\n");
-        fflush(stdout);
-
-        /* ---- Phase B: GET rank 1's buf (0xAB) → local buf ---- */
-        memset(buf, 0x00, BUF_SIZE);
-        iov.buffer = buf;
-
-        status = uct_ep_get_zcopy(ep, &iov, 1,
-                                   peer.buf_va, rkey_bundle.rkey, NULL);
-        if (status != UCS_INPROGRESS)
-            DIE("[GET] ep_get_zcopy: %s", ucs_status_string(status));
-
-        printf("rank 0: [GET] posted %zu bytes, flushing...\n",
-               (size_t)BUF_SIZE);
-        fflush(stdout);
-
-        flush_ep(iface, ep, "GET");
-
-        /* Verify GET result. */
-        size_t first_bad = SIZE_MAX;
-        for (size_t i = 0; i < BUF_SIZE; i++) {
-            if (buf[i] != (uint8_t)FILL_BYTE) { first_bad = i; break; }
+        /* Barrier: both sides ready. */
+        {   uint8_t go = 1;
+            tcp_send_all(sock, &go, 1);
+            tcp_recv_all(sock, &go, 1);
         }
-        if (first_bad == SIZE_MAX)
-            printf("rank 0: [GET] PASS — %zu bytes verified (all 0x%02x)\n",
-                   (size_t)BUF_SIZE, (unsigned)FILL_BYTE);
-        else
-            printf("rank 0: [GET] FAIL — byte %zu: got 0x%02x expected 0x%02x\n",
-                   first_bad, buf[first_bad], (unsigned)FILL_BYTE);
+
+        printf("rank 0: pingpong starting (%d iters, %d bytes)\n",
+               PINGPONG_ITERS, SN_LEN);
         fflush(stdout);
 
-        /* Signal rank 1 that both phases are done; it can verify and exit. */
-        uint8_t done = 1;
+        for (int sn = 0; sn < PINGPONG_ITERS; sn++) {
+            /* Send: write sn into send buf, put to rank 1's recv buf.
+             * NO flush — fire and immediately poll, like UCP perftest. */
+            uint8_t send_data[SN_LEN];
+            memset(send_data, 0x00, SN_LEN);
+            send_data[SN_LEN - 1] = (uint8_t)sn;
+
+            status = uct_ep_put_short(ep, send_data, SN_LEN,
+                                      peer.buf_va, rkey_bundle.rkey);
+            CHECK_STATUS(status, "put_short send");
+
+            /* Recv: poll own recv buffer until last byte == sn.
+             * Call iface_progress to drain ACKs (like UCT perftest). */
+            volatile uint8_t *recv_sn = &buf[SN_LEN - 1];
+            ucs_time_t deadline = ucs_get_time() +
+                                  ucs_time_from_sec(FLUSH_TIMEOUT_SEC);
+            while (*recv_sn != (uint8_t)sn) {
+                /* No iface_progress — match UCP one-sided behavior */
+                if (ucs_get_time() > deadline) {
+                    printf("rank 0: TIMEOUT at sn=%d: recv buf=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                           sn, buf[0], buf[1], buf[2], buf[3],
+                           buf[4], buf[5], buf[6], buf[7]);
+                    fflush(stdout);
+                    DIE("recv timed out");
+                }
+            }
+            printf("rank 0: sn=%d PASS\n", sn);
+            fflush(stdout);
+        }
+
+        printf("rank 0: pingpong PASS — all %d iterations\n", PINGPONG_ITERS);
+        fflush(stdout);
+
+        /* Signal done. */
+        uint8_t done = 2;
         tcp_send_all(sock, &done, sizeof(done));
 
         uct_rkey_release(cxi_comp, &rkey_bundle);
@@ -462,20 +478,77 @@ int main(int argc, char **argv)
      * 8. Rank 1: wait for done signal, verify PUT result.
      * ------------------------------------------------------------------ */
     if (rank == 1) {
+        /* Rank 1 also needs an EP + rkey to put data back to rank 0. */
+        uct_ep_params_t ep_params;
+        memset(&ep_params, 0, sizeof(ep_params));
+        ep_params.field_mask  = UCT_EP_PARAM_FIELD_IFACE     |
+                                UCT_EP_PARAM_FIELD_DEV_ADDR  |
+                                UCT_EP_PARAM_FIELD_IFACE_ADDR;
+        ep_params.iface       = iface;
+        ep_params.dev_addr    = (const uct_device_addr_t *)peer.dev_addr;
+        ep_params.iface_addr  = (const uct_iface_addr_t  *)peer.iface_addr;
+
+        uct_ep_h ep;
+        status = uct_ep_create(&ep_params, &ep);
+        CHECK_STATUS(status, "uct_ep_create");
+
+        uct_rkey_bundle_t rkey_bundle;
+        status = uct_rkey_unpack(cxi_comp, peer.rkey, &rkey_bundle);
+        CHECK_STATUS(status, "uct_rkey_unpack");
+
+        /* Reset recv buffer to 0xff. */
+        memset(buf, 0xFF, SN_LEN);
+
+        /* Barrier: both sides ready. */
+        {   uint8_t go = 1;
+            tcp_send_all(sock, &go, 1);
+            tcp_recv_all(sock, &go, 1);
+        }
+
+        printf("rank 1: pingpong starting (%d iters, %d bytes)\n",
+               PINGPONG_ITERS, SN_LEN);
+        fflush(stdout);
+
+        for (int sn = 0; sn < PINGPONG_ITERS; sn++) {
+            /* Recv: poll own recv buffer until last byte == sn.
+             * Call iface_progress to drain ACKs (like UCT perftest). */
+            volatile uint8_t *recv_sn = &buf[SN_LEN - 1];
+            ucs_time_t deadline = ucs_get_time() +
+                                  ucs_time_from_sec(FLUSH_TIMEOUT_SEC);
+            while (*recv_sn != (uint8_t)sn) {
+                /* No iface_progress — match UCP one-sided behavior */
+                if (ucs_get_time() > deadline) {
+                    printf("rank 1: TIMEOUT at sn=%d: recv buf=[%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+                           sn, buf[0], buf[1], buf[2], buf[3],
+                           buf[4], buf[5], buf[6], buf[7]);
+                    fflush(stdout);
+                    DIE("recv timed out");
+                }
+            }
+
+            /* Send: write sn into send buf, put to rank 0's recv buf.
+             * NO flush — fire and continue, like UCP perftest. */
+            uint8_t send_data[SN_LEN];
+            memset(send_data, 0x00, SN_LEN);
+            send_data[SN_LEN - 1] = (uint8_t)sn;
+
+            status = uct_ep_put_short(ep, send_data, SN_LEN,
+                                      peer.buf_va, rkey_bundle.rkey);
+            CHECK_STATUS(status, "put_short send");
+
+            printf("rank 1: sn=%d PASS\n", sn);
+            fflush(stdout);
+        }
+
+        printf("rank 1: pingpong PASS — all %d iterations\n", PINGPONG_ITERS);
+        fflush(stdout);
+
+        /* Wait for done signal. */
         uint8_t done = 0;
         tcp_recv_all(sock, &done, sizeof(done));
 
-        size_t first_bad = SIZE_MAX;
-        for (size_t i = 0; i < BUF_SIZE; i++) {
-            if (buf[i] != (uint8_t)FILL_BYTE) { first_bad = i; break; }
-        }
-        if (first_bad == SIZE_MAX)
-            printf("rank 1: [PUT] PASS — %zu bytes verified (all 0x%02x)\n",
-                   (size_t)BUF_SIZE, (unsigned)FILL_BYTE);
-        else
-            printf("rank 1: [PUT] FAIL — byte %zu: got 0x%02x expected 0x%02x\n",
-                   first_bad, buf[first_bad], (unsigned)FILL_BYTE);
-        fflush(stdout);
+        uct_rkey_release(cxi_comp, &rkey_bundle);
+        uct_ep_destroy(ep);
     }
 
     /* ------------------------------------------------------------------

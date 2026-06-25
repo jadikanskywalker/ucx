@@ -180,6 +180,14 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_RES, "put_short");
 
+    ucs_trace("cxi put_short ep %p len %u rkey %p iova 0x%lx "
+              "remote_addr 0x%lx final_offset 0x%lx lac %u",
+              ep, length, rkey_p,
+              (unsigned long)rkey_p->iova,
+              (unsigned long)remote_addr,
+              (unsigned long)(rkey_p->iova + remote_addr),
+              (unsigned)rkey_p->lac);
+
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
         return UCS_ERR_NO_RESOURCE;

@@ -77,6 +77,7 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->rem_nid     = dev_addr->nid;
     ep->rem_pid     = iface_addr->pid;
     ep->outstanding = 0;
+    ep->flush_comp  = NULL;
 
     /* Build all DFAs at creation time so the hot path needs no check.
      * RMA DFAs: pid_offset = lac index (one per LAC).
@@ -127,6 +128,10 @@ ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
     if (ep->outstanding == 0) {
         UCT_TL_EP_STAT_FLUSH(ucs_derived_of(tl_ep, uct_base_ep_t));
         return UCS_OK;
+    }
+
+    if (comp != NULL) {
+        ep->flush_comp = comp;
     }
 
     UCT_TL_EP_STAT_FLUSH_WAIT(ucs_derived_of(tl_ep, uct_base_ep_t));

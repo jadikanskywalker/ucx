@@ -1,4 +1,11 @@
 #!/bin/bash
+#SBATCH --job-name=ucx-cxi-rdma
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --time=00:05:00
+
 # Two-process cross-node CXI UCT data-integrity test.
 #
 # Build the test binary once before submitting:
@@ -29,13 +36,5 @@ if [[ "${1}" == "--build" ]]; then
     exit 0
 fi
 
-#SBATCH --job-name=ucx-cxi-rdma
-#SBATCH --nodes=2
-#SBATCH --ntasks=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=1
-#SBATCH --time=00:05:00
-
 srun --output="$UCX/tmp/cxi_rdma.%j.%N.out" \
-     --error="$UCX/tmp/cxi_rdma.%j.%N.err" \
      "$BIN" cxi0

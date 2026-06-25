@@ -74,6 +74,7 @@ typedef struct uct_cxi_ep {
     union c_fab_addr  dfa_am;                             /**< AM DFA (pid_offset=UCT_CXI_PTE_AM) */
     uint8_t           dfa_am_idx_ext;                    /**< AM idx_ext */
     unsigned          outstanding;     /**< In-flight send ops for this EP */
+    uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
 } uct_cxi_ep_t;
 
 
