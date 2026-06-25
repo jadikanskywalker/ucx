@@ -1,5 +1,5 @@
 /**
-* Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2001-2015. ALL RIGHTS RESERVED.
+* Copyright (c) NVIDIA CORPORATION & AFFILIATES, 2001-2026. ALL RIGHTS RESERVED.
 *
 * See file LICENSE for terms.
 */
@@ -674,9 +674,8 @@ static ssize_t ucp_memh_do_pack(ucp_mem_h memh, uint64_t flags, int rkey_compat,
         ucs_fatal("packing rkey using ucp_memh_pack() is unsupported");
     }
 
-    mem_info.type    = memh->mem_type;
-    mem_info.sys_dev = memh->sys_dev;
-    sys_distance     = sys_dev_distances;
+    mem_info     = ucp_memory_info_from_memh(memh);
+    sys_distance = sys_dev_distances;
 
     ucs_for_each_bit(ep_sys_dev, sys_dev_map) {
         status = ucs_topo_get_distance(memh->sys_dev, ep_sys_dev, sys_distance);
@@ -714,8 +713,11 @@ ucp_memh_pack_internal(ucp_mem_h memh, const ucp_memh_pack_params_t *params,
 
     ucs_trace("packing %smemh %p for buffer %p md_map 0x%" PRIx64
               " export_md_map 0x%" PRIx64,
-              (flags & UCP_MEMH_PACK_FLAG_EXPORT) ? "exported " : "", memh,
-              ucp_memh_address(memh), memh->md_map, context->export_md_map);
+              (flags & UCP_MEMH_PACK_FLAG_EXPORT) ? "exported " :
+              ucp_memh_is_zero_length(memh)       ? "zero_length " :
+                                                    "",
+              memh, ucp_memh_address(memh), memh->md_map,
+              (context != NULL) ? context->export_md_map : 0);
 
     if (ucp_memh_is_zero_length(memh)) {
         /* Dummy memh, return dummy key */
