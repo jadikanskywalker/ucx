@@ -84,14 +84,14 @@ if [[ "\$SLURM_PROCID" == "0" ]]; then
     echo "\$IP" > "\$IP_FILE"
 
     if [[ "$TYPE" == "UCT" ]]; then
-        echo "[rank 0] server: ucx_perftest -x $TRANSPORT -d $DEVICE -t $TEST"
-        ucx_perftest -x "$TRANSPORT" -d "$DEVICE" -t "$TEST" \
+        echo "[rank 0] server: ucx_perftest -x $TRANSPORT -d $DEVICE -t $TEST -D zcopy"
+        ucx_perftest -x "$TRANSPORT" -d "$DEVICE" -t "$TEST" -D zcopy \
             >"\$OUT_DIR/server.out" 2>"\$OUT_DIR/server.err"
     else
         [[ -n "$TRANSPORT" ]] && export UCX_TLS="$TRANSPORT"
         [[ -n "$DEVICE"    ]] && export UCX_NET_DEVICES="$DEVICE"
-        echo "[rank 0] server: UCX_TLS=\${UCX_TLS:-<unset>} UCX_NET_DEVICES=\${UCX_NET_DEVICES:-<unset>} ucx_perftest -t $TEST"
-        ucx_perftest -t "$TEST" \
+        echo "[rank 0] server: UCX_TLS=\${UCX_TLS:-<unset>} UCX_NET_DEVICES=\${UCX_NET_DEVICES:-<unset>} ucx_perftest -t $TEST -D zcopy"
+        ucx_perftest -t "$TEST" -D zcopy \
             >"\$OUT_DIR/server.out" 2>"\$OUT_DIR/server.err"
     fi
 else
@@ -103,14 +103,14 @@ else
     sleep 1
 
     if [[ "$TYPE" == "UCT" ]]; then
-        echo "[rank 1] client: ucx_perftest \$SERVER_IP -x $TRANSPORT -d $DEVICE -t $TEST"
-        ucx_perftest "\$SERVER_IP" -x "$TRANSPORT" -d "$DEVICE" -t "$TEST" \
+        echo "[rank 1] client: ucx_perftest \$SERVER_IP -x $TRANSPORT -d $DEVICE -t $TEST -D zcopy"
+        ucx_perftest "\$SERVER_IP" -x "$TRANSPORT" -d "$DEVICE" -t "$TEST -D zcopy" \
             >"\$OUT_DIR/client.out" 2>"\$OUT_DIR/client.err"
     else
         [[ -n "$TRANSPORT" ]] && export UCX_TLS="$TRANSPORT"
         [[ -n "$DEVICE"    ]] && export UCX_NET_DEVICES="$DEVICE"
-        echo "[rank 1] client: UCX_TLS=\${UCX_TLS:-<unset>} UCX_NET_DEVICES=\${UCX_NET_DEVICES:-<unset>} ucx_perftest \$SERVER_IP -t $TEST"
-        ucx_perftest "\$SERVER_IP" -t "$TEST" \
+        echo "[rank 1] client: UCX_TLS=\${UCX_TLS:-<unset>} UCX_NET_DEVICES=\${UCX_NET_DEVICES:-<unset>} ucx_perftest \$SERVER_IP -t $TEST -D zcopy"
+        ucx_perftest "\$SERVER_IP" -t "$TEST" -D zcopy \
             >"\$OUT_DIR/client.out" 2>"\$OUT_DIR/client.err"
     fi
 fi

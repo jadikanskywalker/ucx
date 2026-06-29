@@ -22,6 +22,10 @@
 #include "cxi_ep.h"
 #include <uct/api/uct.h>
 
+/* Bit 5 of match_bits: header_data carries an out-of-band AM header.
+ * Set by am_zcopy when header and IOV payload are non-contiguous.
+ * Bits 0-4 = am_id (0-31). */
+#define UCT_CXI_AM_HDR_FLAG  (1ULL << 5)
 
 ucs_status_t uct_cxi_ep_am_short(uct_ep_h ep, uint8_t id, uint64_t header,
                                   const void *payload, unsigned length);

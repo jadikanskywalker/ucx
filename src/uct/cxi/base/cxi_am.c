@@ -232,11 +232,16 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
  * remote AM PRIORITY ME.  The caller must keep the buffer valid until the
  * completion fires (C_EVENT_ACK → uct_invoke_completion).
  *
- * max_hdr = 0: CXI DMA has a single local_addr — no scatter-gather to
- * combine a separate header with the IOV payload.  am_id is in match_bits.
+ * Header handling (max_hdr = 8, CXI has no send-side scatter-gather):
+ *   Contiguous (header + header_length == iov[0].buffer):
+ *     Single DMA from header pointer for header_length + iov_length.
+ *   Non-contiguous (header from stack / different allocation):
+ *     Header packed into cmd.header_data (8 bytes out-of-band).
+ *     UCT_CXI_AM_HDR_FLAG set in match_bits.  Receiver prepends
+ *     header_data before payload in the ME buffer.
  *
- * max_zcopy = buf_size: the payload must fit in one receiver ME buffer.
- * Larger transfers should use RMA zcopy.
+ * max_zcopy = buf_size - 8: payload must fit in one receiver ME buffer
+ * (8 bytes reserved for header_data prepend).
  */
 ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
                                   const void *header, unsigned header_length,
@@ -246,12 +251,14 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     uct_cxi_ep_t         *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t      *iface = uct_cxi_am_ep_iface(ep);
     uct_cxi_mem_handle_t *memh  = (uct_cxi_mem_handle_t *)iov[0].memh;
-    size_t                length = uct_iov_get_length(iov);
+    size_t                iov_length = uct_iov_get_length(iov);
     uct_cxi_send_op_t    *op;
     int                   ret;
 
-    UCT_CHECK_LENGTH(header_length, 0, 0, "am_zcopy header");
-    UCT_CHECK_LENGTH(length, 0, iface->am.buf_size, "am_zcopy payload");
+    UCT_CHECK_LENGTH(header_length, 0, sizeof(uint64_t), "am_zcopy header");
+    UCT_CHECK_LENGTH(header_length + iov_length, 0,
+                     iface->am.buf_size - sizeof(uint64_t),
+                     "am_zcopy total");
 
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
@@ -263,20 +270,39 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
 
     {
         struct c_full_dma_cmd cmd = {};
-        cmd.command.opcode       = C_CMD_PUT;
-        cmd.index_ext            = ep->dfa_am_idx_ext;
-        cmd.lac                  = memh->cxi_md->lac;
-        cmd.event_send_disable   = 1;
+        int contiguous = (header_length > 0) &&
+                         ((const uint8_t *)header + header_length ==
+                          (const uint8_t *)iov[0].buffer);
+
+        cmd.command.opcode        = C_CMD_PUT;
+        cmd.index_ext             = ep->dfa_am_idx_ext;
+        cmd.lac                   = memh->cxi_md->lac;
+        cmd.event_send_disable    = 1;
         cmd.event_success_disable = 0;
-        cmd.restricted           = 0;
-        cmd.eq                   = iface->evtq->eqn;
-        cmd.dfa                  = ep->dfa_am;
-        cmd.match_bits           = (uint64_t)id;
-        cmd.remote_offset        = 0;
-        cmd.local_addr           = memh->iova_offset +
-                                   (uint64_t)(uintptr_t)iov[0].buffer;
-        cmd.request_len          = (uint32_t)length;
-        cmd.user_ptr             = (uint64_t)(uintptr_t)op;
+        cmd.restricted            = 0;
+        cmd.eq                    = iface->evtq->eqn;
+        cmd.dfa                   = ep->dfa_am;
+        cmd.remote_offset         = 0;
+        cmd.user_ptr              = (uint64_t)(uintptr_t)op;
+
+        if (contiguous) {
+            cmd.match_bits  = (uint64_t)id;
+            cmd.local_addr  = memh->iova_offset +
+                              (uint64_t)(uintptr_t)header;
+            cmd.request_len = (uint32_t)(header_length + iov_length);
+        } else if (header_length > 0) {
+            cmd.match_bits  = (uint64_t)id | UCT_CXI_AM_HDR_FLAG;
+            cmd.header_data = 0;
+            memcpy(&cmd.header_data, header, header_length);
+            cmd.local_addr  = memh->iova_offset +
+                              (uint64_t)(uintptr_t)iov[0].buffer;
+            cmd.request_len = (uint32_t)iov_length;
+        } else {
+            cmd.match_bits  = (uint64_t)id;
+            cmd.local_addr  = memh->iova_offset +
+                              (uint64_t)(uintptr_t)iov[0].buffer;
+            cmd.request_len = (uint32_t)iov_length;
+        }
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
     }
@@ -291,6 +317,6 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     iface->tx.outstanding++;
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
-                      AM, ZCOPY, length);
+                      AM, ZCOPY, header_length + iov_length);
     return UCS_INPROGRESS;
 }

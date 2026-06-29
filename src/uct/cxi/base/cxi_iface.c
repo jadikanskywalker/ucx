@@ -215,8 +215,9 @@ uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
     le.lac                   = self->am.rx_mh.cxi_md->lac;
     le.start                 = self->am.rx_mh.iova_offset +
                                (uint64_t)(uintptr_t)(self->am.rx_base +
-                                                      buf_idx * self->am.buf_size);
-    le.length                = self->am.buf_size;
+                                                      buf_idx * self->am.buf_size) +
+                               sizeof(uint64_t);
+    le.length                = self->am.buf_size - sizeof(uint64_t);
     le.min_free              = UCT_CXI_AM_MIN_FREE;
     le.ignore_bits           = UINT64_MAX;
     le.match_bits            = 0;
@@ -854,8 +855,8 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
 
     iface_attr->cap.am.max_short      = C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t);
     iface_attr->cap.am.max_bcopy      = iface->tx.max_bcopy;
-    iface_attr->cap.am.max_hdr        = 0;
-    iface_attr->cap.am.max_zcopy      = iface->am.buf_size;
+    iface_attr->cap.am.max_hdr        = sizeof(uint64_t);
+    iface_attr->cap.am.max_zcopy      = iface->am.buf_size - sizeof(uint64_t);
     iface_attr->cap.am.opt_zcopy_align = sizeof(uint64_t);
     iface_attr->cap.am.align_mtu      = 1;
     iface_attr->cap.am.max_iov        = 1;
@@ -957,14 +958,18 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             //           (unsigned)event->tgt_long.auto_unlinked,
             //           cxi_event_rc(event));
 
-            /* NIC auto-unlinked this buffer (min_free threshold reached).
-             * This is the last C_EVENT_PUT for this LE; the NIC has already
-             * removed it from the PRIORITY list.  Switch active to the spare
-             * buffer (already posted, so no gap).  C_EVENT_UNLINK will follow
-             * and the handler there reposts this buffer at the end of the list. */
+            if (ucs_unlikely(event->tgt_long.match_bits &
+                             UCT_CXI_AM_HDR_FLAG)) {
+                uint64_t hdr = event->tgt_long.header_data;
+                memcpy((uint8_t *)data - sizeof(uint64_t),
+                       &hdr, sizeof(uint64_t));
+                data = (uint8_t *)data - sizeof(uint64_t);
+                len += sizeof(uint64_t);
+            }
+
             // if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-            //     ucs_info("cxi AM LE auto_unlinked buf=%d at offset=%zu",
-            //              buf_idx, msg_end);
+            //     ucs_info("cxi AM LE auto_unlinked buf=%d",
+            //              buf_idx);
             // }
 
             uct_iface_invoke_am(&iface->super, am_id, data, len, 0);

@@ -296,14 +296,17 @@ UCS_TEST_P(test_cxi_am, am_bcopy_multiple)
  */
 
 /**
- * Send a single am_zcopy with a 4096-byte payload from a registered buffer.
- * The handler receives the raw payload (no header — max_hdr = 0).
+ * Send a single am_zcopy with an 8-byte header + 4096-byte payload.
+ * Header and payload are contiguous (same registered buffer) — tests
+ * the fast path (single DMA from header pointer).
  */
 UCS_TEST_P(test_cxi_am, am_zcopy_single)
 {
-    static const uint8_t AM_ID    = 20;
-    static const size_t  PAY_LEN  = 4096;
-    static const uint8_t PAY_FILL = 0xE7;
+    static const uint8_t  AM_ID    = 20;
+    static const uint64_t HEADER   = 0xABCD1234DEAD5678ULL;
+    static const size_t   HDR_LEN  = sizeof(uint64_t);
+    static const size_t   PAY_LEN  = 4096;
+    static const uint8_t  PAY_FILL = 0xE7;
 
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
@@ -311,38 +314,46 @@ UCS_TEST_P(test_cxi_am, am_zcopy_single)
     sender().connect_to_iface(0, receiver());
     uct_ep_h ep = sender().ep(0);
 
-    std::vector<uint8_t> payload(PAY_LEN, PAY_FILL);
-    uct_mem_h memh = reg(sender(), payload.data(), PAY_LEN);
+    /* Contiguous: [header(8B)][payload(4096B)] in one registered buffer. */
+    std::vector<uint8_t> buf(HDR_LEN + PAY_LEN);
+    memcpy(buf.data(), &HEADER, HDR_LEN);
+    memset(buf.data() + HDR_LEN, PAY_FILL, PAY_LEN);
+    uct_mem_h memh = reg(sender(), buf.data(), buf.size());
 
     uct_iov_t iov;
-    iov.buffer = payload.data();
+    iov.buffer = buf.data() + HDR_LEN;
     iov.length = PAY_LEN;
     iov.memh   = memh;
     iov.stride = 0;
     iov.count  = 1;
 
-    ucs_status_t st = uct_ep_am_zcopy(ep, AM_ID, NULL, 0, &iov, 1, 0, NULL);
+    ucs_status_t st = uct_ep_am_zcopy(ep, AM_ID, buf.data(), HDR_LEN,
+                                       &iov, 1, 0, NULL);
     ASSERT_EQ(UCS_INPROGRESS, st);
 
     poll_am(ep, ctx);
 
-    ASSERT_EQ(PAY_LEN, ctx.data.size());
+    ASSERT_EQ(HDR_LEN + PAY_LEN, ctx.data.size());
+    uint64_t recv_hdr = 0;
+    memcpy(&recv_hdr, ctx.data.data(), HDR_LEN);
+    EXPECT_EQ(HEADER, recv_hdr) << "zcopy header mismatch";
     for (size_t i = 0; i < PAY_LEN; i++) {
-        EXPECT_EQ(PAY_FILL, ctx.data[i]) << "zcopy byte " << i << " mismatch";
+        EXPECT_EQ(PAY_FILL, ctx.data[HDR_LEN + i])
+                << "zcopy byte " << i << " mismatch";
     }
 
     dereg(sender(), memh);
 }
 
 /**
- * Send multiple am_zcopy messages with distinct patterns.
- * Verifies that successive zcopy sends are independently delivered and
- * that completions fire correctly.
+ * Send multiple am_zcopy messages with 8-byte headers + distinct payloads.
+ * Header and payload are contiguous per message (fast path).
  */
 UCS_TEST_P(test_cxi_am, am_zcopy_multiple)
 {
-    static const size_t N       = 4;
-    static const size_t PAY_LEN = 1024;
+    static const size_t  N       = 4;
+    static const size_t  HDR_LEN = sizeof(uint64_t);
+    static const size_t  PAY_LEN = 1024;
 
     uct_cxi_am_recv_ctx ctx[N];
     for (size_t i = 0; i < N; i++) {
@@ -356,13 +367,16 @@ UCS_TEST_P(test_cxi_am, am_zcopy_multiple)
     std::vector<uint8_t> bufs[N];
     uct_mem_h memhs[N];
     for (size_t i = 0; i < N; i++) {
-        bufs[i].assign(PAY_LEN, static_cast<uint8_t>(0xF0 + i));
-        memhs[i] = reg(sender(), bufs[i].data(), PAY_LEN);
+        bufs[i].resize(HDR_LEN + PAY_LEN);
+        uint64_t hdr = static_cast<uint64_t>(0x2000 + i);
+        memcpy(bufs[i].data(), &hdr, HDR_LEN);
+        memset(bufs[i].data() + HDR_LEN, static_cast<int>(0xF0 + i), PAY_LEN);
+        memhs[i] = reg(sender(), bufs[i].data(), bufs[i].size());
     }
 
     for (size_t i = 0; i < N; i++) {
         uct_iov_t iov;
-        iov.buffer = bufs[i].data();
+        iov.buffer = bufs[i].data() + HDR_LEN;
         iov.length = PAY_LEN;
         iov.memh   = memhs[i];
         iov.stride = 0;
@@ -370,7 +384,8 @@ UCS_TEST_P(test_cxi_am, am_zcopy_multiple)
 
         ucs_status_t st = uct_ep_am_zcopy(ep,
                                            static_cast<uint8_t>(21 + i),
-                                           NULL, 0, &iov, 1, 0, NULL);
+                                           bufs[i].data(), HDR_LEN,
+                                           &iov, 1, 0, NULL);
         ASSERT_EQ(UCS_INPROGRESS, st) << "zcopy " << i << " failed";
     }
 
@@ -397,15 +412,73 @@ UCS_TEST_P(test_cxi_am, am_zcopy_multiple)
     } while (flush_st == UCS_INPROGRESS && ucs_get_time() < deadline);
 
     for (size_t i = 0; i < N; i++) {
-        ASSERT_EQ(PAY_LEN, ctx[i].data.size())
+        ASSERT_EQ(HDR_LEN + PAY_LEN, ctx[i].data.size())
                 << "zcopy handler " << i << " wrong data size";
+        uint64_t recv_hdr = 0;
+        memcpy(&recv_hdr, ctx[i].data.data(), HDR_LEN);
+        EXPECT_EQ(static_cast<uint64_t>(0x2000 + i), recv_hdr)
+                << "zcopy handler " << i << " header mismatch";
         uint8_t expected = static_cast<uint8_t>(0xF0 + i);
         for (size_t j = 0; j < PAY_LEN; j++) {
-            EXPECT_EQ(expected, ctx[i].data[j])
+            EXPECT_EQ(expected, ctx[i].data[HDR_LEN + j])
                     << "zcopy handler " << i << " byte " << j;
         }
         dereg(sender(), memhs[i]);
     }
+}
+
+
+/**
+ * Send am_zcopy with a non-contiguous header (stack variable) and registered
+ * IOV payload.  Exercises the header_data fallback path: header is packed into
+ * cmd.header_data, UCT_CXI_AM_HDR_FLAG is set, and the receiver prepends
+ * header_data before the payload in the ME buffer.
+ */
+UCS_TEST_P(test_cxi_am, am_zcopy_noncontiguous_header)
+{
+    static const uint8_t  AM_ID    = 25;
+    static const size_t   PAY_LEN  = 2048;
+    static const uint8_t  PAY_FILL = 0xBB;
+
+    uct_cxi_am_recv_ctx ctx = {false, {}};
+    set_am_handler(AM_ID, &ctx);
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    /* Header on the stack — deliberately NOT in the registered IOV region. */
+    uint64_t hdr = 0xFEEDFACE99887766ULL;
+
+    /* Payload in a separate registered buffer. */
+    std::vector<uint8_t> payload(PAY_LEN, PAY_FILL);
+    uct_mem_h memh = reg(sender(), payload.data(), PAY_LEN);
+
+    uct_iov_t iov;
+    iov.buffer = payload.data();
+    iov.length = PAY_LEN;
+    iov.memh   = memh;
+    iov.stride = 0;
+    iov.count  = 1;
+
+    ucs_status_t st = uct_ep_am_zcopy(ep, AM_ID, &hdr, sizeof(hdr),
+                                       &iov, 1, 0, NULL);
+    ASSERT_EQ(UCS_INPROGRESS, st);
+
+    poll_am(ep, ctx);
+
+    /* Handler should see [header(8B)][payload(2048B)]. */
+    ASSERT_EQ(sizeof(uint64_t) + PAY_LEN, ctx.data.size());
+
+    uint64_t recv_hdr = 0;
+    memcpy(&recv_hdr, ctx.data.data(), sizeof(uint64_t));
+    EXPECT_EQ(hdr, recv_hdr) << "non-contiguous zcopy header mismatch";
+
+    for (size_t i = 0; i < PAY_LEN; i++) {
+        EXPECT_EQ(PAY_FILL, ctx.data[sizeof(uint64_t) + i])
+                << "non-contiguous zcopy byte " << i << " mismatch";
+    }
+
+    dereg(sender(), memh);
 }
 
 
