@@ -555,7 +555,7 @@ static ucs_status_t uct_cxi_rkey_release(uct_component_h component,
 
 static ucs_status_t uct_cxi_md_mem_query(uct_md_h md, const void *address,
                                          size_t length,
-                                         uct_md_mem_attr_t *attr)
+                                         uct_md_mem_attr_v2_t *attr)
 {
     return UCS_ERR_UNSUPPORTED;
 }

@@ -131,6 +131,7 @@ ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
     }
 
     if (comp != NULL) {
+        ucs_assert(ep->flush_comp == NULL);
         ep->flush_comp = comp;
     }
 
@@ -139,13 +140,24 @@ ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
 }
 
 /*
- * uct_cxi_ep_fence — no-op with stats.
+ * uct_cxi_ep_fence — emit C_CMD_CQ_FENCE to stall NIC pipeline.
  *
- * The CXI TX command queue is hardware-ordered: commands posted to the same
- * CMDQ are executed in submission order, so no software fence is needed.
+ * The CXI CMDQ is submission-ordered, but the NIC pipelines execution:
+ * a later command can begin before an earlier one finishes, allowing
+ * reordering in the fabric.  C_CMD_CQ_FENCE stalls subsequent commands
+ * until all prior commands have completed execution.
  */
 ucs_status_t uct_cxi_ep_fence(uct_ep_h tl_ep, unsigned flags)
 {
+    uct_cxi_iface_t *iface = ucs_derived_of(tl_ep->iface, uct_cxi_iface_t);
+    int ret;
+
+    ret = cxi_cq_emit_cq_cmd(iface->tx.cmdq, C_CMD_CQ_FENCE);
+    if (ucs_unlikely(ret != 0)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+    cxi_cq_ring(iface->tx.cmdq);
+
     UCT_TL_EP_STAT_FENCE(ucs_derived_of(tl_ep, uct_base_ep_t));
     return UCS_OK;
 }
