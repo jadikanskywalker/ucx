@@ -272,7 +272,8 @@ gtest_SOURCES += \
     uct/cxi/test_cxi_iface.cc \
     uct/cxi/test_cxi_ep.cc \
     uct/cxi/test_cxi_rma.cc \
-    uct/cxi/test_cxi_am.cc
+    uct/cxi/test_cxi_am.cc \
+    uct/cxi/test_cxi_amo.cc
 gtest_LDADD += \
     $(top_builddir)/src/uct/cxi/libuct_cxi.la \
     $(CXI_LIBS)

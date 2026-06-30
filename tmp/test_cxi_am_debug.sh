@@ -4,6 +4,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=00:05:00
+#SBATCH --output=/cosmos/nfs/home/jadhicks/ucx/tmp/out/slurm/am_debug-%j.out
 
 UCX=/cosmos/nfs/home/jadhicks/ucx
 mkdir -p "$UCX/tmp/out"

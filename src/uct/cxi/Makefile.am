@@ -15,6 +15,7 @@ libuct_cxi_la_LDFLAGS    = -version-info $(SOVERSION)
 
 noinst_HEADERS = \
     base/cxi_am.h \
+    base/cxi_amo.h \
     base/cxi_ep.h \
     base/cxi_iface.h \
     base/cxi_rma.h \
@@ -23,6 +24,7 @@ noinst_HEADERS = \
 
 libuct_cxi_la_SOURCES = \
     base/cxi_am.c \
+    base/cxi_amo.c \
     base/cxi_ep.c \
     base/cxi_iface.c \
     base/cxi_rma.c \

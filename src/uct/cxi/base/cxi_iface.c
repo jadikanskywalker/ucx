@@ -20,6 +20,7 @@
 #endif
 
 #include "cxi_am.h"
+#include "cxi_amo.h"
 #include "cxi_ep.h"
 #include "cxi_iface.h"
 #include "cxi_md.h"
@@ -365,12 +366,12 @@ static uct_iface_ops_t uct_cxi_iface_ops = {
     .ep_am_short_iov          = (uct_ep_am_short_iov_func_t)ucs_empty_function_return_unsupported,
     .ep_am_bcopy              = uct_cxi_ep_am_bcopy,
     .ep_am_zcopy              = uct_cxi_ep_am_zcopy,
-    .ep_atomic_cswap64        = (uct_ep_atomic_cswap64_func_t)ucs_empty_function_return_unsupported,
-    .ep_atomic_cswap32        = (uct_ep_atomic_cswap32_func_t)ucs_empty_function_return_unsupported,
-    .ep_atomic32_post         = (uct_ep_atomic32_post_func_t)ucs_empty_function_return_unsupported,
-    .ep_atomic64_post         = (uct_ep_atomic64_post_func_t)ucs_empty_function_return_unsupported,
-    .ep_atomic32_fetch        = (uct_ep_atomic32_fetch_func_t)ucs_empty_function_return_unsupported,
-    .ep_atomic64_fetch        = (uct_ep_atomic64_fetch_func_t)ucs_empty_function_return_unsupported,
+    .ep_atomic_cswap64        = uct_cxi_ep_atomic_cswap64,
+    .ep_atomic_cswap32        = uct_cxi_ep_atomic_cswap32,
+    .ep_atomic32_post         = uct_cxi_ep_atomic32_post,
+    .ep_atomic64_post         = uct_cxi_ep_atomic64_post,
+    .ep_atomic32_fetch        = uct_cxi_ep_atomic32_fetch,
+    .ep_atomic64_fetch        = uct_cxi_ep_atomic64_fetch,
     .ep_tag_eager_short       = (uct_ep_tag_eager_short_func_t)ucs_empty_function_return_unsupported,
     .ep_tag_eager_bcopy       = (uct_ep_tag_eager_bcopy_func_t)ucs_empty_function_return_unsupported,
     .ep_tag_eager_zcopy       = (uct_ep_tag_eager_zcopy_func_t)ucs_empty_function_return_unsupported,
@@ -835,7 +836,18 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
                                         UCT_IFACE_FLAG_AM_BCOPY  |
                                         UCT_IFACE_FLAG_AM_ZCOPY  |
                                         UCT_IFACE_FLAG_CB_SYNC   |
-                                        UCT_IFACE_FLAG_PENDING;
+                                        UCT_IFACE_FLAG_PENDING  |
+                                        UCT_IFACE_FLAG_ATOMIC_DEVICE;
+
+    iface_attr->cap.atomic32.op_flags  = UCS_BIT(UCT_ATOMIC_OP_ADD) |
+                                         UCS_BIT(UCT_ATOMIC_OP_AND) |
+                                         UCS_BIT(UCT_ATOMIC_OP_OR)  |
+                                         UCS_BIT(UCT_ATOMIC_OP_XOR);
+    iface_attr->cap.atomic32.fop_flags = iface_attr->cap.atomic32.op_flags |
+                                         UCS_BIT(UCT_ATOMIC_OP_SWAP) |
+                                         UCS_BIT(UCT_ATOMIC_OP_CSWAP);
+    iface_attr->cap.atomic64.op_flags  = iface_attr->cap.atomic32.op_flags;
+    iface_attr->cap.atomic64.fop_flags = iface_attr->cap.atomic32.fop_flags;
 
     iface_attr->cap.put.max_short     = C_MAX_IDC_PAYLOAD_RES;  /* 224 B */
     iface_attr->cap.put.max_bcopy     = iface->tx.max_bcopy;

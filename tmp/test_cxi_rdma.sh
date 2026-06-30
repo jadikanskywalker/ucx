@@ -5,6 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=00:05:00
+#SBATCH --output=/cosmos/nfs/home/jadhicks/ucx/tmp/out/slurm/rdma-%j.out
 
 # Two-process cross-node CXI UCT data-integrity test.
 #
@@ -13,8 +14,6 @@
 #
 # Then submit:
 #   sbatch ucx/tmp/test_cxi_rdma.sh
-#
-# Output lands in ucx/tmp/cxi_rdma.<jobid>.<node>.{out,err}
 
 UCX=/cosmos/nfs/home/jadhicks/ucx
 BIN=$UCX/tmp/cxi_two_proc_test
@@ -36,5 +35,7 @@ if [[ "${1}" == "--build" ]]; then
     exit 0
 fi
 
-srun --output="$UCX/tmp/cxi_rdma.%j.%N.out" \
+mkdir -p "$UCX/tmp/out"
+
+srun --output="$UCX/tmp/out/rdma.%j.%N.out" \
      "$BIN" cxi0

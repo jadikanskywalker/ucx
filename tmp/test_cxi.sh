@@ -3,6 +3,7 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=00:05:00
+#SBATCH --output=/cosmos/nfs/home/jadhicks/ucx/tmp/out/slurm/test_cxi-%j.out
 
 UCX=/cosmos/nfs/home/jadhicks/ucx
 mkdir -p "$UCX/tmp/out"
