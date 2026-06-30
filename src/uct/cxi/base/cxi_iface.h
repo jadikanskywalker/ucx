@@ -13,6 +13,7 @@
 #include <uct/base/uct_iface.h>
 #include <uct/base/uct_md.h>
 #include <uct/api/uct.h>
+#include <ucs/datastruct/arbiter.h>
 #include <ucs/datastruct/mpool.h>
 
 #include <libcxi/libcxi.h>
@@ -116,6 +117,11 @@ typedef struct uct_cxi_iface {
         ucs_mpool_t      desc_pool;        /**< uct_cxi_send_desc_t — bcopy bounce bufs */
         size_t           max_bcopy;        /**< Max payload per bcopy op (from config) */
         unsigned         outstanding;      /**< Total in-flight sends (all EPs) */
+        /* Pending-request queue: when a send returns UCS_ERR_NO_RESOURCE,
+         * uct_ep_pending_add() queues the caller's callback here via the
+         * EP's arb_group.  Drained from uct_cxi_iface_progress() once TX
+         * completions free up cmdq/pool resources. */
+        ucs_arbiter_t    arbiter;
         /* Short-GET scratch: a page-aligned heap allocation so the NIC's DMA
          * writes land in their own page, away from CPU-hot iface struct
          * fields (prevents false sharing / cache line invalidation).

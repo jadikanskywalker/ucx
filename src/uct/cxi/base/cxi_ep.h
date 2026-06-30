@@ -12,6 +12,7 @@
 
 #include <uct/base/uct_iface.h>
 #include <uct/api/uct.h>
+#include <ucs/datastruct/arbiter.h>
 
 #include <cxi_prov_hw.h>
 
@@ -75,6 +76,7 @@ typedef struct uct_cxi_ep {
     uint8_t           dfa_am_idx_ext;                    /**< AM idx_ext */
     unsigned          outstanding;     /**< In-flight send ops for this EP */
     uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
+    ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */
 } uct_cxi_ep_t;
 
 
@@ -84,5 +86,16 @@ void         uct_cxi_ep_destroy(uct_ep_h tl_ep);
 ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
                                uct_completion_t *comp);
 ucs_status_t uct_cxi_ep_fence(uct_ep_h tl_ep, unsigned flags);
+
+ucs_status_t uct_cxi_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
+                                     unsigned flags);
+void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
+                               void *arg);
+
+/* Arbiter dispatch callback — called from uct_cxi_iface_progress() via
+ * ucs_arbiter_dispatch() to drain queued pending requests. */
+ucs_arbiter_cb_result_t
+uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
+                            ucs_arbiter_elem_t *elem, void *arg);
 
 #endif /* UCT_CXI_EP_H */

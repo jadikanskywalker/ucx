@@ -78,6 +78,7 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->rem_pid     = iface_addr->pid;
     ep->outstanding = 0;
     ep->flush_comp  = NULL;
+    ucs_arbiter_group_init(&ep->arb_group);
 
     /* Build all DFAs at creation time so the hot path needs no check.
      * RMA DFAs: pid_offset = lac index (one per LAC).
@@ -100,12 +101,96 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     return UCS_OK;
 }
 
+static void uct_cxi_ep_pending_purge_warn_cb(uct_pending_req_t *self, void *arg)
+{
+    uct_ep_h ep = arg;
+    ucs_warn("cxi ep %p: pending request %p (func=%p) was not purged",
+             ep, self, (void*)self->func);
+}
+
 void uct_cxi_ep_destroy(uct_ep_h tl_ep)
 {
     uct_cxi_ep_t *ep = ucs_derived_of(tl_ep, uct_cxi_ep_t);
 
     ucs_debug("cxi ep %p destroy (outstanding=%u)", ep, ep->outstanding);
+    uct_cxi_ep_pending_purge(tl_ep, uct_cxi_ep_pending_purge_warn_cb, ep);
     ucs_free(ep);
+}
+
+
+/* -------------------------------------------------------------------------
+ * pending_add / pending_purge
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * uct_cxi_ep_process_pending — arbiter dispatch callback, invoked from
+ * iface_progress() once TX completions have freed cmdq/pool resources.
+ *
+ * Unlike IB RC, CXI has no per-EP remote flow-control credits — cmdq,
+ * op_pool, and desc_pool are all iface-global.  So if one EP's pending
+ * callback hits NO_RESOURCE, no other EP can progress this round either;
+ * STOP halts the whole dispatch instead of RC's four-way EP-vs-iface split.
+ */
+ucs_arbiter_cb_result_t
+uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
+                            ucs_arbiter_elem_t *elem, void *arg)
+{
+    uct_pending_req_t *req = ucs_container_of(elem, uct_pending_req_t, priv);
+    ucs_status_t       status;
+
+    status = req->func(req);
+    if (status == UCS_OK) {
+        return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
+    } else if (status == UCS_ERR_NO_RESOURCE) {
+        return UCS_ARBITER_CB_RESULT_STOP;
+    }
+    return UCS_ARBITER_CB_RESULT_NEXT_GROUP;
+}
+
+/*
+ * uct_cxi_ep_pending_add — queue a callback to retry once resources free up.
+ *
+ * Unconditionally queues (no UCS_ERR_BUSY fast path): CXI has three distinct
+ * resource pools (cmdq, op_pool, desc_pool) and no cheap way to probe "do I
+ * have resources right now" across all of them, so we always defer to the
+ * arbiter dispatch in iface_progress() rather than trying to special-case
+ * the immediately-retryable case.
+ */
+ucs_status_t uct_cxi_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
+                                     unsigned flags)
+{
+    uct_cxi_ep_t     *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
+    uct_cxi_iface_t  *iface = uct_cxi_ep_iface(ep);
+
+    uct_pending_req_arb_group_push(&ep->arb_group, n);
+    ucs_arbiter_group_schedule(&iface->tx.arbiter, &ep->arb_group);
+    return UCS_OK;
+}
+
+static ucs_arbiter_cb_result_t
+uct_cxi_ep_arbiter_purge_cb(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
+                             ucs_arbiter_elem_t *elem, void *arg)
+{
+    uct_pending_req_t   *req      = ucs_container_of(elem, uct_pending_req_t,
+                                                       priv);
+    uct_purge_cb_args_t *cb_args  = arg;
+
+    if (cb_args->cb != NULL) {
+        cb_args->cb(req, cb_args->arg);
+    }
+    return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
+}
+
+void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
+                               void *arg)
+{
+    uct_cxi_ep_t        *ep        = ucs_derived_of(tl_ep, uct_cxi_ep_t);
+    uct_cxi_iface_t     *iface     = uct_cxi_ep_iface(ep);
+    uct_purge_cb_args_t  cb_args   = {cb, arg};
+
+    ucs_arbiter_group_purge(&iface->tx.arbiter, &ep->arb_group,
+                             uct_cxi_ep_arbiter_purge_cb, &cb_args);
 }
 
 

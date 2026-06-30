@@ -380,8 +380,8 @@ static uct_iface_ops_t uct_cxi_iface_ops = {
     .ep_tag_rndv_request      = (uct_ep_tag_rndv_request_func_t)ucs_empty_function_return_unsupported,
     .iface_tag_recv_zcopy     = (uct_iface_tag_recv_zcopy_func_t)ucs_empty_function_return_unsupported,
     .iface_tag_recv_cancel    = (uct_iface_tag_recv_cancel_func_t)ucs_empty_function_return_unsupported,
-    .ep_pending_add           = (uct_ep_pending_add_func_t)ucs_empty_function_return_unsupported,
-    .ep_pending_purge         = (uct_ep_pending_purge_func_t)ucs_empty_function,
+    .ep_pending_add           = uct_cxi_ep_pending_add,
+    .ep_pending_purge         = uct_cxi_ep_pending_purge,
     .ep_flush                 = uct_cxi_ep_flush,
     .ep_fence                 = uct_cxi_ep_fence,
     .ep_check                 = (uct_ep_check_func_t)ucs_empty_function_return_unsupported,
@@ -577,6 +577,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
 
     /* Step 12: send-op pool for zcopy/short completion tracking. */
     self->tx.outstanding = 0;
+    ucs_arbiter_init(&self->tx.arbiter);
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_send_op_t);
     mp_params.elems_per_chunk = UCT_CXI_CMDQ_DEPTH;
@@ -733,6 +734,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
 
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
+
+    ucs_arbiter_cleanup(&self->tx.arbiter);
 
     /* Close AM PTE and rx_buf in reverse allocation order. */
     if (self->am.pte_map != NULL) {
@@ -1032,6 +1035,12 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
     if (n > 0) {
         cxi_eq_ack_events(iface->evtq);
     }
+
+    /* Retry any sends queued via uct_ep_pending_add() now that this round
+     * of completions may have freed cmdq/op_pool/desc_pool resources.
+     * Cheap no-op when the arbiter is empty. */
+    ucs_arbiter_dispatch(&iface->tx.arbiter, 1, uct_cxi_ep_process_pending,
+                         NULL);
 
     return n;
 }
