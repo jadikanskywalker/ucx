@@ -21,10 +21,12 @@
 
 #define UCT_CXI_NAME "cxi"
 
-/* Event queue sizing. */
+/* Event queue sizing.  UCT_CXI_EQ_NUM_EVENTS is the config default only —
+ * the actual runtime size is uct_cxi_iface_t::eq_num_events, resolved at
+ * iface_open from UCX_CXI_EQ_SIZE together with the TX pool caps (see
+ * UCS_CLASS_INIT_FUNC).  UCT_CXI_EQ_ENTRY_SIZE is a hardware constant. */
 #define UCT_CXI_EQ_NUM_EVENTS  1024U
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
-#define UCT_CXI_EQ_BUF_LEN    (UCT_CXI_EQ_NUM_EVENTS * UCT_CXI_EQ_ENTRY_SIZE)
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
@@ -92,10 +94,13 @@ typedef struct uct_cxi_iface_addr {
 typedef struct uct_cxi_iface_config {
     uct_iface_config_t       super;
     uct_iface_mpool_config_t bcopy_mp;  /**< desc_pool config (bufs_grow, max_bufs) */
+    uct_iface_mpool_config_t op_mp;     /**< op_pool config (bufs_grow, max_bufs)   */
     size_t                   max_bcopy; /**< Max payload for put_bcopy/get_bcopy    */
     unsigned                 am_rx_num_bufs; /**< # AM receive buffers (PRIORITY MEs) */
     size_t                   am_rx_buf_size; /**< Size of each AM receive buffer     */
     size_t                   am_max_zcopy;  /**< Max AM zcopy payload               */
+    unsigned                 eq_size;    /**< Event queue depth (floor; may be
+                                              auto-grown to fit TX pool caps)     */
 } uct_cxi_iface_config_t;
 
 
@@ -142,6 +147,9 @@ typedef struct uct_cxi_iface {
     void                 *eq_buf;          /**< mmap backing buffer for evtq */
     struct cxi_md        *eq_md;           /**< cxil_map registration of eq_buf */
     struct cxi_eq        *evtq;            /**< Event queue (shared by all CMDQs & PTEs) */
+    unsigned              eq_num_events;   /**< Runtime EQ depth — resolved from
+                                                UCX_CXI_EQ_SIZE and TX pool caps at
+                                                iface_open; see UCS_CLASS_INIT_FUNC */
 
     /* ── RMA/AMO portals (restricted, pid_offset = LAC index) ───────── */
     struct {

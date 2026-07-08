@@ -62,11 +62,40 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, max_bcopy),
      UCS_CONFIG_TYPE_MEMUNITS},
 
-    UCT_IFACE_MPOOL_CONFIG_FIELDS("BCOPY_", -1, 256, 16mb, 2.0,
+    UCT_IFACE_MPOOL_CONFIG_FIELDS("BCOPY_", 512, 256, 16mb, 2.0,
                                   "bcopy descriptor",
                                   ucs_offsetof(uct_cxi_iface_config_t, bcopy_mp),
                                   "\nDefault bufs_grow matches TX command queue depth "
-                                  "so one chunk can saturate the cmdq without regrowth."),
+                                  "so one chunk can saturate the cmdq without regrowth.\n"
+                                  "MAX_BUFS default (512) is bounded so pool exhaustion\n"
+                                  "reliably triggers UCS_ERR_NO_RESOURCE / pending-retry\n"
+                                  "before outstanding ops can exceed a hardware EQ_SIZE.\n"
+                                  "-1 means \"size this pool to EQ_SIZE\".  Workloads \n"
+                                  "with many concurrently-busy endpoints on one interface\n"
+                                  "should raise this together with TX_OP_MAX_BUFS and\n"
+                                  "EQ_SIZE — per-endpoint size for expected in-flight\n"
+                                  "operation count."),
+
+    UCT_IFACE_MPOOL_CONFIG_FIELDS("TX_OP_", 512, 256, 16mb, 2.0,
+                                  "send-op tracking",
+                                  ucs_offsetof(uct_cxi_iface_config_t, op_mp),
+                                  "\nUsed by put/get/AM short and zcopy, and AMO post/fetch,\n"
+                                  "for completion tracking (no DMA-registered memory).\n"
+                                  "MAX_BUFS default (512) is bounded for the same reason as\n"
+                                  "BCOPY_MAX_BUFS above; -1 means \"size to EQ_SIZE\".\n"
+                                  "Raise together with BCOPY_MAX_BUFS and EQ_SIZE\n"
+                                  "for workloads with many concurrently-busy endpoints."),
+
+    {"EQ_SIZE", "1024",
+     "Event queue depth (number of hardware completion events).  Acts as a\n"
+     "floor: automatically grown to (TX_OP_MAX_BUFS + BCOPY_MAX_BUFS) if their\n"
+     "sum exceeds this value, since each in-flight send holds exactly one pool\n"
+     "slot until its single EQ completion event is drained. Flooding the EQ\n"
+     "will result in expensive flow control. Restricted op pool sizes, and\\\n"
+     "or growing the EQ size helps ensure transmit-side resouces exhaust\n"
+     "before an endpoint's EQ is saturated.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_size),
+     UCS_CONFIG_TYPE_UINT},
 
     {"AM_RX_NUM_BUFS", "4",
      "Number of AM receive buffers rotated on the PRIORITY list.\n"
@@ -459,6 +488,9 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     ucs_mpool_params_t         mp_params;
     ucs_status_t               status;
     int                        ret;
+    unsigned                   op_max_bufs;
+    unsigned                   desc_max_bufs;
+    size_t                     eq_buf_len;
 
     UCT_CHECK_PARAM(params->field_mask & UCT_IFACE_PARAM_FIELD_OPEN_MODE,
                     "UCT_IFACE_PARAM_FIELD_OPEN_MODE is not defined");
@@ -475,6 +507,37 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                             params->stats_root :
                             NULL) UCS_STATS_ARG(UCT_CXI_NAME));
 
+    /*
+     * Step 1.5: resolve TX pool caps and EQ depth together.
+     *
+     * Each in-flight op (post/short/zcopy/AMO from op_pool, bcopy/AMO-fetch
+     * from desc_pool) holds exactly one pool slot until its single EQ
+     * completion event is drained.  If op_max_bufs + desc_max_bufs could
+     * exceed the hardware EQ depth, outstanding operations could overrun
+     * the EQ before pool exhaustion ever returns UCS_ERR_NO_RESOURCE,
+     * causing a silent hardware EQ drop instead of a clean pending-retry
+     * (see uct_cxi_ep_pending_add).  So eq_num_events is grown to be at
+     * least the sum of any *explicitly finite* pool caps.
+     *
+     * -1 (UINT_MAX) on either MAX_BUFS config resolves to "size this pool
+     * to the full EQ" rather than literal unbounded growth — this keeps
+     * the invariant even when a user opts out of an explicit cap on one
+     * pool, at the cost of not strictly bounding the total when *both*
+     * pools are left at -1 simultaneously (an explicit, documented
+     * simplification: each -1 pool independently gets the full EQ depth).
+     */
+    {
+        unsigned op_cfg   = config->op_mp.max_bufs;
+        unsigned desc_cfg = config->bcopy_mp.max_bufs;
+        unsigned finite_sum = (op_cfg == UINT_MAX ? 0 : op_cfg) +
+                              (desc_cfg == UINT_MAX ? 0 : desc_cfg);
+
+        self->eq_num_events = ucs_max(config->eq_size, finite_sum);
+        op_max_bufs          = (op_cfg == UINT_MAX) ? self->eq_num_events : op_cfg;
+        desc_max_bufs        = (desc_cfg == UINT_MAX) ? self->eq_num_events : desc_cfg;
+    }
+    eq_buf_len = (size_t)self->eq_num_events * UCT_CXI_EQ_ENTRY_SIZE;
+
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
     if (ret != 0) {
@@ -484,18 +547,17 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     /* Step 3: mmap a private anonymous buffer for the event queue ring. */
-    self->eq_buf = mmap(NULL, UCT_CXI_EQ_BUF_LEN,
+    self->eq_buf = mmap(NULL, eq_buf_len,
                         PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (self->eq_buf == MAP_FAILED) {
-        ucs_error("cxi mmap eq_buf size %zu failed: %m",
-                  (size_t)UCT_CXI_EQ_BUF_LEN);
+        ucs_error("cxi mmap eq_buf size %zu failed: %m", eq_buf_len);
         status = UCS_ERR_NO_MEMORY;
         goto err_destroy_wait_obj;
     }
 
     /* Step 4: pin the EQ buffer so the NIC can DMA into it. */
-    ret = cxil_map(lni, self->eq_buf, UCT_CXI_EQ_BUF_LEN,
+    ret = cxil_map(lni, self->eq_buf, eq_buf_len,
                    CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE,
                    NULL, &self->eq_md);
     if (ret != 0) {
@@ -507,7 +569,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     /* Step 5: allocate the event queue backed by the pinned buffer. */
     memset(&eq_attr, 0, sizeof(eq_attr));
     eq_attr.queue     = self->eq_buf;
-    eq_attr.queue_len = UCT_CXI_EQ_BUF_LEN;
+    eq_attr.queue_len = eq_buf_len;
     ret = cxil_alloc_evtq(lni, self->eq_md, &eq_attr,
                           self->wait_obj, NULL, &self->evtq);
     if (ret != 0) {
@@ -575,12 +637,20 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         }
     }
 
-    /* Step 12: send-op pool for zcopy/short completion tracking. */
+    /*
+     * Step 12: send-op pool for zcopy/short completion tracking.
+     *
+     * max_elems = op_max_bufs (resolved in Step 1.5 from TX_OP_MAX_BUFS,
+     * with -1 meaning "size to eq_num_events") so pool exhaustion returns
+     * UCS_ERR_NO_RESOURCE — triggering the pending-retry path — before
+     * outstanding ops can exceed the hardware EQ depth.
+     */
     self->tx.outstanding = 0;
     ucs_arbiter_init(&self->tx.arbiter);
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_send_op_t);
     mp_params.elems_per_chunk = UCT_CXI_CMDQ_DEPTH;
+    mp_params.max_elems       = op_max_bufs;
     mp_params.ops             = &uct_cxi_send_op_mpool_ops;
     mp_params.name            = "cxi-send-op";
     status = ucs_mpool_init(&mp_params, &self->tx.op_pool);
@@ -598,17 +668,26 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * uct_cxi_mem_handle_t is passed to uct_cxi_send_desc_init per element.
      * One chunk = UCT_CXI_CMDQ_DEPTH descs ≈ 2 MB, matching the TX cmdq depth
      * so the queue can fill without triggering a second cxil_map.
+     *
+     * max_bufs is overridden to desc_max_bufs (resolved in Step 1.5) rather
+     * than passed straight from config->bcopy_mp — see Step 1.5 for the -1
+     * ("size to EQ") resolution.
      */
     self->tx.max_bcopy = config->max_bcopy;
-    status = uct_iface_mpool_init(
-            &self->super, &self->tx.desc_pool,
-            sizeof(uct_cxi_send_desc_t) + config->max_bcopy,
-            sizeof(uct_cxi_send_desc_t),  /* align_offset: align data area */
-            UCS_SYS_CACHE_LINE_SIZE,
-            &config->bcopy_mp,
-            UCT_CXI_CMDQ_DEPTH,
-            uct_cxi_send_desc_init,
-            "cxi-send-desc");
+    {
+        uct_iface_mpool_config_t desc_mp_config = config->bcopy_mp;
+        desc_mp_config.max_bufs = desc_max_bufs;
+
+        status = uct_iface_mpool_init(
+                &self->super, &self->tx.desc_pool,
+                sizeof(uct_cxi_send_desc_t) + config->max_bcopy,
+                sizeof(uct_cxi_send_desc_t),  /* align_offset: align data area */
+                UCS_SYS_CACHE_LINE_SIZE,
+                &desc_mp_config,
+                UCT_CXI_CMDQ_DEPTH,
+                uct_cxi_send_desc_init,
+                "cxi-send-desc");
+    }
     if (status != UCS_OK) {
         ucs_error("cxi send_desc mpool init failed: %s",
                   ucs_status_string(status));
@@ -720,7 +799,7 @@ err_destroy_evtq:
 err_unmap_eq:
     cxil_unmap(self->eq_md);
 err_munmap_eq:
-    munmap(self->eq_buf, UCT_CXI_EQ_BUF_LEN);
+    munmap(self->eq_buf, eq_buf_len);
 err_destroy_wait_obj:
     cxil_destroy_wait_obj(self->wait_obj);
 err:
@@ -807,7 +886,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
         ucs_warn("cxi cxil_unmap eq_md failed: %s", strerror(-ret));
     }
 
-    munmap(self->eq_buf, UCT_CXI_EQ_BUF_LEN);
+    munmap(self->eq_buf, (size_t)self->eq_num_events * UCT_CXI_EQ_ENTRY_SIZE);
 
     ret = cxil_destroy_wait_obj(self->wait_obj);
     if (ret != 0) {
