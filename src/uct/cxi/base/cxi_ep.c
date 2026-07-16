@@ -140,6 +140,10 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
     ucs_status_t       status;
 
     status = req->func(req);
+    /* TEMPORARY: confirms the dispatch loop is actually retrying queued
+     * sends and shows how each attempt resolves. */
+    ucs_trace("cxi pending: process req=%p func=%p status=%s",
+             req, (void*)req->func, ucs_status_string(status));
     if (status == UCS_OK) {
         return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
     } else if (status == UCS_ERR_NO_RESOURCE) {
@@ -165,6 +169,9 @@ ucs_status_t uct_cxi_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
 
     uct_pending_req_arb_group_push(&ep->arb_group, n);
     ucs_arbiter_group_schedule(&iface->tx.arbiter, &ep->arb_group);
+    /* TEMPORARY: confirms pending_add is actually reached (vs the caller
+     * silently swallowing NO_RESOURCE) and which EP/req queued. */
+    ucs_trace("cxi pending: add ep=%p req=%p func=%p", ep, n, (void*)n->func);
     return UCS_OK;
 }
 
@@ -189,6 +196,9 @@ void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
     uct_cxi_iface_t     *iface     = uct_cxi_ep_iface(ep);
     uct_purge_cb_args_t  cb_args   = {cb, arg};
 
+    /* TEMPORARY: confirms purge runs and how many elements it found. */
+    ucs_info("cxi pending: purge ep=%p elems=%zu", ep,
+             ucs_arbiter_group_num_elems(&ep->arb_group));
     ucs_arbiter_group_purge(&iface->tx.arbiter, &ep->arb_group,
                              uct_cxi_ep_arbiter_purge_cb, &cb_args);
 }
