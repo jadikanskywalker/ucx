@@ -649,7 +649,9 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     ucs_arbiter_init(&self->tx.arbiter);
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_send_op_t);
-    mp_params.elems_per_chunk = UCT_CXI_CMDQ_DEPTH;
+    /* ucs_mpool_init() requires max_elems >= elems_per_chunk; clamp so a
+     * small TX_OP_MAX_BUFS (e.g. in tests) doesn't violate that. */
+    mp_params.elems_per_chunk = ucs_min(UCT_CXI_CMDQ_DEPTH, op_max_bufs);
     mp_params.max_elems       = op_max_bufs;
     mp_params.ops             = &uct_cxi_send_op_mpool_ops;
     mp_params.name            = "cxi-send-op";
@@ -676,7 +678,17 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     self->tx.max_bcopy = config->max_bcopy;
     {
         uct_iface_mpool_config_t desc_mp_config = config->bcopy_mp;
+        /* ucs_mpool_init() requires max_elems >= elems_per_chunk; clamp both
+         * the explicit BCOPY_BUFS_GROW override and the "grow" fallback
+         * below so a small BCOPY_MAX_BUFS (e.g. in tests) doesn't violate
+         * that. bufs_grow == 0 keeps its "let the transport pick" meaning. */
+        unsigned desc_grow = ucs_min(UCT_CXI_CMDQ_DEPTH, desc_max_bufs);
+
         desc_mp_config.max_bufs = desc_max_bufs;
+        if ((desc_mp_config.bufs_grow != 0) &&
+            (desc_mp_config.bufs_grow > desc_max_bufs)) {
+            desc_mp_config.bufs_grow = desc_grow;
+        }
 
         status = uct_iface_mpool_init(
                 &self->super, &self->tx.desc_pool,
@@ -684,7 +696,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                 sizeof(uct_cxi_send_desc_t),  /* align_offset: align data area */
                 UCS_SYS_CACHE_LINE_SIZE,
                 &desc_mp_config,
-                UCT_CXI_CMDQ_DEPTH,
+                desc_grow,
                 uct_cxi_send_desc_init,
                 "cxi-send-desc");
     }
