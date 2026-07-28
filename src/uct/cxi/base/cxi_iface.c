@@ -133,7 +133,11 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     int                       ret;
 
     {
-        struct cxi_pt_alloc_opts pt_opts = {};
+        /* EXPERIMENTAL (EQ backpressure test): arm graceful disable/recover
+         * instead of silent EQ-drop on resource pressure. */
+        struct cxi_pt_alloc_opts pt_opts = {
+            .en_flowctrl = 1
+        };
         ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->rma.pte[lac]);
     }
     if (ret != 0) {
@@ -279,9 +283,12 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
     int                  ret;
 
     {
+        /* EXPERIMENTAL (EQ backpressure test): arm graceful disable/recover
+         * instead of silent EQ-drop on resource pressure. */
         struct cxi_pt_alloc_opts pt_opts = {
             .is_matching    = 1,   /* unrestricted (messaging) mode */
-            .use_long_event = 1    /* force 64-byte events with rlength/start */
+            .use_long_event = 1,   /* force 64-byte events with rlength/start */
+            .en_flowctrl    = 1
         };
         ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->am.pte);
     }
@@ -1011,6 +1018,13 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                 ucs_error("cxi TX event %d error: rc=%d ep %p",
                           (int)event->hdr.event_type,
                           cxi_event_rc(event), op->ep);
+                if (cxi_event_rc(event) == C_RC_PT_DISABLED) {
+                    /* EXPERIMENTAL (EQ backpressure test): sender-side
+                     * observation of a target PTE disable. */
+                    ucs_warn("  cxi TX saw PT_DISABLED: event %d ep %p — "
+                             "target PTE is in graceful recovery",
+                             (int)event->hdr.event_type, op->ep);
+                }
                 if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
                     iface->am.pte != NULL) {
                     struct cxi_pte_status pte_s = {};
@@ -1080,6 +1094,49 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 
             uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
 
+        } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
+            /* EXPERIMENTAL (EQ backpressure test): receiver-side observation
+             * of a PTE transitioning state (e.g. graceful disable under
+             * en_flowctrl). ptlte_index identifies which PTE. */
+            uint8_t ptlte_state = event->tgt_long.initiator.state_change.ptlte_state;
+            uint8_t sc_reason   = event->tgt_long.initiator.state_change.sc_reason;
+
+            ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
+                     "sc_reason=%u sc_nic_auto=%u",
+                     (unsigned)event->tgt_long.ptlte_index,
+                     (unsigned)ptlte_state, (unsigned)sc_reason,
+                     (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto);
+
+            if (ptlte_state == C_PTLTE_DISABLED) {
+                struct cxil_pte *pte = NULL;
+                unsigned         lac;
+
+                if (iface->am.pte != NULL &&
+                    event->tgt_long.ptlte_index == iface->am.pte->ptn) {
+                    pte = iface->am.pte;
+                } else {
+                    for (lac = 0; lac < iface->rma.lac_count; lac++) {
+                        if (iface->rma.pte[lac] != NULL &&
+                            event->tgt_long.ptlte_index ==
+                                    iface->rma.pte[lac]->ptn) {
+                            pte = iface->rma.pte[lac];
+                            break;
+                        }
+                    }
+                }
+
+                if (pte != NULL) {
+                    struct cxi_pte_status pte_s = {};
+                    if (cxil_pte_status(pte, &pte_s) == 0) {
+                        ucs_warn("cxi PTE ptn=%u DISABLED: drop_count=%u "
+                                 "ule_count=%u state=%u",
+                                 (unsigned)event->tgt_long.ptlte_index,
+                                 pte_s.drop_count, pte_s.ule_count,
+                                 pte_s.state);
+                    }
+                }
+            }
+
             // /* Periodic pte_status diagnostic: log les_allocated + ule_count
             //  * every 50 total received messages to catch LE disappearance. */
             // if ((++iface->am.rx_total % 50) == 0 && iface->am.pte != NULL) {
@@ -1120,6 +1177,123 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 
     if (ucs_unlikely(cxi_eq_get_drops(iface->evtq))) {
         ucs_error("cxi EQ drop detected: events lost (EQ full)");
+
+        /* EXPERIMENTAL (EQ backpressure test): on a raw drop, the
+         * STATE_CHANGE notification for whichever PTE (if any) disabled
+         * may itself have been lost in the same overflow — don't rely
+         * solely on having seen that event. Proactively poll every
+         * locally-owned PTE's status directly, and check the EQ's own
+         * fill-level status write-back while we're at it. */
+        {
+            struct c_eq_status status = {};
+            int                got_status;
+
+            got_status = cxi_eq_get_status(iface->evtq, &status);
+            if (got_status) {
+                ucs_warn("cxi EQ status: slots_free=%u slots_rsrvd=%u "
+                         "thld_sts=%u thld_id=%u wr_ptr=%u",
+                         (unsigned)status.event_slots_free,
+                         (unsigned)status.event_slots_rsrvd,
+                         (unsigned)status.thld_sts, (unsigned)status.thld_id,
+                         (unsigned)status.wr_ptr);
+                if (status.thld_sts) {
+                    ucs_warn("cxi EQ fill level: %u%%",
+                             cxi_eq_status_fill_level(iface->evtq, &status));
+                }
+            } else {
+                ucs_warn("cxi EQ status: no new update since last check");
+            }
+        }
+
+        if (iface->am.pte != NULL) {
+            struct cxi_pte_status pte_s = {};
+            if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
+                ucs_warn("cxi AM PTE ptn=%u state=%u drop_count=%u "
+                         "ule_count=%u les_allocated=%u les_reserved=%u "
+                         "les_max=%u",
+                         iface->am.pte->ptn, pte_s.state, pte_s.drop_count,
+                         pte_s.ule_count, pte_s.les_allocated,
+                         pte_s.les_reserved, pte_s.les_max);
+
+                /* EXPERIMENTAL (EQ backpressure test): attempt a real
+                 * SETSTATE re-enable, once, and see (a) whether it
+                 * succeeds and (b) whether the LE(s) posted before the
+                 * disable are still allocated afterward (les_allocated),
+                 * or got auto-unlinked and need reposting. */
+                {
+                    static bool reenable_attempted = false;
+
+                    if ((pte_s.state == C_PTLTE_DISABLED) &&
+                        !reenable_attempted) {
+                        struct c_set_state_cmd ss = {};
+                        int                     ret;
+                        unsigned                tries;
+
+                        reenable_attempted = true;
+
+                        ss.command.opcode = C_CMD_TGT_SETSTATE;
+                        ss.ptlte_index    = iface->am.pte->ptn;
+                        ss.ptlte_state    = C_PTLTE_ENABLED;
+                        ss.drop_count     = pte_s.drop_count;
+
+                        ret = cxi_cq_emit_target(iface->tgt.cmdq, &ss);
+                        if (ret == 0) {
+                            cxi_cq_ring(iface->tgt.cmdq);
+                            ucs_warn("cxi AM PTE ptn=%u: issued SETSTATE "
+                                     "ENABLED drop_count=%u",
+                                     iface->am.pte->ptn, pte_s.drop_count);
+                        } else {
+                            ucs_warn("cxi AM PTE ptn=%u: SETSTATE emit "
+                                     "failed: %d", iface->am.pte->ptn, ret);
+                        }
+
+                        /* Poll status directly rather than waiting for a
+                         * STATE_CHANGE event, which we've already seen can
+                         * itself be lost under this same pressure. */
+                        for (tries = 0; tries < 20; tries++) {
+                            struct cxi_pte_status post_s = {};
+
+                            if (cxil_pte_status(iface->am.pte, &post_s) !=
+                                0) {
+                                break;
+                            }
+                            if (post_s.state != C_PTLTE_DISABLED) {
+                                ucs_warn("cxi AM PTE ptn=%u: re-enable "
+                                         "result after %u tries: state=%u "
+                                         "drop_count=%u les_allocated=%u "
+                                         "les_reserved=%u les_max=%u",
+                                         iface->am.pte->ptn, tries,
+                                         post_s.state, post_s.drop_count,
+                                         post_s.les_allocated,
+                                         post_s.les_reserved,
+                                         post_s.les_max);
+                                break;
+                            }
+                            if (tries == 19) {
+                                ucs_warn("cxi AM PTE ptn=%u: still "
+                                         "DISABLED after %u status polls, "
+                                         "giving up",
+                                         iface->am.pte->ptn, tries + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        {
+            unsigned lac;
+            for (lac = 0; lac < iface->rma.lac_count; lac++) {
+                struct cxi_pte_status pte_s = {};
+                if ((iface->rma.pte[lac] != NULL) &&
+                    (cxil_pte_status(iface->rma.pte[lac], &pte_s) == 0)) {
+                    ucs_warn("cxi RMA PTE lac=%u ptn=%u state=%u "
+                             "drop_count=%u ule_count=%u",
+                             lac, iface->rma.pte[lac]->ptn, pte_s.state,
+                             pte_s.drop_count, pte_s.ule_count);
+                }
+            }
+        }
+
         cxi_eq_ack_drops(iface->evtq);
     }
 
