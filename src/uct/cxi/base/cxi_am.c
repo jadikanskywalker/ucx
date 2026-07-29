@@ -91,6 +91,10 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     UCT_CHECK_LENGTH(length, 0,
                      C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t), "am_short");
 
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
     memcpy(buf, &header, sizeof(uint64_t));
     memcpy(buf + sizeof(uint64_t), payload, length);
 
@@ -163,6 +167,10 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     uct_cxi_send_desc_t *desc;
     size_t               length;
     int                  ret;
+
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return (ssize_t)UCS_ERR_NO_RESOURCE;
+    }
 
     desc = ucs_mpool_get(&iface->tx.desc_pool);
     if (ucs_unlikely(desc == NULL)) {
@@ -259,6 +267,10 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     UCT_CHECK_LENGTH(header_length + iov_length, 0,
                      iface->am.buf_size - sizeof(uint64_t),
                      "am_zcopy total");
+
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
 
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {

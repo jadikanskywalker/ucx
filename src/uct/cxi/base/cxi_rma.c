@@ -96,6 +96,10 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_RES, "get_short");
 
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
         return UCS_ERR_NO_RESOURCE;
@@ -187,6 +191,10 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
               (unsigned long)remote_addr,
               (unsigned long)(rkey_p->iova + remote_addr),
               (unsigned)rkey_p->lac);
+
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
 
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
@@ -293,6 +301,10 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
     size_t                length;
     int                   ret;
 
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return (ssize_t)UCS_ERR_NO_RESOURCE;
+    }
+
     desc = ucs_mpool_get(&iface->tx.desc_pool);
     if (ucs_unlikely(desc == NULL)) {
         UCT_TL_IFACE_STAT_TX_NO_DESC(&iface->super);
@@ -365,6 +377,10 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
 
     UCT_CHECK_LENGTH(length, 0, iface->tx.max_bcopy, "get_bcopy");
 
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
     desc = ucs_mpool_get(&iface->tx.desc_pool);
     if (ucs_unlikely(desc == NULL)) {
         UCT_TL_IFACE_STAT_TX_NO_DESC(&iface->super);
@@ -432,6 +448,10 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
         return UCS_ERR_NO_RESOURCE;
@@ -496,6 +516,10 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     uct_cxi_mem_handle_t *local_mh = (uct_cxi_mem_handle_t *)iov[0].memh;
     uct_cxi_send_op_t    *op;
     int                   ret;
+
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
 
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {

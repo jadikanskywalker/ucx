@@ -77,6 +77,10 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
         return UCS_ERR_NO_RESOURCE;
@@ -157,6 +161,10 @@ uct_cxi_ep_atomic_fetch_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
     const uct_cxi_rkey_t *rkey_p = (const uct_cxi_rkey_t *)(uintptr_t)rkey;
     uct_cxi_send_desc_t  *desc;
     int                   ret;
+
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
 
     desc = ucs_mpool_get(&iface->tx.desc_pool);
     if (ucs_unlikely(desc == NULL)) {
@@ -251,6 +259,10 @@ uct_cxi_ep_atomic_cswap_common(uct_ep_h tl_ep, uint64_t compare,
     const uct_cxi_rkey_t *rkey_p = (const uct_cxi_rkey_t *)(uintptr_t)rkey;
     uct_cxi_send_desc_t  *desc;
     int                   ret;
+
+    if (uct_cxi_ep_fc_blocked(ep, iface)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
 
     desc = ucs_mpool_get(&iface->tx.desc_pool);
     if (ucs_unlikely(desc == NULL)) {

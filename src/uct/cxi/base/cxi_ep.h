@@ -13,8 +13,16 @@
 #include <uct/base/uct_iface.h>
 #include <uct/api/uct.h>
 #include <ucs/datastruct/arbiter.h>
+#include <ucs/time/time.h>
 
 #include <cxi_prov_hw.h>
+
+/* Fixed backoff after observing C_RC_PT_DISABLED on this EP's own TX
+ * completion — short enough that recovery (typically resolved within a
+ * handful of microseconds, see PTE flow-control design notes) isn't
+ * meaningfully delayed, long enough to avoid re-submitting into a PTE
+ * that's still disabled on every single progress() call. */
+#define UCT_CXI_FC_BACKOFF_US 100
 
 
 /**
@@ -77,8 +85,33 @@ typedef struct uct_cxi_ep {
     unsigned          outstanding;     /**< In-flight send ops for this EP */
     uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
     ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */
+    ucs_time_t        fc_blocked_until; /**< Set on C_RC_PT_DISABLED; new sends
+                                             on this EP return UCS_ERR_NO_RESOURCE
+                                             (routing through pending/arbiter,
+                                             same as pool exhaustion) until this
+                                             deadline passes. 0 = not blocked. */
 } uct_cxi_ep_t;
 
+
+/*
+ * uct_cxi_ep_fc_blocked — true if this send should be deferred to the
+ * pending/arbiter retry path rather than attempted now.
+ *
+ * Two independent reasons, both gate identically (return UCS_ERR_NO_RESOURCE,
+ * same as ordinary pool exhaustion — no new caller-visible status):
+ *   - iface->eq_need_to_drain: the shared EQ is being drained back down
+ *     after a drop, before any disabled PTE is re-checked (see cxi_iface.c).
+ *     New local sends are held back to stop refilling it out from under
+ *     that drain.
+ *   - ep->fc_blocked_until: this specific EP's last send hit a disabled
+ *     remote PTE; back off briefly rather than resubmit into it.
+ */
+static UCS_F_ALWAYS_INLINE int
+uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+    return ucs_unlikely((iface->eq_need_to_drain > 0) ||
+                         (ep->fc_blocked_until > ucs_get_time()));
+}
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);
 void         uct_cxi_ep_destroy(uct_ep_h tl_ep);

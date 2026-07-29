@@ -74,10 +74,11 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     dev_addr   = (const uct_cxi_device_addr_t *)params->dev_addr;
     iface_addr = (const uct_cxi_iface_addr_t  *)params->iface_addr;
 
-    ep->rem_nid     = dev_addr->nid;
-    ep->rem_pid     = iface_addr->pid;
-    ep->outstanding = 0;
-    ep->flush_comp  = NULL;
+    ep->rem_nid          = dev_addr->nid;
+    ep->rem_pid          = iface_addr->pid;
+    ep->outstanding      = 0;
+    ep->flush_comp       = NULL;
+    ep->fc_blocked_until = 0;
     ucs_arbiter_group_init(&ep->arb_group);
 
     /* Build all DFAs at creation time so the hot path needs no check.

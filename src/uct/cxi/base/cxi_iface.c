@@ -40,9 +40,6 @@
 #include <errno.h>
 #include <string.h>
 
-// TEMPORARY
-#include <stdio.h>
-
 
 static UCS_F_ALWAYS_INLINE uct_cxi_md_t *
 uct_cxi_iface_md(uct_cxi_iface_t *iface)
@@ -97,6 +94,38 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, eq_size),
      UCS_CONFIG_TYPE_UINT},
 
+    {"EQ_RESERVED_SLOTS_PCT", "5",
+     "Percentage of the EQ reserved so incoming (RX) traffic cannot crowd\n"
+     "out this iface's own TX completions. One-sided: TX completions may\n"
+     "still use the full EQ, this only blocks LPE/RX events from the\n"
+     "reserved portion. A floor, not an exclusive TX partition — safe to\n"
+     "default small since PTE flow control (below) is what actually\n"
+     "prevents data loss regardless of this setting; raise it for\n"
+     "workloads known to be TX-heavy.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_reserved_slots_pct),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"EQ_DRAIN_PCT", "50",
+     "Percentage of the EQ to drain (counted from the moment a drop is\n"
+     "detected) before re-checking and re-enabling any disabled PTE.\n"
+     "Re-enabling into a still-full EQ just re-triggers the same disable\n"
+     "on the next blocked event, so this avoids flapping under sustained\n"
+     "(not transient) pressure.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_drain_pct),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"EQ_FLAP_LIMIT", "5",
+     "Max disable/re-enable cycles for one PTE within EQ_FLAP_WINDOW\n"
+     "before giving up and leaving it disabled (logged as an error)\n"
+     "rather than continuing to retry SETSTATE indefinitely.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_flap_limit),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"EQ_FLAP_WINDOW", "1s",
+     "Time window for EQ_FLAP_LIMIT.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_flap_window),
+     UCS_CONFIG_TYPE_TIME},
+
     {"AM_RX_NUM_BUFS", "4",
      "Number of AM receive buffers rotated on the PRIORITY list.\n"
      "More buffers reduce the chance of overflow under burst traffic.",
@@ -133,8 +162,12 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     int                       ret;
 
     {
-        /* EXPERIMENTAL (EQ backpressure test): arm graceful disable/recover
-         * instead of silent EQ-drop on resource pressure. */
+        /* en_flowctrl: on EQ-full pressure, transition DISABLED (graceful,
+         * accountable via drop_count) instead of silently dropping the
+         * event. This LE has event_success_disable=1 below, so it can
+         * never itself generate a target-side event needing a slot — the
+         * bit is armed here for consistency / in case that ever changes,
+         * not because RMA/AMO can hit this path today. */
         struct cxi_pt_alloc_opts pt_opts = {
             .en_flowctrl = 1
         };
@@ -283,8 +316,11 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
     int                  ret;
 
     {
-        /* EXPERIMENTAL (EQ backpressure test): arm graceful disable/recover
-         * instead of silent EQ-drop on resource pressure. */
+        /* en_flowctrl: on EQ-full pressure, transition DISABLED (graceful,
+         * accountable via drop_count) instead of silently dropping the
+         * event. Unlike RMA/AMO, AM's receive LEs do generate real
+         * target-side events (C_EVENT_PUT) — this is the PTE this
+         * mechanism actually protects; see iface_progress(). */
         struct cxi_pt_alloc_opts pt_opts = {
             .is_matching    = 1,   /* unrestricted (messaging) mode */
             .use_long_event = 1,   /* force 64-byte events with rlength/start */
@@ -545,6 +581,15 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
     eq_buf_len = (size_t)self->eq_num_events * UCT_CXI_EQ_ENTRY_SIZE;
 
+    /* PTE flow-control recovery config, resolved once here (setup time,
+     * not the hot path) — see cxi_iface.h / iface_progress(). */
+    self->eq_need_to_drain = 0;
+    self->eq_drain_pct     = config->eq_drain_pct;
+    self->eq_flap_limit    = config->eq_flap_limit;
+    self->eq_flap_window   = ucs_time_from_sec(config->eq_flap_window);
+    memset(&self->am.fc, 0, sizeof(self->am.fc));
+    memset(self->rma.fc, 0, sizeof(self->rma.fc));
+
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
     if (ret != 0) {
@@ -573,10 +618,15 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err_munmap_eq;
     }
 
-    /* Step 5: allocate the event queue backed by the pinned buffer. */
+    /* Step 5: allocate the event queue backed by the pinned buffer.
+     * reserved_slots is one-sided (blocks LPE/RX from the reservation,
+     * does not cap TX) — see EQ_RESERVED_SLOTS_PCT doc and the design
+     * notes in iface_progress(). */
     memset(&eq_attr, 0, sizeof(eq_attr));
-    eq_attr.queue     = self->eq_buf;
-    eq_attr.queue_len = eq_buf_len;
+    eq_attr.queue          = self->eq_buf;
+    eq_attr.queue_len      = eq_buf_len;
+    eq_attr.reserved_slots = (self->eq_num_events *
+                              config->eq_reserved_slots_pct) / 100;
     ret = cxil_alloc_evtq(lni, self->eq_md, &eq_attr,
                           self->wait_obj, NULL, &self->evtq);
     if (ret != 0) {
@@ -989,6 +1039,81 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
 }
 
 /*
+ * uct_cxi_iface_pte_recover — issue SETSTATE(ENABLED) for one PTE if it's
+ * currently DISABLED, subject to a per-PTE flap limit.
+ *
+ * Called only once the shared EQ has been drained by eq_need_to_drain (see
+ * iface_progress()) — never immediately on a raw drop, since re-enabling
+ * into a still-full EQ just re-triggers the same disable on the PTE's next
+ * blocked event.  cxil_pte_status() is queried directly rather than relying
+ * on having seen a STATE_CHANGE event for this PTE, since that notification
+ * can itself be lost under the same EQ pressure it's meant to report.
+ */
+static void
+uct_cxi_iface_pte_recover(uct_cxi_iface_t *iface, struct cxil_pte *pte,
+                          uct_cxi_pte_fc_t *fc)
+{
+    struct cxi_pte_status  pte_s = {};
+    struct c_set_state_cmd ss    = {};
+    ucs_time_t             now;
+    int                    ret;
+
+    if ((pte == NULL) || fc->gave_up) {
+        return;
+    }
+    if ((cxil_pte_status(pte, &pte_s) != 0) ||
+        (pte_s.state != C_PTLTE_DISABLED)) {
+        return;
+    }
+
+    now = ucs_get_time();
+    if ((fc->flap_window_start == 0) ||
+        (now - fc->flap_window_start > iface->eq_flap_window)) {
+        fc->flap_window_start = now;
+        fc->flap_count        = 0;
+    }
+    if (++fc->flap_count > iface->eq_flap_limit) {
+        ucs_error("cxi PTE ptn=%u: exceeded %u disable/re-enable cycles "
+                  "within the flap window — giving up, PTE stays disabled",
+                  pte->ptn, iface->eq_flap_limit);
+        fc->gave_up = 1;
+        return;
+    }
+
+    ss.command.opcode = C_CMD_TGT_SETSTATE;
+    ss.ptlte_index    = pte->ptn;
+    ss.ptlte_state    = C_PTLTE_ENABLED;
+    ss.drop_count     = pte_s.drop_count;
+
+    ret = cxi_cq_emit_target(iface->tgt.cmdq, &ss);
+    if (ucs_unlikely(ret != 0)) {
+        ucs_warn("cxi PTE ptn=%u: SETSTATE emit failed: %d", pte->ptn, ret);
+        return;
+    }
+    cxi_cq_ring(iface->tgt.cmdq);
+    ucs_debug("cxi PTE ptn=%u: recovering (flap %u/%u), SETSTATE ENABLED "
+             "drop_count=%u", pte->ptn, fc->flap_count, iface->eq_flap_limit,
+             pte_s.drop_count);
+}
+
+/*
+ * uct_cxi_iface_recover_ptes — check every locally-owned PTE (AM + each open
+ * RMA LAC — bounded by UCT_CXI_MAX_LACS+1, not connection count) and recover
+ * any found DISABLED.  Called once the EQ has been drained enough
+ * (eq_need_to_drain reaching 0), not per-drop.
+ */
+static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
+{
+    unsigned lac;
+
+    uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
+    for (lac = 0; lac < iface->rma.lac_count; lac++) {
+        uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
+                                  &iface->rma.fc[lac]);
+    }
+}
+
+/*
  * uct_cxi_iface_progress — poll the event queue for send completions.
  *
  * Handles initiator-side TX completions and target-side AM receives.
@@ -1019,11 +1144,13 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                           (int)event->hdr.event_type,
                           cxi_event_rc(event), op->ep);
                 if (cxi_event_rc(event) == C_RC_PT_DISABLED) {
-                    /* EXPERIMENTAL (EQ backpressure test): sender-side
-                     * observation of a target PTE disable. */
-                    ucs_warn("  cxi TX saw PT_DISABLED: event %d ep %p — "
-                             "target PTE is in graceful recovery",
-                             (int)event->hdr.event_type, op->ep);
+                    /* Target PTE is in graceful recovery (en_flowctrl).
+                     * Back off new sends on this EP briefly rather than
+                     * resubmit straight into it — see
+                     * uct_cxi_ep_fc_blocked(). No wire message needed:
+                     * this is a purely local, self-observed signal. */
+                    op->ep->fc_blocked_until = ucs_get_time() +
+                            ucs_time_from_usec(UCT_CXI_FC_BACKOFF_US);
                 }
                 if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
                     iface->am.pte != NULL) {
@@ -1095,60 +1222,68 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
 
         } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
-            /* EXPERIMENTAL (EQ backpressure test): receiver-side observation
-             * of a PTE transitioning state (e.g. graceful disable under
-             * en_flowctrl). ptlte_index identifies which PTE. */
-            uint8_t ptlte_state = event->tgt_long.initiator.state_change.ptlte_state;
-            uint8_t sc_reason   = event->tgt_long.initiator.state_change.sc_reason;
+            /* Two distinct things produce this event, and ptlte_state alone
+             * cannot tell them apart — both report DISABLED identically:
+             *   - A fresh, NIC-initiated disable (return_code == C_RC_OK).
+             *   - The completion of our *own* SETSTATE(ENABLED) attempt,
+             *     rejected (C_RC_NO_MATCH) if drop_count moved between our
+             *     cxil_pte_status() read and the command actually landing
+             *     in hardware — a real race at sustained high message
+             *     rates, not a bug in the read/issue sequence. sc_reason
+             *     is not meaningful on a rejection completion (observed:
+             *     nonsensical values outside the documented enum) — only
+             *     return_code distinguishes the two cases. */
+            uint8_t ptlte_state =
+                    event->tgt_long.initiator.state_change.ptlte_state;
+            uint8_t sc_reason =
+                    event->tgt_long.initiator.state_change.sc_reason;
+            int     rc = cxi_event_rc(event);
 
             ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
-                     "sc_reason=%u sc_nic_auto=%u",
+                     "sc_reason=%u sc_nic_auto=%u rc=%d",
                      (unsigned)event->tgt_long.ptlte_index,
                      (unsigned)ptlte_state, (unsigned)sc_reason,
-                     (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto);
+                     (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto,
+                     rc);
 
-            if (ptlte_state == C_PTLTE_DISABLED) {
-                struct cxil_pte *pte = NULL;
-                unsigned         lac;
-
-                if (iface->am.pte != NULL &&
-                    event->tgt_long.ptlte_index == iface->am.pte->ptn) {
-                    pte = iface->am.pte;
+            if ((ptlte_state == C_PTLTE_DISABLED) &&
+                ((rc != C_RC_OK) || (sc_reason == C_SC_FC_EQ_FULL))) {
+                /* Either our own re-enable lost the drop_count race, or a
+                 * fresh disable specifically caused by EQ capacity — in
+                 * both cases the EQ itself needs to drain before another
+                 * SETSTATE attempt has any real chance of landing on a
+                 * still-current drop_count. Defer to the drain-gated path
+                 * below rather than retrying inline (that tight-loop retry
+                 * is what caused the original bug this replaces). */
+                if (iface->eq_need_to_drain == 0) {
+                    iface->eq_need_to_drain = (iface->eq_num_events *
+                                               iface->eq_drain_pct) / 100;
+                }
+            } else if ((ptlte_state == C_PTLTE_DISABLED) &&
+                       (iface->eq_need_to_drain == 0)) {
+                /* Fresh disable for a non-EQ-capacity reason (matching-
+                 * resource family — not reachable via AM today given
+                 * event_success_disable=1 doesn't apply here and AM's LE
+                 * count is fixed; relevant for future TAG). Draining EQ
+                 * events doesn't address this, so recover immediately. */
+                if ((iface->am.pte != NULL) &&
+                    (event->tgt_long.ptlte_index == iface->am.pte->ptn)) {
+                    uct_cxi_iface_pte_recover(iface, iface->am.pte,
+                                              &iface->am.fc);
                 } else {
+                    unsigned lac;
                     for (lac = 0; lac < iface->rma.lac_count; lac++) {
-                        if (iface->rma.pte[lac] != NULL &&
-                            event->tgt_long.ptlte_index ==
-                                    iface->rma.pte[lac]->ptn) {
-                            pte = iface->rma.pte[lac];
+                        if ((iface->rma.pte[lac] != NULL) &&
+                            (event->tgt_long.ptlte_index ==
+                                    iface->rma.pte[lac]->ptn)) {
+                            uct_cxi_iface_pte_recover(iface,
+                                                      iface->rma.pte[lac],
+                                                      &iface->rma.fc[lac]);
                             break;
                         }
                     }
                 }
-
-                if (pte != NULL) {
-                    struct cxi_pte_status pte_s = {};
-                    if (cxil_pte_status(pte, &pte_s) == 0) {
-                        ucs_warn("cxi PTE ptn=%u DISABLED: drop_count=%u "
-                                 "ule_count=%u state=%u",
-                                 (unsigned)event->tgt_long.ptlte_index,
-                                 pte_s.drop_count, pte_s.ule_count,
-                                 pte_s.state);
-                    }
-                }
             }
-
-            // /* Periodic pte_status diagnostic: log les_allocated + ule_count
-            //  * every 50 total received messages to catch LE disappearance. */
-            // if ((++iface->am.rx_total % 50) == 0 && iface->am.pte != NULL) {
-            //     struct cxi_pte_status pte_s = {};
-            //     if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
-            //         ucs_info("cxi AM PTE periodic rx_total=%u: "
-            //                  "state=%u drop_count=%u les_alloc=%u ule_count=%u",
-            //                  iface->am.rx_total, pte_s.state,
-            //                  pte_s.drop_count, pte_s.les_allocated,
-            //                  pte_s.ule_count);
-            //     }
-            // }
         } else if (event->hdr.event_type == C_EVENT_UNLINK) {
             /* LE was auto-unlinked (min_free) or software-unlinked.  Repost
              * at the tail of the PRIORITY list so the ring keeps rotating. */
@@ -1170,130 +1305,30 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                      (int)event->hdr.event_type, cxi_event_rc(event));
         }
         n++;
-    }
 
-    // TEMPORARY
-    fflush(stdout);
+        /* Draining back down after a drop (see below) — count every event
+         * processed here, since it's already being iterated; no extra
+         * hardware query needed. Real events are frequently smaller than
+         * the worst-case 64 bytes eq_num_events is sized around (e.g.
+         * C_EVENT_ACK/REPLY use the ~32-byte short format), so counting
+         * against that conservative unit only ever under-counts how much
+         * room was actually freed — safe in the conservative direction.
+         * At the threshold, check PTE status and recover anything found
+         * disabled; re-enabling immediately on every drop instead would
+         * just re-trigger the same disable on the next blocked event
+         * under sustained pressure. */
+        if ((iface->eq_need_to_drain > 0) &&
+            (--iface->eq_need_to_drain == 0)) {
+            uct_cxi_iface_recover_ptes(iface);
+        }
+    }
 
     if (ucs_unlikely(cxi_eq_get_drops(iface->evtq))) {
         ucs_error("cxi EQ drop detected: events lost (EQ full)");
-
-        /* EXPERIMENTAL (EQ backpressure test): on a raw drop, the
-         * STATE_CHANGE notification for whichever PTE (if any) disabled
-         * may itself have been lost in the same overflow — don't rely
-         * solely on having seen that event. Proactively poll every
-         * locally-owned PTE's status directly, and check the EQ's own
-         * fill-level status write-back while we're at it. */
-        {
-            struct c_eq_status status = {};
-            int                got_status;
-
-            got_status = cxi_eq_get_status(iface->evtq, &status);
-            if (got_status) {
-                ucs_warn("cxi EQ status: slots_free=%u slots_rsrvd=%u "
-                         "thld_sts=%u thld_id=%u wr_ptr=%u",
-                         (unsigned)status.event_slots_free,
-                         (unsigned)status.event_slots_rsrvd,
-                         (unsigned)status.thld_sts, (unsigned)status.thld_id,
-                         (unsigned)status.wr_ptr);
-                if (status.thld_sts) {
-                    ucs_warn("cxi EQ fill level: %u%%",
-                             cxi_eq_status_fill_level(iface->evtq, &status));
-                }
-            } else {
-                ucs_warn("cxi EQ status: no new update since last check");
-            }
+        if (iface->eq_need_to_drain == 0) {
+            iface->eq_need_to_drain = (iface->eq_num_events *
+                                       iface->eq_drain_pct) / 100;
         }
-
-        if (iface->am.pte != NULL) {
-            struct cxi_pte_status pte_s = {};
-            if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
-                ucs_warn("cxi AM PTE ptn=%u state=%u drop_count=%u "
-                         "ule_count=%u les_allocated=%u les_reserved=%u "
-                         "les_max=%u",
-                         iface->am.pte->ptn, pte_s.state, pte_s.drop_count,
-                         pte_s.ule_count, pte_s.les_allocated,
-                         pte_s.les_reserved, pte_s.les_max);
-
-                /* EXPERIMENTAL (EQ backpressure test): attempt a real
-                 * SETSTATE re-enable, once, and see (a) whether it
-                 * succeeds and (b) whether the LE(s) posted before the
-                 * disable are still allocated afterward (les_allocated),
-                 * or got auto-unlinked and need reposting. */
-                {
-                    static bool reenable_attempted = false;
-
-                    if ((pte_s.state == C_PTLTE_DISABLED) &&
-                        !reenable_attempted) {
-                        struct c_set_state_cmd ss = {};
-                        int                     ret;
-                        unsigned                tries;
-
-                        reenable_attempted = true;
-
-                        ss.command.opcode = C_CMD_TGT_SETSTATE;
-                        ss.ptlte_index    = iface->am.pte->ptn;
-                        ss.ptlte_state    = C_PTLTE_ENABLED;
-                        ss.drop_count     = pte_s.drop_count;
-
-                        ret = cxi_cq_emit_target(iface->tgt.cmdq, &ss);
-                        if (ret == 0) {
-                            cxi_cq_ring(iface->tgt.cmdq);
-                            ucs_warn("cxi AM PTE ptn=%u: issued SETSTATE "
-                                     "ENABLED drop_count=%u",
-                                     iface->am.pte->ptn, pte_s.drop_count);
-                        } else {
-                            ucs_warn("cxi AM PTE ptn=%u: SETSTATE emit "
-                                     "failed: %d", iface->am.pte->ptn, ret);
-                        }
-
-                        /* Poll status directly rather than waiting for a
-                         * STATE_CHANGE event, which we've already seen can
-                         * itself be lost under this same pressure. */
-                        for (tries = 0; tries < 20; tries++) {
-                            struct cxi_pte_status post_s = {};
-
-                            if (cxil_pte_status(iface->am.pte, &post_s) !=
-                                0) {
-                                break;
-                            }
-                            if (post_s.state != C_PTLTE_DISABLED) {
-                                ucs_warn("cxi AM PTE ptn=%u: re-enable "
-                                         "result after %u tries: state=%u "
-                                         "drop_count=%u les_allocated=%u "
-                                         "les_reserved=%u les_max=%u",
-                                         iface->am.pte->ptn, tries,
-                                         post_s.state, post_s.drop_count,
-                                         post_s.les_allocated,
-                                         post_s.les_reserved,
-                                         post_s.les_max);
-                                break;
-                            }
-                            if (tries == 19) {
-                                ucs_warn("cxi AM PTE ptn=%u: still "
-                                         "DISABLED after %u status polls, "
-                                         "giving up",
-                                         iface->am.pte->ptn, tries + 1);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        {
-            unsigned lac;
-            for (lac = 0; lac < iface->rma.lac_count; lac++) {
-                struct cxi_pte_status pte_s = {};
-                if ((iface->rma.pte[lac] != NULL) &&
-                    (cxil_pte_status(iface->rma.pte[lac], &pte_s) == 0)) {
-                    ucs_warn("cxi RMA PTE lac=%u ptn=%u state=%u "
-                             "drop_count=%u ule_count=%u",
-                             lac, iface->rma.pte[lac]->ptn, pte_s.state,
-                             pte_s.drop_count, pte_s.ule_count);
-                }
-            }
-        }
-
         cxi_eq_ack_drops(iface->evtq);
     }
 

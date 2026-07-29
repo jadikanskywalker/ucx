@@ -15,6 +15,7 @@
 #include <uct/api/uct.h>
 #include <ucs/datastruct/arbiter.h>
 #include <ucs/datastruct/mpool.h>
+#include <ucs/time/time.h>
 
 #include <libcxi/libcxi.h>
 
@@ -101,7 +102,30 @@ typedef struct uct_cxi_iface_config {
     size_t                   am_max_zcopy;  /**< Max AM zcopy payload               */
     unsigned                 eq_size;    /**< Event queue depth (floor; may be
                                               auto-grown to fit TX pool caps)     */
+    unsigned                 eq_reserved_slots_pct; /**< % of EQ reserved so RX
+                                              traffic can't crowd out TX completions */
+    unsigned                 eq_drain_pct;   /**< % of EQ to drain (from the point a
+                                              drop is detected) before attempting to
+                                              re-enable a disabled PTE               */
+    unsigned                 eq_flap_limit;  /**< Max disable/re-enable cycles for one
+                                              PTE within eq_flap_window before giving
+                                              up on it                              */
+    double                    eq_flap_window; /**< Time window for eq_flap_limit,
+                                              seconds (UCS_CONFIG_TYPE_TIME)        */
 } uct_cxi_iface_config_t;
+
+
+/**
+ * Per-PTE flow-control recovery state — tracks disable/re-enable flapping
+ * so sustained overload escalates (log + stop retrying) instead of spinning
+ * SETSTATE commands forever.  One instance per locally-owned PTE (AM, and
+ * one per open RMA LAC).
+ */
+typedef struct uct_cxi_pte_fc {
+    ucs_time_t flap_window_start; /**< Start of the current flap-counting window */
+    unsigned   flap_count;        /**< Disable events observed within the window */
+    int        gave_up;           /**< Stopped attempting re-enable for this PTE */
+} uct_cxi_pte_fc_t;
 
 
 /**
@@ -151,11 +175,21 @@ typedef struct uct_cxi_iface {
                                                 UCX_CXI_EQ_SIZE and TX pool caps at
                                                 iface_open; see UCS_CLASS_INIT_FUNC */
 
+    /* ── PTE flow-control recovery (drain-gated re-enable) ──────────── */
+    unsigned   eq_need_to_drain; /**< >0 while waiting to drain enough of the EQ
+                                      before re-checking/re-enabling disabled
+                                      PTEs; decremented once per event drained
+                                      in iface_progress(), 0 = not recovering */
+    unsigned   eq_drain_pct;     /**< Resolved from config at iface_open */
+    unsigned   eq_flap_limit;    /**< Resolved from config at iface_open */
+    ucs_time_t eq_flap_window;   /**< Resolved from config at iface_open */
+
     /* ── RMA/AMO portals (restricted, pid_offset = LAC index) ───────── */
     struct {
         struct cxil_pte     *pte[UCT_CXI_MAX_LACS];     /**< NULL until LAC used */
         struct cxil_pte_map *pte_map[UCT_CXI_MAX_LACS];
         uint8_t              lac_count;                   /**< # of open RMA PTEs */
+        uct_cxi_pte_fc_t      fc[UCT_CXI_MAX_LACS];       /**< Per-LAC recovery state */
     } rma;
 
     /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) — Phase 7 */
@@ -178,6 +212,7 @@ typedef struct uct_cxi_iface {
         unsigned              num_bufs;    /**< Runtime buffer count          */
         size_t                buf_size;    /**< Runtime per-buffer size       */
         uint32_t              rx_total;    /**< Total messages received       */
+        uct_cxi_pte_fc_t      fc;          /**< Recovery state for am.pte     */
     } am;
 
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */
