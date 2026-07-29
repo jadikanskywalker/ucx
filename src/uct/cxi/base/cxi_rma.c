@@ -252,7 +252,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
  * put_bcopy completion: no user callback — the source data is already in the
  * bounce buffer which belongs to the transport.  Just return the desc.
  */
-static void uct_cxi_put_bcopy_comp(uct_cxi_send_op_t *op)
+static void uct_cxi_put_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     ucs_mpool_put((uct_cxi_send_desc_t *)op);
 }
@@ -261,14 +261,20 @@ static void uct_cxi_put_bcopy_comp(uct_cxi_send_op_t *op)
  * get_bcopy completion: NIC has delivered remote data into desc's buffer.
  * Call the unpack callback to deliver to the caller, invoke any user
  * completion, then return the descriptor.
+ *
+ * On failure (status != UCS_OK), desc's buffer was never actually written
+ * by the remote — skip unpack_cb rather than deliver stale/uninitialized
+ * data to the caller as if it were a real result.
  */
-static void uct_cxi_get_bcopy_comp(uct_cxi_send_op_t *op)
+static void uct_cxi_get_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     uct_cxi_send_desc_t *desc = (uct_cxi_send_desc_t *)op;
 
-    desc->unpack_cb(desc->unpack_arg, desc + 1, desc->length);
+    if (status == UCS_OK) {
+        desc->unpack_cb(desc->unpack_arg, desc + 1, desc->length);
+    }
     if (op->comp != NULL) {
-        uct_invoke_completion(op->comp, UCS_OK);
+        uct_invoke_completion(op->comp, status);
     }
     ucs_mpool_put(desc);
 }

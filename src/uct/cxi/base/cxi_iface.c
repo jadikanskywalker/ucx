@@ -1125,6 +1125,29 @@ static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
  *
  * ACK, REPLY, and SEND all carry the send_op pointer in init_short.user_ptr.
  */
+
+/*
+ * uct_cxi_rc_to_status — map a CXI hardware return code to a ucs_status_t
+ * for completion reporting.
+ *
+ * C_RC_PT_DISABLED maps to UCS_ERR_BUSY rather than a connection/endpoint
+ * failure code: the target PTE is in a known, actively-recovering state
+ * (en_flowctrl), not a broken connection — UCS_ERR_BUSY's "try again"
+ * connotation matches that. Everything else not explicitly handled here
+ * maps to the generic UCS_ERR_IO_ERROR.
+ */
+static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
+{
+    switch (rc) {
+    case C_RC_OK:
+        return UCS_OK;
+    case C_RC_PT_DISABLED:
+        return UCS_ERR_BUSY;
+    default:
+        return UCS_ERR_IO_ERROR;
+    }
+}
+
 static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxi_iface_t     *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
@@ -1139,44 +1162,58 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
              * ACK   = restricted PUT confirmed by remote (RMA).
              * REPLY = GET data returned (RMA). */
             op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
-            if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
-                ucs_error("cxi TX event %d error: rc=%d ep %p",
-                          (int)event->hdr.event_type,
-                          cxi_event_rc(event), op->ep);
-                if (cxi_event_rc(event) == C_RC_PT_DISABLED) {
-                    /* Target PTE is in graceful recovery (en_flowctrl).
-                     * Back off new sends on this EP briefly rather than
-                     * resubmit straight into it — see
-                     * uct_cxi_ep_fc_blocked(). No wire message needed:
-                     * this is a purely local, self-observed signal. */
-                    op->ep->fc_blocked_until = ucs_get_time() +
-                            ucs_time_from_usec(UCT_CXI_FC_BACKOFF_US);
-                }
-                if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
-                    iface->am.pte != NULL) {
-                    struct cxi_pte_status pte_s = {};
-                    if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
-                        ucs_error("cxi AM PTE state=%u drop_count=%u ule_count=%u",
-                                  pte_s.state, pte_s.drop_count, pte_s.ule_count);
+            {
+                ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
+
+                if (ucs_unlikely(status != UCS_OK)) {
+                    ucs_error("cxi TX event %d error: rc=%d ep %p",
+                              (int)event->hdr.event_type,
+                              cxi_event_rc(event), op->ep);
+                    if (cxi_event_rc(event) == C_RC_PT_DISABLED) {
+                        /* Target PTE is in graceful recovery (en_flowctrl).
+                         * Back off new sends on this EP briefly rather than
+                         * resubmit straight into it — see
+                         * uct_cxi_ep_fc_blocked(). No wire message needed:
+                         * this is a purely local, self-observed signal. */
+                        op->ep->fc_blocked_until = ucs_get_time() +
+                                ucs_time_from_usec(UCT_CXI_FC_BACKOFF_US);
+                    }
+                    if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
+                        iface->am.pte != NULL) {
+                        struct cxi_pte_status pte_s = {};
+                        if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
+                            ucs_error("cxi AM PTE state=%u drop_count=%u ule_count=%u",
+                                      pte_s.state, pte_s.drop_count, pte_s.ule_count);
+                        }
                     }
                 }
-            }
-            op->ep->outstanding--;
-            iface->tx.outstanding--;
-            if (op->ep->outstanding == 0 && op->ep->flush_comp != NULL) {
-                uct_invoke_completion(op->ep->flush_comp, UCS_OK);
-                op->ep->flush_comp = NULL;
-            }
-            ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
-                      (int)event->hdr.event_type,
-                      cxi_event_rc(event), op->ep, op->ep->outstanding);
-            if (op->handler != NULL) {
-                op->handler(op);       /* bcopy: handler owns comp + mpool_put */
-            } else {
-                if (op->comp != NULL) {
-                    uct_invoke_completion(op->comp, UCS_OK);
+                /* Latch the worst status seen across every op draining
+                 * while a flush is pending on this EP — first failure
+                 * sticks (uct_completion_update_status). The final
+                 * uct_invoke_completion(..., UCS_OK) below is safe
+                 * regardless: it internally re-applies update_status,
+                 * which UCS_OK can never overwrite an already-latched
+                 * error with. */
+                if (op->ep->flush_comp != NULL) {
+                    uct_completion_update_status(op->ep->flush_comp, status);
                 }
-                ucs_mpool_put(op);     /* zcopy / short */
+                op->ep->outstanding--;
+                iface->tx.outstanding--;
+                if (op->ep->outstanding == 0 && op->ep->flush_comp != NULL) {
+                    uct_invoke_completion(op->ep->flush_comp, UCS_OK);
+                    op->ep->flush_comp = NULL;
+                }
+                ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
+                          (int)event->hdr.event_type,
+                          cxi_event_rc(event), op->ep, op->ep->outstanding);
+                if (op->handler != NULL) {
+                    op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
+                } else {
+                    if (op->comp != NULL) {
+                        uct_invoke_completion(op->comp, status);
+                    }
+                    ucs_mpool_put(op);     /* zcopy / short */
+                }
             }
         } else if (event->hdr.event_type == C_EVENT_PUT) {
             /* Target-side AM receive.  buffer_id identifies which rx_buf the

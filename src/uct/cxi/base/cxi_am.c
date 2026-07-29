@@ -57,7 +57,7 @@ uct_cxi_am_ep_iface(uct_cxi_ep_t *ep)
  * AM bcopy completion: the bounce-buffer desc holds the sent payload.
  * No user callback for bcopy put — just return the descriptor.
  */
-static void uct_cxi_am_bcopy_comp(uct_cxi_send_op_t *op)
+static void uct_cxi_am_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     ucs_mpool_put((uct_cxi_send_desc_t *)op);
 }

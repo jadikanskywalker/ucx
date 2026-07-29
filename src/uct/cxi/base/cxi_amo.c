@@ -49,13 +49,20 @@ static const uint8_t uct_cxi_amo_op_table[] = {
     [UCT_ATOMIC_OP_SWAP] = C_AMO_OP_CSWAP,
 };
 
-static void uct_cxi_amo_fetch_comp(uct_cxi_send_op_t *op)
+/*
+ * On failure (status != UCS_OK), desc's buffer was never actually written
+ * by the remote — skip the copy rather than deliver a stale/uninitialized
+ * "result" to the caller as if the fetch/cswap had actually happened.
+ */
+static void uct_cxi_amo_fetch_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     uct_cxi_send_desc_t *desc = (uct_cxi_send_desc_t *)op;
 
-    memcpy(desc->unpack_arg, desc + 1, desc->length);
+    if (status == UCS_OK) {
+        memcpy(desc->unpack_arg, desc + 1, desc->length);
+    }
     if (op->comp != NULL) {
-        uct_invoke_completion(op->comp, UCS_OK);
+        uct_invoke_completion(op->comp, status);
     }
     ucs_mpool_put(desc);
 }

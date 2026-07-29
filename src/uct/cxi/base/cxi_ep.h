@@ -34,11 +34,15 @@
  *
  * handler: NULL for zcopy/short (default path: invoke comp, mpool_put op).
  *          Set for bcopy: handler owns completion + returns desc to pool.
+ *          Receives the real completion status — must skip any data
+ *          copy/unpack (unpack_cb, memcpy) unless status == UCS_OK, since
+ *          a failed GET/fetch's "result" buffer was never actually written
+ *          by the remote and must not be delivered to the caller.
  */
 typedef struct uct_cxi_send_op {
     struct uct_cxi_ep *ep;      /**< Owning EP — used to decrement outstanding */
     uct_completion_t  *comp;    /**< Caller completion callback, or NULL       */
-    void (*handler)(struct uct_cxi_send_op *); /**< NULL = default zcopy path  */
+    void (*handler)(struct uct_cxi_send_op *, ucs_status_t); /**< NULL = default zcopy path */
 } uct_cxi_send_op_t;
 
 
