@@ -15,12 +15,12 @@
 # Arguments:
 #   TEST       ucx_perftest test name (required), e.g. put_lat, am_lat
 #   TYPE       UCT or UCP (default: UCT)
+#   LAYOUT     Data layout passed via -D: short, bcopy, or zcopy (default: short)
+#   LOG_LEVEL  UCX_LOG_LEVEL value (default: warn)
 #   TRANSPORT  UCT: -x flag value  / UCP: UCX_TLS value
 #              (default: cxi for UCT, empty for UCP)
 #   DEVICE     UCT: -d flag value  / UCP: UCX_NET_DEVICES value
 #              (default: cxi0 for UCT, empty for UCP)
-#   LAYOUT     Data layout passed via -D: short, bcopy, or zcopy (default: short)
-#   LOG_LEVEL  UCX_LOG_LEVEL value (default: warn)
 #
 # UCT mode:  ucx_perftest -x TRANSPORT -d DEVICE -t TEST -D LAYOUT
 # UCP mode:  UCX_TLS=TRANSPORT UCX_NET_DEVICES=DEVICE ucx_perftest -t TEST -D LAYOUT
@@ -35,12 +35,12 @@ TYPE="${2:-UCT}"
 
 case "$TYPE" in
     UCT)
-        TRANSPORT="${3:-cxi}"
-        DEVICE="${4:-cxi0}"
+        TRANSPORT="${5:-cxi}"
+        DEVICE="${6:-cxi0}"
         ;;
     UCP)
-        TRANSPORT="${3:-}"
-        DEVICE="${4:-}"
+        TRANSPORT="${5:-}"
+        DEVICE="${6:-}"
         ;;
     *)
         echo "Error: TYPE must be UCT or UCP (got: '$TYPE')" >&2
@@ -48,18 +48,18 @@ case "$TYPE" in
         ;;
 esac
 
-LAYOUT="${5:-short}"
-LOG_LEVEL="${6:-warn}"
+LAYOUT="${3:-short}"
+LOG_LEVEL="${4:-warn}"
 
 if [[ -z "$TEST" ]]; then
     echo "Error: TEST argument is required." >&2
     echo "Usage: sbatch $0 TEST [TYPE [TRANSPORT [DEVICE [LAYOUT [LOG_LEVEL]]]]]" >&2
     echo "  TEST       ucx_perftest test (e.g. put_lat, am_lat)" >&2
     echo "  TYPE       UCT or UCP             (default: UCT)" >&2
-    echo "  TRANSPORT  transport / UCX_TLS    (default: cxi for UCT, '' for UCP)" >&2
-    echo "  DEVICE     device / UCX_NET_DEVS  (default: cxi0 for UCT, '' for UCP)" >&2
     echo "  LAYOUT     short, bcopy, or zcopy (default: short)" >&2
     echo "  LOG_LEVEL  UCX_LOG_LEVEL          (default: warn)" >&2
+    echo "  TRANSPORT  transport / UCX_TLS    (default: cxi for UCT, '' for UCP)" >&2
+    echo "  DEVICE     device / UCX_NET_DEVS  (default: cxi0 for UCT, '' for UCP)" >&2
     exit 1
 fi
 

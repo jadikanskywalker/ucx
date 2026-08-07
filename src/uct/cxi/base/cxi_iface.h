@@ -22,10 +22,11 @@
 
 #define UCT_CXI_NAME "cxi"
 
-/* Event queue sizing.  UCT_CXI_EQ_NUM_EVENTS is the config default only —
- * the actual runtime size is uct_cxi_iface_t::eq_num_events, resolved at
- * iface_open from UCX_CXI_EQ_SIZE together with the TX pool caps (see
- * UCS_CLASS_INIT_FUNC).  UCT_CXI_EQ_ENTRY_SIZE is a hardware constant. */
+/* Event queue sizing.  UCT_CXI_EQ_NUM_EVENTS is what UCX_CXI_EQ_SIZE's -1
+ * sentinel default resolves to — the actual runtime size is
+ * uct_cxi_iface_t::eq_num_events, resolved at iface_open together with the
+ * TX pool caps (see UCS_CLASS_INIT_FUNC).  UCT_CXI_EQ_ENTRY_SIZE is a
+ * hardware constant. */
 #define UCT_CXI_EQ_NUM_EVENTS  1024U
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
 
@@ -100,8 +101,12 @@ typedef struct uct_cxi_iface_config {
     unsigned                 am_rx_num_bufs; /**< # AM receive buffers (PRIORITY MEs) */
     size_t                   am_rx_buf_size; /**< Size of each AM receive buffer     */
     size_t                   am_max_zcopy;  /**< Max AM zcopy payload               */
-    unsigned                 eq_size;    /**< Event queue depth (floor; may be
-                                              auto-grown to fit TX pool caps)     */
+    unsigned                 eq_size;    /**< Event queue depth. -1 sentinel
+                                              resolves to UCT_CXI_EQ_NUM_EVENTS;
+                                              pool caps derive from whichever
+                                              this resolves to (see iface_open) */
+    unsigned                 eq_max_poll; /**< Max events drained per
+                                              iface_progress() call            */
     unsigned                 eq_reserved_slots_pct; /**< % of EQ reserved so RX
                                               traffic can't crowd out TX completions */
     unsigned                 eq_drain_pct;   /**< % of EQ to drain (from the point a
@@ -112,6 +117,12 @@ typedef struct uct_cxi_iface_config {
                                               up on it                              */
     double                    eq_flap_window; /**< Time window for eq_flap_limit,
                                               seconds (UCS_CONFIG_TYPE_TIME)        */
+    int                       dynamic_eq_growth; /**< Grow the EQ preemptively on a
+                                              hardware fill-threshold crossing,
+                                              instead of waiting to hit it        */
+    unsigned                  eq_grow_thresh_pct; /**< Fill % that triggers a resize */
+    unsigned                  eq_max_len;     /**< Ceiling on eq_num_events growth,
+                                              in events (same unit as eq_size)      */
 } uct_cxi_iface_config_t;
 
 
@@ -120,11 +131,24 @@ typedef struct uct_cxi_iface_config {
  * so sustained overload escalates (log + stop retrying) instead of spinning
  * SETSTATE commands forever.  One instance per locally-owned PTE (AM, and
  * one per open RMA LAC).
+ *
+ * `exhausted` tracks matching-resource exhaustion (LE/overflow-list, not
+ * EQ capacity) independently of EQ-fill `DRAINING`
+ * (uct_cxi_iface_t::eq_need_to_drain) — draining EQ events doesn't free
+ * buffer/LE capacity, so the two need separate state.  Only ever set for
+ * `iface->am.fc` — never for `iface->rma.fc[]`, since RMA/AMO's catch-all
+ * LE is a single persistent non-consuming LE with no matching resource to
+ * exhaust (see the design notes in cxi_iface.c's STATE_CHANGE handling).
+ * `onload_cb` is a reserved, currently-unused extension point for TAG,
+ * which will need an onload step (TGT_SEARCH_AND_DELETE) before repost —
+ * reserved now so TAG doesn't need to reshape this struct later.
  */
 typedef struct uct_cxi_pte_fc {
     ucs_time_t flap_window_start; /**< Start of the current flap-counting window */
     unsigned   flap_count;        /**< Disable events observed within the window */
     int        gave_up;           /**< Stopped attempting re-enable for this PTE */
+    int        exhausted;         /**< Matching-resource exhaustion (AM/TAG only) */
+    void      *onload_cb;         /**< Reserved for TAG; unused today */
 } uct_cxi_pte_fc_t;
 
 
@@ -174,6 +198,18 @@ typedef struct uct_cxi_iface {
     unsigned              eq_num_events;   /**< Runtime EQ depth — resolved from
                                                 UCX_CXI_EQ_SIZE and TX pool caps at
                                                 iface_open; see UCS_CLASS_INIT_FUNC */
+    unsigned              eq_max_poll;     /**< Max events drained per
+                                                iface_progress() call — resolved
+                                                from UCX_CXI_EQ_MAX_POLL. Bounds
+                                                the drain loop the same way every
+                                                other UCX transport bounds its
+                                                CQ/event poll (RC/UD/DC's
+                                                TX/RX_MAX_POLL, TCP's
+                                                UCT_TCP_MAX_EVENTS), so a steady
+                                                flood can't keep the loop running
+                                                past the point where the post-loop
+                                                fill-threshold/drop checks would
+                                                still have time to act. */
 
     /* ── PTE flow-control recovery (drain-gated re-enable) ──────────── */
     unsigned   eq_need_to_drain; /**< >0 while waiting to drain enough of the EQ
@@ -183,6 +219,36 @@ typedef struct uct_cxi_iface {
     unsigned   eq_drain_pct;     /**< Resolved from config at iface_open */
     unsigned   eq_flap_limit;    /**< Resolved from config at iface_open */
     ucs_time_t eq_flap_window;   /**< Resolved from config at iface_open */
+    unsigned   eq_reserved_slots_pct; /**< Resolved from config at iface_open;
+                                           persisted (not just applied once)
+                                           so eq_grow can recompute the
+                                           absolute reserved count as
+                                           eq_num_events changes           */
+    unsigned   eq_reserved_slots;     /**< Current absolute reserved-slot
+                                           count, kept in sync with the
+                                           value cxil_evtq_adjust_reserved_fc()
+                                           reports after each change      */
+
+    /* ── Preemptive EQ growth (fill-threshold-triggered resize) ──────
+     * Independent of eq_need_to_drain's reactive drain-and-recover path
+     * above — this acts *before* a disable ever happens, on a hardware
+     * fill-percentage status update rather than an actual drop/disable
+     * event. The two coexist without coupling: DRAINING/EXHAUSTED remain
+     * the backstop once eq_max_len is reached or a burst outruns one
+     * resize round-trip. See the STATE_CHANGE/EQ_SWITCH handling in
+     * cxi_iface.c. */
+    struct {
+        int            enabled;        /**< Resolved from dynamic_eq_growth */
+        unsigned       thresh_pct;     /**< Resolved from eq_grow_thresh_pct */
+        unsigned       max_len_events; /**< Resolved from eq_max_len        */
+        int            resizing;       /**< true from cxil_evtq_resize() to
+                                             cxil_evtq_resize_complete()    */
+        void          *pending_buf;    /**< New (larger) buffer awaiting
+                                             C_EVENT_EQ_SWITCH              */
+        struct cxi_md *pending_md;     /**< cxil_map registration of
+                                             pending_buf                   */
+        size_t         pending_len;    /**< Byte length of pending_buf     */
+    } eq_grow;
 
     /* ── RMA/AMO portals (restricted, pid_offset = LAC index) ───────── */
     struct {

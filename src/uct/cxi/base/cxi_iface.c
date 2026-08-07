@@ -31,6 +31,7 @@
 #include <ucs/debug/log.h>
 #include <ucs/debug/memtrack_int.h>
 #include <ucs/sys/math.h>
+#include <ucs/sys/ptr_arith.h>
 #include <ucs/sys/stubs.h>
 #include <ucs/sys/string.h>
 
@@ -83,15 +84,27 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
                                   "Raise together with BCOPY_MAX_BUFS and EQ_SIZE\n"
                                   "for workloads with many concurrently-busy endpoints."),
 
-    {"EQ_SIZE", "1024",
-     "Event queue depth (number of hardware completion events).  Acts as a\n"
-     "floor: automatically grown to (TX_OP_MAX_BUFS + BCOPY_MAX_BUFS) if their\n"
-     "sum exceeds this value, since each in-flight send holds exactly one pool\n"
-     "slot until its single EQ completion event is drained. Flooding the EQ\n"
-     "will result in expensive flow control. Restricted op pool sizes, and\\\n"
-     "or growing the EQ size helps ensure transmit-side resouces exhaust\n"
-     "before an endpoint's EQ is saturated.",
+    {"EQ_SIZE", "-1",
+     "Event queue depth (number of hardware completion events). -1 (default)\n"
+     "resolves to 1024. TX_OP_MAX_BUFS/BCOPY_MAX_BUFS each independently\n"
+     "default (their own -1 sentinel) to half of whatever this resolves to,\n"
+     "so the common case of neither being set still sums to exactly this\n"
+     "value; an explicitly-set pool cap is used exactly as given, even if\n"
+     "that sums past this value — a reachable raw EQ drop from TX-side\n"
+     "crowding is then a consequence of that explicit combination, not\n"
+     "something silently protected against.",
      ucs_offsetof(uct_cxi_iface_config_t, eq_size),
+     UCS_CONFIG_TYPE_INT},
+
+    {"EQ_MAX_POLL", "16",
+     "Max events drained from the EQ per iface_progress() call, matching\n"
+     "the bounded-poll-per-call pattern every other UCX transport uses\n"
+     "(e.g. RC/UD/DC's TX/RX_MAX_POLL, TCP's UCT_TCP_MAX_EVENTS) instead of\n"
+     "draining to empty. Without this bound, a steady incoming flood could\n"
+     "keep the loop running past the point where the post-loop\n"
+     "EQ_DYNAMIC_GROWTH fill-threshold and EQ_DRAIN_PCT drop checks would\n"
+     "still have time to act before the EQ actually fills.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_max_poll),
      UCS_CONFIG_TYPE_UINT},
 
     {"EQ_RESERVED_SLOTS_PCT", "5",
@@ -125,6 +138,28 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      "Time window for EQ_FLAP_LIMIT.",
      ucs_offsetof(uct_cxi_iface_config_t, eq_flap_window),
      UCS_CONFIG_TYPE_TIME},
+
+    {"EQ_DYNAMIC_GROWTH", "y",
+     "Preemptively grow (double) the EQ when its fill level crosses\n"
+     "EQ_GROW_THRESH_PCT, using Cassini's native resize API, instead of\n"
+     "waiting to hit EQ_FULL and recovering reactively (see EQ_DRAIN_PCT).\n"
+     "Growth stops at EQ_MAX_LEN; sustained pressure past that point falls\n"
+     "back to the reactive path.",
+     ucs_offsetof(uct_cxi_iface_config_t, dynamic_eq_growth),
+     UCS_CONFIG_TYPE_BOOL},
+
+    {"EQ_GROW_THRESH_PCT", "80",
+     "EQ fill percentage that triggers a EQ_DYNAMIC_GROWTH resize.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_grow_thresh_pct),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"EQ_MAX_LEN", "65536",
+     "Ceiling on EQ_DYNAMIC_GROWTH, in events (same unit as EQ_SIZE).\n"
+     "Bounded well below the hardware's own maximum by default so\n"
+     "sustained pressure eventually falls back to the reactive\n"
+     "drain/backoff path instead of growing pinned memory unboundedly.",
+     ucs_offsetof(uct_cxi_iface_config_t, eq_max_len),
+     UCS_CONFIG_TYPE_UINT},
 
     {"AM_RX_NUM_BUFS", "4",
      "Number of AM receive buffers rotated on the PRIORITY list.\n"
@@ -551,44 +586,60 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                             NULL) UCS_STATS_ARG(UCT_CXI_NAME));
 
     /*
-     * Step 1.5: resolve TX pool caps and EQ depth together.
+     * Step 1.5: resolve EQ depth, then TX pool caps from it.
      *
-     * Each in-flight op (post/short/zcopy/AMO from op_pool, bcopy/AMO-fetch
-     * from desc_pool) holds exactly one pool slot until its single EQ
-     * completion event is drained.  If op_max_bufs + desc_max_bufs could
-     * exceed the hardware EQ depth, outstanding operations could overrun
-     * the EQ before pool exhaustion ever returns UCS_ERR_NO_RESOURCE,
-     * causing a silent hardware EQ drop instead of a clean pending-retry
-     * (see uct_cxi_ep_pending_add).  So eq_num_events is grown to be at
-     * least the sum of any *explicitly finite* pool caps.
+     * EQ_SIZE uses the same -1/UINT_MAX-sentinel convention as
+     * TX_OP_MAX_BUFS/BCOPY_MAX_BUFS below (config table default "-1") —
+     * unset resolves to UCT_CXI_EQ_NUM_EVENTS, explicitly set uses that
+     * value exactly. This is a real sentinel, not a "differs from the
+     * compiled-in default" guess, so a user explicitly setting EQ_SIZE to
+     * the same value the default would have produced is still correctly
+     * seen as "set" — the config table must keep passing -1 through
+     * un-resolved for this check to mean anything; nothing upstream of
+     * here may substitute in the default early.
      *
-     * -1 (UINT_MAX) on either MAX_BUFS config resolves to "size this pool
-     * to the full EQ" rather than literal unbounded growth — this keeps
-     * the invariant even when a user opts out of an explicit cap on one
-     * pool, at the cost of not strictly bounding the total when *both*
-     * pools are left at -1 simultaneously (an explicit, documented
-     * simplification: each -1 pool independently gets the full EQ depth).
+     * Each pool cap keeps its existing, independent meaning for the same
+     * sentinel ("unbounded — size this pool from the EQ") — unset
+     * resolves to half of eq_num_events each, so that the common case of
+     * neither pool being explicitly set still sums to exactly
+     * eq_num_events (matching each in-flight op holding one pool slot
+     * until its single EQ completion event is drained), rather than each
+     * independently claiming the *full* EQ. An explicitly-set pool cap is
+     * used exactly as given, even if that (combined with an explicit
+     * EQ_SIZE) sums past eq_num_events — a reachable raw EQ drop from
+     * TX-side crowding is then a consequence of that explicit, informed
+     * choice, not something silently protected against.
      */
     {
+        unsigned eq_cfg   = config->eq_size;
         unsigned op_cfg   = config->op_mp.max_bufs;
         unsigned desc_cfg = config->bcopy_mp.max_bufs;
-        unsigned finite_sum = (op_cfg == UINT_MAX ? 0 : op_cfg) +
-                              (desc_cfg == UINT_MAX ? 0 : desc_cfg);
 
-        self->eq_num_events = ucs_max(config->eq_size, finite_sum);
-        op_max_bufs          = (op_cfg == UINT_MAX) ? self->eq_num_events : op_cfg;
-        desc_max_bufs        = (desc_cfg == UINT_MAX) ? self->eq_num_events : desc_cfg;
+        self->eq_num_events = (eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
+                              eq_cfg;
+        op_max_bufs   = (op_cfg == UINT_MAX) ?
+                        ucs_max(self->eq_num_events / 2, 1u) : op_cfg;
+        desc_max_bufs = (desc_cfg == UINT_MAX) ?
+                        ucs_max(self->eq_num_events / 2, 1u) : desc_cfg;
     }
     eq_buf_len = (size_t)self->eq_num_events * UCT_CXI_EQ_ENTRY_SIZE;
+    self->eq_max_poll = ucs_max(config->eq_max_poll, 1u);
 
     /* PTE flow-control recovery config, resolved once here (setup time,
      * not the hot path) — see cxi_iface.h / iface_progress(). */
-    self->eq_need_to_drain = 0;
-    self->eq_drain_pct     = config->eq_drain_pct;
-    self->eq_flap_limit    = config->eq_flap_limit;
-    self->eq_flap_window   = ucs_time_from_sec(config->eq_flap_window);
+    self->eq_need_to_drain     = 0;
+    self->eq_drain_pct         = config->eq_drain_pct;
+    self->eq_flap_limit        = config->eq_flap_limit;
+    self->eq_flap_window       = ucs_time_from_sec(config->eq_flap_window);
+    self->eq_reserved_slots_pct = config->eq_reserved_slots_pct;
     memset(&self->am.fc, 0, sizeof(self->am.fc));
     memset(self->rma.fc, 0, sizeof(self->rma.fc));
+
+    /* Preemptive EQ growth config — see cxi_iface.h / eq_grow_start(). */
+    memset(&self->eq_grow, 0, sizeof(self->eq_grow));
+    self->eq_grow.enabled        = config->dynamic_eq_growth;
+    self->eq_grow.thresh_pct     = config->eq_grow_thresh_pct;
+    self->eq_grow.max_len_events = config->eq_max_len;
 
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
@@ -626,7 +677,16 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     eq_attr.queue          = self->eq_buf;
     eq_attr.queue_len      = eq_buf_len;
     eq_attr.reserved_slots = (self->eq_num_events *
-                              config->eq_reserved_slots_pct) / 100;
+                              self->eq_reserved_slots_pct) / 100;
+    self->eq_reserved_slots = eq_attr.reserved_slots;
+    /* status_thresh_*: a single hardware-native fill-percentage threshold
+     * (see EQ_DYNAMIC_GROWTH doc) — status_thresh_count=0 when disabled
+     * costs nothing (no status write-backs ever generated). */
+    if (self->eq_grow.enabled) {
+        eq_attr.status_thresh_base  = self->eq_grow.thresh_pct;
+        eq_attr.status_thresh_delta = 0;
+        eq_attr.status_thresh_count = 1;
+    }
     ret = cxil_alloc_evtq(lni, self->eq_md, &eq_attr,
                           self->wait_obj, NULL, &self->evtq);
     if (ret != 0) {
@@ -883,6 +943,19 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
 
+    /* A resize left in flight (iface torn down before C_EVENT_EQ_SWITCH
+     * arrived) leaks its pending buffer unless freed explicitly here —
+     * it's not reachable via the eq_buf/eq_md cleanup below, which only
+     * knows about the currently-active buffer. */
+    if (self->eq_grow.resizing) {
+        ret = cxil_unmap(self->eq_grow.pending_md);
+        if (ret != 0) {
+            ucs_warn("cxi cxil_unmap pending eq_grow buffer failed: %s",
+                     strerror(-ret));
+        }
+        munmap(self->eq_grow.pending_buf, self->eq_grow.pending_len);
+    }
+
     ucs_arbiter_cleanup(&self->tx.arbiter);
 
     /* Close AM PTE and rx_buf in reverse allocation order. */
@@ -1114,6 +1187,34 @@ static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
 }
 
 /*
+ * uct_cxi_iface_pte_by_index — find the locally-owned PTE (and its
+ * recovery/exhaustion state) matching a STATE_CHANGE event's ptlte_index.
+ * Checks AM first, then each open RMA LAC. Returns NULL (via *pte_p) if
+ * the index doesn't match anything we track — shouldn't happen, but a
+ * STATE_CHANGE for a PTE we don't recognize isn't actionable either way.
+ */
+static uct_cxi_pte_fc_t *
+uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
+                           struct cxil_pte **pte_p)
+{
+    unsigned lac;
+
+    if ((iface->am.pte != NULL) && (ptlte_index == iface->am.pte->ptn)) {
+        *pte_p = iface->am.pte;
+        return &iface->am.fc;
+    }
+    for (lac = 0; lac < iface->rma.lac_count; lac++) {
+        if ((iface->rma.pte[lac] != NULL) &&
+            (ptlte_index == iface->rma.pte[lac]->ptn)) {
+            *pte_p = iface->rma.pte[lac];
+            return &iface->rma.fc[lac];
+        }
+    }
+    *pte_p = NULL;
+    return NULL;
+}
+
+/*
  * uct_cxi_iface_progress — poll the event queue for send completions.
  *
  * Handles initiator-side TX completions and target-side AM receives.
@@ -1148,6 +1249,138 @@ static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
     }
 }
 
+/*
+ * uct_cxi_iface_eq_grow_start — begin a preemptive EQ resize.
+ *
+ * Called from iface_progress() once a hardware fill-threshold status
+ * update reports the EQ at or above eq_grow.thresh_pct. Submits a new,
+ * double-sized buffer via cxil_evtq_resize() — hardware keeps writing to
+ * the old buffer for a few more events, then emits C_EVENT_EQ_SWITCH
+ * (handled in the main event loop) once it has switched to the new one.
+ *
+ * Only one resize may be in flight at a time (enforced by the driver,
+ * mirrored here via eq_grow.resizing) — the caller must not call this
+ * again until eq_grow_complete() has run.
+ */
+static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
+{
+    uct_cxi_md_t  *md = uct_cxi_iface_md(iface);
+    size_t         new_len;
+    void          *new_buf;
+    struct cxi_md *new_md;
+    int            ret;
+
+    if (iface->eq_num_events >= iface->eq_grow.max_len_events) {
+        ucs_debug("cxi EQ at configured max_len (%u events) — "
+                  "not growing further, reactive recovery remains "
+                  "the backstop", iface->eq_grow.max_len_events);
+        return;
+    }
+
+    new_len = ucs_min((size_t)iface->eq_num_events * 2,
+                      (size_t)iface->eq_grow.max_len_events) *
+             UCT_CXI_EQ_ENTRY_SIZE;
+    new_len = ucs_align_up_pow2(new_len, ucs_get_page_size());
+
+    new_buf = mmap(NULL, new_len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (new_buf == MAP_FAILED) {
+        ucs_warn("cxi EQ grow: mmap size %zu failed: %m — will retry on "
+                 "next threshold crossing", new_len);
+        return;
+    }
+
+    /* Same flags as the original eq_md (Step 4 in iface_open) — must land
+     * on the same LAC as the EQ's current MD, or cxil_evtq_resize() below
+     * rejects it. */
+    ret = cxil_map(md->cxi_lni, new_buf, new_len,
+                   CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE, NULL,
+                   &new_md);
+    if (ret != 0) {
+        ucs_warn("cxi EQ grow: cxil_map failed: %s — will retry on next "
+                 "threshold crossing", strerror(-ret));
+        munmap(new_buf, new_len);
+        return;
+    }
+
+    ret = cxil_evtq_resize(iface->evtq, new_buf, new_len, new_md);
+    if (ret != 0) {
+        ucs_warn("cxi EQ grow: cxil_evtq_resize failed: %s", strerror(-ret));
+        cxil_unmap(new_md);
+        munmap(new_buf, new_len);
+        return;
+    }
+
+    iface->eq_grow.pending_buf = new_buf;
+    iface->eq_grow.pending_md  = new_md;
+    iface->eq_grow.pending_len = new_len;
+    iface->eq_grow.resizing    = 1;
+    ucs_debug("cxi EQ grow: resize submitted %u -> %zu events",
+             iface->eq_num_events, new_len / UCT_CXI_EQ_ENTRY_SIZE);
+}
+
+/*
+ * uct_cxi_iface_eq_grow_complete — finish a preemptive EQ resize.
+ *
+ * Called from the main event loop on C_EVENT_EQ_SWITCH. Completes the
+ * driver-side handshake, frees the old buffer, and re-applies the
+ * reserved-slots percentage against the new (larger) size — otherwise
+ * the reserved floor silently shrinks as a fraction of the queue on
+ * every doubling.
+ */
+static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface)
+{
+    void          *old_buf = iface->eq_buf;
+    struct cxi_md *old_md  = iface->eq_md;
+    size_t         old_len = (size_t)iface->eq_num_events *
+                             UCT_CXI_EQ_ENTRY_SIZE;
+    unsigned       target_reserved;
+    int            ret;
+
+    if (!iface->eq_grow.resizing) {
+        ucs_warn("cxi C_EVENT_EQ_SWITCH with no resize in flight — ignoring");
+        return;
+    }
+
+    ret = cxil_evtq_resize_complete(iface->evtq);
+    if (ret != 0) {
+        ucs_error("cxi EQ grow: cxil_evtq_resize_complete failed: %s — "
+                  "EQ remains at %u events", strerror(-ret),
+                  iface->eq_num_events);
+        return;
+    }
+
+    ret = cxil_unmap(old_md);
+    if (ret != 0) {
+        ucs_warn("cxi EQ grow: cxil_unmap old buffer failed: %s",
+                 strerror(-ret));
+    }
+    munmap(old_buf, old_len);
+
+    iface->eq_buf        = iface->eq_grow.pending_buf;
+    iface->eq_md          = iface->eq_grow.pending_md;
+    iface->eq_num_events = (unsigned)(iface->eq_grow.pending_len /
+                                      UCT_CXI_EQ_ENTRY_SIZE);
+    iface->eq_grow.pending_buf = NULL;
+    iface->eq_grow.pending_md  = NULL;
+    iface->eq_grow.pending_len = 0;
+    iface->eq_grow.resizing    = 0;
+
+    target_reserved = (iface->eq_num_events *
+                       iface->eq_reserved_slots_pct) / 100;
+    ret = cxil_evtq_adjust_reserved_fc(
+            iface->evtq, (int)target_reserved - (int)iface->eq_reserved_slots);
+    if (ret < 0) {
+        ucs_warn("cxi EQ grow: reserved-slots adjust failed: %s — "
+                 "reserved floor now a smaller fraction of the grown EQ",
+                 strerror(-ret));
+    } else {
+        iface->eq_reserved_slots = (unsigned)ret;
+    }
+
+    ucs_debug("cxi EQ grown: now %u events", iface->eq_num_events);
+}
+
 static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxi_iface_t     *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
@@ -1155,7 +1388,14 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
     uct_cxi_send_op_t   *op;
     unsigned             n = 0;
 
-    while ((event = cxi_eq_get_event(iface->evtq)) != NULL) {
+    /* Bounded per the EQ_MAX_POLL doc — a steady flood must not keep this
+     * loop running past the point where the post-loop EQ_DYNAMIC_GROWTH
+     * fill-threshold and EQ_DRAIN_PCT drop checks below would still have
+     * time to act; matches every other UCX transport's poll-a-bounded-
+     * batch-and-return pattern (RC/UD/DC's TX/RX_MAX_POLL, TCP's
+     * UCT_TCP_MAX_EVENTS) rather than draining to empty. */
+    while ((n < iface->eq_max_poll) &&
+           ((event = cxi_eq_get_event(iface->evtq)) != NULL)) {
         if (event->hdr.event_type == C_EVENT_ACK  ||
             event->hdr.event_type == C_EVENT_REPLY) {
             /* Initiator-side TX completion.
@@ -1169,15 +1409,6 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                     ucs_error("cxi TX event %d error: rc=%d ep %p",
                               (int)event->hdr.event_type,
                               cxi_event_rc(event), op->ep);
-                    if (cxi_event_rc(event) == C_RC_PT_DISABLED) {
-                        /* Target PTE is in graceful recovery (en_flowctrl).
-                         * Back off new sends on this EP briefly rather than
-                         * resubmit straight into it — see
-                         * uct_cxi_ep_fc_blocked(). No wire message needed:
-                         * this is a purely local, self-observed signal. */
-                        op->ep->fc_blocked_until = ucs_get_time() +
-                                ucs_time_from_usec(UCT_CXI_FC_BACKOFF_US);
-                    }
                     if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
                         iface->am.pte != NULL) {
                         struct cxi_pte_status pte_s = {};
@@ -1187,6 +1418,12 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                         }
                     }
                 }
+                /* Target PTE in graceful recovery (en_flowctrl) or any
+                 * other completion status feeds this EP's adaptive
+                 * concurrency cap / retry cadence — see
+                 * uct_cxi_ep_tx_complete(). No wire message needed: this
+                 * is a purely local, self-observed signal. */
+                uct_cxi_ep_tx_complete(op->ep, status);
                 /* Latch the worst status seen across every op draining
                  * while a flush is pending on this EP — first failure
                  * sticks (uct_completion_update_status). The final
@@ -1270,55 +1507,68 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
              *     is not meaningful on a rejection completion (observed:
              *     nonsensical values outside the documented enum) — only
              *     return_code distinguishes the two cases. */
-            uint8_t ptlte_state =
+            uint8_t  ptlte_state =
                     event->tgt_long.initiator.state_change.ptlte_state;
-            uint8_t sc_reason =
+            uint8_t  sc_reason =
                     event->tgt_long.initiator.state_change.sc_reason;
-            int     rc = cxi_event_rc(event);
+            int      rc          = cxi_event_rc(event);
+            uint16_t ptlte_index = event->tgt_long.ptlte_index;
 
             ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
                      "sc_reason=%u sc_nic_auto=%u rc=%d",
-                     (unsigned)event->tgt_long.ptlte_index,
+                     (unsigned)ptlte_index,
                      (unsigned)ptlte_state, (unsigned)sc_reason,
                      (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto,
                      rc);
 
-            if ((ptlte_state == C_PTLTE_DISABLED) &&
-                ((rc != C_RC_OK) || (sc_reason == C_SC_FC_EQ_FULL))) {
-                /* Either our own re-enable lost the drop_count race, or a
-                 * fresh disable specifically caused by EQ capacity — in
-                 * both cases the EQ itself needs to drain before another
-                 * SETSTATE attempt has any real chance of landing on a
-                 * still-current drop_count. Defer to the drain-gated path
-                 * below rather than retrying inline (that tight-loop retry
-                 * is what caused the original bug this replaces). */
-                if (iface->eq_need_to_drain == 0) {
-                    iface->eq_need_to_drain = (iface->eq_num_events *
-                                               iface->eq_drain_pct) / 100;
+            if (rc != C_RC_OK) {
+                /* Our own SETSTATE(ENABLED) was rejected — drop_count
+                 * moved between our cxil_pte_status() read and the
+                 * command landing in hardware (a real race at sustained
+                 * high message rates). This is NOT caused by EQ
+                 * pressure — the rejection generates no EQ traffic of
+                 * its own — so retry immediately with a fresh read
+                 * rather than waiting on drain progress that has
+                 * nothing to do with this PTE's drop_count. */
+                struct cxil_pte  *pte;
+                uct_cxi_pte_fc_t *fc = uct_cxi_iface_pte_by_index(
+                        iface, ptlte_index, &pte);
+                if (fc != NULL) {
+                    uct_cxi_iface_pte_recover(iface, pte, fc);
                 }
-            } else if ((ptlte_state == C_PTLTE_DISABLED) &&
-                       (iface->eq_need_to_drain == 0)) {
-                /* Fresh disable for a non-EQ-capacity reason (matching-
-                 * resource family — not reachable via AM today given
-                 * event_success_disable=1 doesn't apply here and AM's LE
-                 * count is fixed; relevant for future TAG). Draining EQ
-                 * events doesn't address this, so recover immediately. */
-                if ((iface->am.pte != NULL) &&
-                    (event->tgt_long.ptlte_index == iface->am.pte->ptn)) {
+            } else if (ptlte_state == C_PTLTE_DISABLED) {
+                if (sc_reason == C_SC_FC_EQ_FULL) {
+                    /* Fresh disable caused by EQ capacity — iface-wide:
+                     * every PTE and every initiator-side completion
+                     * shares this ring. Defer recovery until the EQ has
+                     * actually drained (see the eq_need_to_drain
+                     * countdown below) rather than retrying inline. */
+                    if (iface->eq_need_to_drain == 0) {
+                        iface->eq_need_to_drain = (iface->eq_num_events *
+                                                   iface->eq_drain_pct) / 100;
+                    }
+                } else if ((iface->am.pte != NULL) &&
+                           (ptlte_index == iface->am.pte->ptn)) {
+                    /* Fresh disable for a non-EQ-capacity reason on the
+                     * AM PTE — matching-resource exhaustion (N=4 fixed
+                     * rotating buffers all simultaneously full; RMA/AMO
+                     * can't reach this path, see uct_cxi_pte_fc_t).
+                     * Independent of EQ-fill: gate new AM sends via
+                     * am.fc.exhausted (uct_cxi_ep_fc_blocked) and
+                     * attempt recovery right away rather than waiting on
+                     * drain progress, which doesn't free buffer/LE
+                     * capacity. */
+                    iface->am.fc.exhausted = 1;
                     uct_cxi_iface_pte_recover(iface, iface->am.pte,
                                               &iface->am.fc);
-                } else {
-                    unsigned lac;
-                    for (lac = 0; lac < iface->rma.lac_count; lac++) {
-                        if ((iface->rma.pte[lac] != NULL) &&
-                            (event->tgt_long.ptlte_index ==
-                                    iface->rma.pte[lac]->ptn)) {
-                            uct_cxi_iface_pte_recover(iface,
-                                                      iface->rma.pte[lac],
-                                                      &iface->rma.fc[lac]);
-                            break;
-                        }
-                    }
+                }
+            } else if (ptlte_state == C_PTLTE_ENABLED) {
+                /* Successful re-enable clears matching-resource
+                 * EXHAUSTED for the AM PTE. (DRAINING clears separately
+                 * via eq_need_to_drain reaching 0, not here.) */
+                if ((iface->am.pte != NULL) &&
+                    (ptlte_index == iface->am.pte->ptn)) {
+                    iface->am.fc.exhausted = 0;
                 }
             }
         } else if (event->hdr.event_type == C_EVENT_UNLINK) {
@@ -1337,6 +1587,11 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                      (unsigned long)event->tgt_long.start,
                      (unsigned long)event->tgt_long.remote_offset,
                      cxi_event_rc(event));
+        } else if (event->hdr.event_type == C_EVENT_EQ_SWITCH) {
+            /* Last event hardware writes to the old buffer of a
+             * preemptive resize (see uct_cxi_iface_eq_grow_start) —
+             * switch reading to the new buffer. */
+            uct_cxi_iface_eq_grow_complete(iface);
         } else {
             ucs_info("cxi iface_progress: unhandled event type %d rc=%d",
                      (int)event->hdr.event_type, cxi_event_rc(event));
@@ -1367,6 +1622,22 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                                        iface->eq_drain_pct) / 100;
         }
         cxi_eq_ack_drops(iface->evtq);
+    }
+
+    /* Preemptive growth: cheap, timestamp-gated fast path (returns 0
+     * immediately when nothing has changed since the last check) — see
+     * uct_cxi_iface_eq_grow_start(). Independent of the reactive drop
+     * handling above; both may fire in the same iface's lifetime without
+     * coupling. */
+    if (iface->eq_grow.enabled && !iface->eq_grow.resizing) {
+        struct c_eq_status eq_status;
+
+        if (cxi_eq_get_status(iface->evtq, &eq_status) &&
+            eq_status.thld_sts &&
+            (cxi_eq_status_fill_level(iface->evtq, &eq_status) >=
+                    iface->eq_grow.thresh_pct)) {
+            uct_cxi_iface_eq_grow_start(iface);
+        }
     }
 
     if (n > 0) {

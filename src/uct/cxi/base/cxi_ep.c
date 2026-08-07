@@ -21,6 +21,7 @@
 
 #include <uct/base/uct_iface.h>
 #include <uct/base/uct_md.h>
+#include <ucs/sys/math.h>
 #include <ucs/sys/string.h>
 
 #include <cxi_prov_hw.h>
@@ -74,11 +75,14 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     dev_addr   = (const uct_cxi_device_addr_t *)params->dev_addr;
     iface_addr = (const uct_cxi_iface_addr_t  *)params->iface_addr;
 
-    ep->rem_nid          = dev_addr->nid;
-    ep->rem_pid          = iface_addr->pid;
-    ep->outstanding      = 0;
-    ep->flush_comp       = NULL;
-    ep->fc_blocked_until = 0;
+    ep->rem_nid              = dev_addr->nid;
+    ep->rem_pid              = iface_addr->pid;
+    ep->outstanding          = 0;
+    ep->flush_comp           = NULL;
+    ep->max_outstanding      = UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED;
+    ep->retry_backoff_until  = 0;
+    ep->consecutive_failures  = 0;
+    ep->consecutive_successes = 0;
     ucs_arbiter_group_init(&ep->arb_group);
 
     /* Build all DFAs at creation time so the hot path needs no check.
@@ -137,8 +141,20 @@ ucs_arbiter_cb_result_t
 uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
                             ucs_arbiter_elem_t *elem, void *arg)
 {
+    uct_cxi_ep_t      *ep  = ucs_container_of(group, uct_cxi_ep_t, arb_group);
     uct_pending_req_t *req = ucs_container_of(elem, uct_pending_req_t, priv);
     ucs_status_t       status;
+
+    if (ucs_unlikely(ep->retry_backoff_until > ucs_get_time())) {
+        /* Still in this EP's adaptive backoff window — leave queued
+         * without even attempting req->func. Retrying now would both
+         * burn a dispatch cycle every progress() call and, more
+         * importantly, still constitute an "attempt" if req->func does
+         * anything observable before its own gate check — pacing
+         * already-queued retries the same as new submissions is the
+         * whole point of retry_backoff_until (see cxi_ep.h). */
+        return UCS_ARBITER_CB_RESULT_STOP;
+    }
 
     status = req->func(req);
     /* TEMPORARY: confirms the dispatch loop is actually retrying queued
@@ -202,6 +218,50 @@ void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
              ucs_arbiter_group_num_elems(&ep->arb_group));
     ucs_arbiter_group_purge(&iface->tx.arbiter, &ep->arb_group,
                              uct_cxi_ep_arbiter_purge_cb, &cb_args);
+}
+
+
+/* -------------------------------------------------------------------------
+ * Adaptive per-endpoint backoff
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * uct_cxi_ep_tx_complete — shrink/grow this EP's max_outstanding and
+ * retry_backoff_until in response to one TX completion's status.
+ *
+ * Called once per drained op from iface_progress(), for every status —
+ * not just failures — since sustained health is what grows the endpoint
+ * back toward unconstrained (see UCT_CXI_FC_HEALTHY_STREAK).
+ *
+ * Only UCS_ERR_BUSY (this file's mapping of C_RC_PT_DISABLED — see
+ * uct_cxi_rc_to_status in cxi_iface.c) drives this policy. Other non-OK
+ * statuses (e.g. UCS_ERR_IO_ERROR) aren't the "receiver overloaded"
+ * signal this backoff exists to react to, so they neither shrink nor
+ * grow it.
+ */
+void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status)
+{
+    if (status == UCS_ERR_BUSY) {
+        unsigned   shift   = ucs_min(ep->consecutive_failures, 10);
+        ucs_time_t backoff = ucs_time_from_usec(
+                ucs_min(UCT_CXI_FC_BACKOFF_BASE_US << shift,
+                        UCT_CXI_FC_BACKOFF_MAX_US));
+
+        ep->consecutive_failures++;
+        ep->consecutive_successes = 0;
+        ep->max_outstanding       = ucs_max(ep->max_outstanding / 2, 1u);
+        ep->retry_backoff_until   = ucs_get_time() + backoff;
+    } else if (status == UCS_OK) {
+        if (++ep->consecutive_successes >= UCT_CXI_FC_HEALTHY_STREAK) {
+            ep->consecutive_successes = 0;
+            ep->consecutive_failures  = 0;
+            ep->max_outstanding = (ep->max_outstanding <
+                                    UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED / 2) ?
+                                   (ep->max_outstanding * 2) :
+                                   UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED;
+        }
+    }
 }
 
 

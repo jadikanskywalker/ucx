@@ -17,12 +17,27 @@
 
 #include <cxi_prov_hw.h>
 
-/* Fixed backoff after observing C_RC_PT_DISABLED on this EP's own TX
- * completion — short enough that recovery (typically resolved within a
- * handful of microseconds, see PTE flow-control design notes) isn't
- * meaningfully delayed, long enough to avoid re-submitting into a PTE
- * that's still disabled on every single progress() call. */
-#define UCT_CXI_FC_BACKOFF_US 100
+/*
+ * Per-endpoint adaptive backoff, applied after observing a
+ * C_RC_PT_DISABLED-class TX completion on this EP's own sends.
+ *
+ * Two independent controls, both needed (see uct_cxi_ep_tx_complete):
+ *   - max_outstanding bounds *concurrency* — how many ops this EP may have
+ *     in flight. Halved (floor 1) on failure, doubled back toward
+ *     unconstrained after a healthy streak.
+ *   - retry_backoff_until bounds *cadence* — how soon this EP may submit
+ *     (or have a queued pending request retried) again after a failure.
+ *     Exponential per consecutive failure, capped, reset on success.
+ * A fixed concurrency cap alone doesn't slow *how fast* a freed slot gets
+ * reused (the arbiter can redrive a queued retry on the very next
+ * progress() call, microseconds later) — that's what previously caused
+ * sub-100us retry bursts tripping the PTE flap limit under load.
+ */
+#define UCT_CXI_FC_BACKOFF_BASE_US        100      /* first-failure backoff */
+#define UCT_CXI_FC_BACKOFF_MAX_US         100000   /* 100ms cap */
+#define UCT_CXI_FC_HEALTHY_STREAK         8        /* consecutive OK completions
+                                                        before growing back */
+#define UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED UINT_MAX
 
 
 /**
@@ -89,32 +104,57 @@ typedef struct uct_cxi_ep {
     unsigned          outstanding;     /**< In-flight send ops for this EP */
     uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
     ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */
-    ucs_time_t        fc_blocked_until; /**< Set on C_RC_PT_DISABLED; new sends
+    unsigned          max_outstanding; /**< Adaptive concurrency cap — new sends
                                              on this EP return UCS_ERR_NO_RESOURCE
-                                             (routing through pending/arbiter,
-                                             same as pool exhaustion) until this
-                                             deadline passes. 0 = not blocked. */
+                                             once outstanding reaches this.
+                                             UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED
+                                             = unconstrained (default). */
+    ucs_time_t        retry_backoff_until; /**< Adaptive retry cadence — new
+                                             sends *and* already-queued pending
+                                             retries on this EP are held back
+                                             until this deadline. 0 = no
+                                             backoff in effect. */
+    unsigned          consecutive_failures;  /**< For backoff/shrink growth */
+    unsigned          consecutive_successes; /**< For backoff/grow reset    */
 } uct_cxi_ep_t;
+
+/*
+ * uct_cxi_ep_tx_complete — update this EP's adaptive backoff state after a
+ * TX completion (called once per drained op from iface_progress(),
+ * regardless of status). Defined in cxi_ep.c.
+ */
+void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
 
 
 /*
  * uct_cxi_ep_fc_blocked — true if this send should be deferred to the
  * pending/arbiter retry path rather than attempted now.
  *
- * Two independent reasons, both gate identically (return UCS_ERR_NO_RESOURCE,
- * same as ordinary pool exhaustion — no new caller-visible status):
+ * Four independent reasons, all gate identically (return
+ * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion — no new
+ * caller-visible status):
  *   - iface->eq_need_to_drain: the shared EQ is being drained back down
  *     after a drop, before any disabled PTE is re-checked (see cxi_iface.c).
  *     New local sends are held back to stop refilling it out from under
- *     that drain.
- *   - ep->fc_blocked_until: this specific EP's last send hit a disabled
- *     remote PTE; back off briefly rather than resubmit into it.
+ *     that drain. Iface-wide — applies regardless of which PTE this op
+ *     targets, since EQ capacity is the iface's shared resource.
+ *   - pte_fc->exhausted: the *specific* PTE this op targets has hit
+ *     matching-resource exhaustion (AM only — pass NULL for RMA/AMO ops,
+ *     which never populate this; see uct_cxi_pte_fc_t). Unrelated PTEs'
+ *     traffic is unaffected.
+ *   - ep->outstanding >= ep->max_outstanding: this EP's adaptive
+ *     concurrency cap (see uct_cxi_ep_tx_complete).
+ *   - ep->retry_backoff_until: this EP's adaptive retry-cadence backoff,
+ *     set after a C_RC_PT_DISABLED-class completion.
  */
 static UCS_F_ALWAYS_INLINE int
-uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
+                       const uct_cxi_pte_fc_t *pte_fc)
 {
     return ucs_unlikely((iface->eq_need_to_drain > 0) ||
-                         (ep->fc_blocked_until > ucs_get_time()));
+                         ((pte_fc != NULL) && pte_fc->exhausted) ||
+                         (ep->outstanding >= ep->max_outstanding) ||
+                         (ep->retry_backoff_until > ucs_get_time()));
 }
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);
