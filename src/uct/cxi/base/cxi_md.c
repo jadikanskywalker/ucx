@@ -147,20 +147,19 @@ static uint16_t uct_cxi_get_vni(void)
 }
 
 /*
- * uct_cxi_log_svc_desc - dump one service descriptor's full detail: the
- * summary line at debug verbosity (one line per service, proportional to
- * object count), the per-member and per-VNI breakdown at trace verbosity
- * (higher-volume nested detail). Called for every entry regardless of
- * whether it ends up selected, so a cluster's raw service configuration
- * (including disabled/system services) is visible with UCX_LOG_LEVEL=debug
- * or =trace without needing external tooling.
+ * uct_cxi_log_svc_desc - dump one service descriptor's full detail (id,
+ * enable/system/restriction flags, every UID/GID member, every VNI) at
+ * trace verbosity. Called for every entry regardless of whether it ends up
+ * selected, so a cluster's raw service configuration (including
+ * disabled/system services) is visible with UCX_LOG_LEVEL=trace without
+ * needing external tooling.
  */
 static void uct_cxi_log_svc_desc(int idx, const struct cxi_svc_desc *desc)
 {
     unsigned k;
     int      j;
 
-    ucs_debug("cxi svc[%d] id %u enable %d system %d restricted_members %d "
+    ucs_trace("cxi svc[%d] id %u enable %d system %d restricted_members %d "
               "restricted_vnis %d num_vld_vnis %d",
               idx, desc->svc_id, desc->enable, desc->is_system_svc,
               desc->restricted_members, desc->restricted_vnis,
@@ -230,7 +229,9 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
     for (i = (int)svc_list->count - 1; i >= 0; i--) {
         desc = svc_list->descs + i;
 
-        uct_cxi_log_svc_desc(i, desc);
+        if (ucs_log_is_enabled(UCS_LOG_LEVEL_TRACE)) {
+            uct_cxi_log_svc_desc(i, desc);
+        }
 
         if (!desc->enable || desc->is_system_svc) {
             continue;
