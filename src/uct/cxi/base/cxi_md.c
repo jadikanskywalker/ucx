@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/types.h>
 
 
 static ucs_config_field_t uct_cxi_md_config_table[] = {
@@ -145,6 +147,191 @@ static uint16_t uct_cxi_get_vni(void)
 }
 
 /*
+ * uct_cxi_log_svc_desc - dump one service descriptor's full detail: the
+ * summary line at debug verbosity (one line per service, proportional to
+ * object count), the per-member and per-VNI breakdown at trace verbosity
+ * (higher-volume nested detail). Called for every entry regardless of
+ * whether it ends up selected, so a cluster's raw service configuration
+ * (including disabled/system services) is visible with UCX_LOG_LEVEL=debug
+ * or =trace without needing external tooling.
+ */
+static void uct_cxi_log_svc_desc(int idx, const struct cxi_svc_desc *desc)
+{
+    unsigned k;
+    int      j;
+
+    ucs_debug("cxi svc[%d] id %u enable %d system %d restricted_members %d "
+              "restricted_vnis %d num_vld_vnis %d",
+              idx, desc->svc_id, desc->enable, desc->is_system_svc,
+              desc->restricted_members, desc->restricted_vnis,
+              desc->num_vld_vnis);
+
+    if (desc->restricted_members) {
+        for (j = 0; j < CXI_SVC_MAX_MEMBERS; j++) {
+            if (desc->members[j].type == CXI_SVC_MEMBER_UID) {
+                ucs_trace("cxi svc[%d] member[%d] uid %u", idx, j,
+                          (unsigned)desc->members[j].svc_member.uid);
+            } else if (desc->members[j].type == CXI_SVC_MEMBER_GID) {
+                ucs_trace("cxi svc[%d] member[%d] gid %u", idx, j,
+                          (unsigned)desc->members[j].svc_member.gid);
+            }
+        }
+    }
+
+    if (desc->restricted_vnis) {
+        for (k = 0; k < desc->num_vld_vnis; k++) {
+            ucs_trace("cxi svc[%d] vni[%u] %u", idx, k,
+                      (unsigned)desc->vnis[k]);
+        }
+    }
+}
+
+/*
+ * uct_cxi_find_svc_by_membership - fall back to kernel-side service
+ * discovery when the launcher does not export SLINGSHOT_SVC_IDS /
+ * SLINGSHOT_DEVICES / SLINGSHOT_VNIS.
+ *
+ * Mirrors libfabric's CXI provider (cxip_nic_get_best_rgroup_vni in
+ * prov/cxi/src/cxip_nic.c): scan the device's pre-configured services via
+ * cxil_get_svc_list() and pick, in priority order, the first enabled
+ * non-system service that is (a) restricted to our effective UID,
+ * (b) restricted to our effective GID, or (c) unrestricted.
+ *
+ * On success returns the chosen service ID and fills *vni_p (from the
+ * service's own VNI restriction, or 0 if the service does not restrict
+ * VNIs — the caller decides what to do with an unrestricted VNI).  Returns
+ * -1 if no usable service is found.
+ */
+static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
+{
+    struct cxil_svc_list *svc_list;
+    struct cxi_svc_desc  *desc;
+    uid_t                 uid = geteuid();
+    gid_t                 gid = getegid();
+    int                   found_uid = -1;
+    int                   found_gid = -1;
+    int                   found_unrestricted = -1;
+    int                   i, j;
+    int                   ret;
+
+    ret = cxil_get_svc_list(dev, &svc_list);
+    if (ret != 0) {
+        ucs_debug("cxi cxil_get_svc_list failed: %s", strerror(-ret));
+        return -1;
+    }
+
+    ucs_debug("cxi %s: querying service list (%u entries, euid %d egid %d)",
+              dev->info.device_name, svc_list->count, (int)uid, (int)gid);
+
+    /* Priority: UID match, then GID match, then unrestricted. Walk the list
+     * back-to-front and lock in the first (i.e. highest-index) match for
+     * each category — matches cxip_nic_get_best_rgroup_vni exactly, so a
+     * process sees the same service UCX and libfabric/MPI would agree on. */
+    for (i = (int)svc_list->count - 1; i >= 0; i--) {
+        desc = svc_list->descs + i;
+
+        uct_cxi_log_svc_desc(i, desc);
+
+        if (!desc->enable || desc->is_system_svc) {
+            continue;
+        }
+
+        if (!desc->restricted_members) {
+            if (found_unrestricted == -1) {
+                found_unrestricted = i;
+            }
+            continue;
+        }
+
+        for (j = 0; j < CXI_SVC_MAX_MEMBERS; j++) {
+            if ((desc->members[j].type == CXI_SVC_MEMBER_UID) &&
+                (desc->members[j].svc_member.uid == uid) &&
+                (found_uid == -1)) {
+                found_uid = i;
+            } else if ((desc->members[j].type == CXI_SVC_MEMBER_GID) &&
+                       (desc->members[j].svc_member.gid == gid) &&
+                       (found_gid == -1)) {
+                found_gid = i;
+            }
+        }
+    }
+
+    if (found_uid != -1) {
+        i = found_uid;
+    } else if (found_gid != -1) {
+        i = found_gid;
+    } else if (found_unrestricted != -1) {
+        i = found_unrestricted;
+    } else {
+        ucs_debug("cxi no service matches uid %d gid %d and no unrestricted "
+                  "service is available", (int)uid, (int)gid);
+        cxil_free_svc_list(svc_list);
+        return -1;
+    }
+
+    desc = svc_list->descs + i;
+
+    if (desc->restricted_vnis && (desc->num_vld_vnis > 0)) {
+        *vni_p = (uint16_t)desc->vnis[0];
+    } else {
+        *vni_p = 0;
+    }
+
+    i = (int)desc->svc_id;
+
+    ucs_debug("cxi found svc_id %d vni %u via service membership "
+              "(uid %d gid %d)", i, (unsigned)*vni_p, (int)uid, (int)gid);
+
+    cxil_free_svc_list(svc_list);
+    return i;
+}
+
+/*
+ * uct_cxi_get_rgroup_vni - resolve the (service ID, VNI) pair used to open
+ * this device.  Two paths, tried in order (mirrors libfabric's CXI
+ * provider: cxip_nic_get_rgroup_vni in prov/cxi/src/cxip_nic.c):
+ *
+ *  1. SLINGSHOT_SVC_IDS / SLINGSHOT_DEVICES / SLINGSHOT_VNIS, set by a
+ *     Slingshot-aware launcher (e.g. the SLURM plugin).  Preferred when
+ *     present, since it reflects what the WLM actually granted this job
+ *     step.
+ *  2. Kernel-side service discovery (uct_cxi_find_svc_by_membership) when
+ *     the launcher does not export those variables.
+ *
+ * Returns UCS_OK with *svc_id_p/*vni_p filled, or UCS_ERR_NO_DEVICE if
+ * neither path found a usable service.
+ */
+static ucs_status_t uct_cxi_get_rgroup_vni(struct cxil_dev *dev,
+                                           unsigned dev_id, int *svc_id_p,
+                                           uint16_t *vni_p)
+{
+    int      svc_id;
+    uint16_t vni;
+
+    svc_id = uct_cxi_get_svc_id(dev_id);
+    vni    = uct_cxi_get_vni();
+    if ((svc_id >= 0) && (vni != 0)) {
+        ucs_debug("cxi resolved svc_id %d vni %u from SLINGSHOT_* env",
+                  svc_id, (unsigned)vni);
+        *svc_id_p = svc_id;
+        *vni_p    = vni;
+        return UCS_OK;
+    }
+
+    ucs_debug("cxi SLINGSHOT_* env incomplete (svc_id %d vni %u), falling "
+              "back to service membership lookup", svc_id, (unsigned)vni);
+
+    svc_id = uct_cxi_find_svc_by_membership(dev, &vni);
+    if (svc_id < 0) {
+        return UCS_ERR_NO_DEVICE;
+    }
+
+    *svc_id_p = svc_id;
+    *vni_p    = vni;
+    return UCS_OK;
+}
+
+/*
  * uct_cxi_devname_to_id - convert "cxiN" to the numeric device index N.
  * Returns -1 if the name does not match the expected pattern.
  */
@@ -168,13 +355,14 @@ static int uct_cxi_devname_to_id(const char *name)
 /*
  * uct_cxi_query_md_resources - enumerate CXI devices available to this job.
  *
- * Guard: if SLINGSHOT_SVC_IDS is not set the Slingshot SLURM plugin has not
- * fired (single-node job or non-Slingshot system).  Advertise no resources
- * in that case so UCX falls back gracefully.
- *
- * When credentials are present we call cxil_get_device_list() and return one
- * MD resource per physical CXI device.  This mirrors the UGNI guard on
- * PMI_GNI_PTAG.
+ * Advertises one MD resource per physical CXI device found by
+ * cxil_get_device_list(), with no credential check here: whether this
+ * process can actually use a device (SLINGSHOT_* env vars, or a
+ * pre-configured service matching our uid/gid, or an unrestricted service —
+ * see uct_cxi_get_rgroup_vni) is resolved per-device in md_open, same as
+ * e.g. IB pkey access. This lets md_open's service-membership fallback run
+ * on launchers that don't export SLINGSHOT_SVC_IDS; a device with no usable
+ * service simply fails md_open and UCX skips it.
  */
 ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
                                         uct_md_resource_desc_t **resources_p,
@@ -184,12 +372,6 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
     uct_md_resource_desc_t  *resources;
     unsigned int             i;
     int                      ret;
-
-    /* Guard: only present resources when the SLURM plugin has fired. */
-    if (getenv("SLINGSHOT_SVC_IDS") == NULL) {
-        ucs_debug("cxi SLINGSHOT_SVC_IDS not set, no devices advertised");
-        return uct_md_query_empty_md_resource(resources_p, num_resources_p);
-    }
 
     ret = cxil_get_device_list(&dev_list);
     if (ret != 0) {
@@ -208,6 +390,8 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
         cxil_free_device_list(dev_list);
         return UCS_ERR_NO_MEMORY;
     }
+
+    ucs_debug("cxi found %u CXI device(s)", dev_list->count);
 
     for (i = 0; i < dev_list->count; i++) {
         ucs_strncpy_safe(resources[i].md_name,
@@ -767,23 +951,6 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
 
     dev_id = (uint32_t)ret;
 
-    /* Read credentials injected by the Slingshot SLURM plugin. */
-    svc_id = uct_cxi_get_svc_id(dev_id);
-    if (svc_id < 0) {
-        ucs_error("cxi no service ID for device %s (dev_id %u)", md_name,
-                  dev_id);
-        return UCS_ERR_NO_DEVICE;
-    }
-
-    vni = uct_cxi_get_vni();
-    if (vni == 0) {
-        ucs_error("cxi no VNI found (SLINGSHOT_VNIS not set or zero)");
-        return UCS_ERR_NO_DEVICE;
-    }
-
-    ucs_debug("cxi opening device %s dev_id %u svc_id %d vni %u",
-              md_name, dev_id, svc_id, (unsigned)vni);
-
     md = ucs_malloc(sizeof(*md), "uct_cxi_md");
     if (md == NULL) {
         return UCS_ERR_NO_MEMORY;
@@ -799,6 +966,23 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     }
 
     nid = md->cxi_dev->info.nid;
+
+    /*
+     * Resolve which service ID / VNI to open this device with: prefer
+     * SLINGSHOT_* env vars injected by the launcher, else fall back to
+     * kernel-side service-membership discovery. See uct_cxi_get_rgroup_vni.
+     */
+    status = uct_cxi_get_rgroup_vni(md->cxi_dev, dev_id, &svc_id, &vni);
+    if (status != UCS_OK) {
+        ucs_error("cxi no usable service found for device %s (dev_id %u): "
+                  "checked SLINGSHOT_SVC_IDS/SLINGSHOT_DEVICES/"
+                  "SLINGSHOT_VNIS and pre-configured service membership "
+                  "(uid/gid/unrestricted)", md_name, dev_id);
+        goto err_close_dev;
+    }
+
+    ucs_debug("cxi opening device %s dev_id %u svc_id %d vni %u",
+              md_name, dev_id, svc_id, (unsigned)vni);
 
     /*
      * Validate the service: cxil_get_svc ensures the svc_id is known to the
