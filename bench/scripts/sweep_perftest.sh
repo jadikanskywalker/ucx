@@ -17,6 +17,11 @@
 #   --layout LAYOUT         short, bcopy, or zcopy (default: short)
 #   --log-level LEVEL       UCX_LOG_LEVEL value (default: warn)
 #   --sleep SECONDS         Delay between sbatch submissions (default: 0.2)
+#   --cxi-device DEVICE     Override the cxi transport's device (default: cxi0)
+#   --tcp-device DEVICE     Override the tcp transport's device (default: hsn0
+#                            -- the Slingshot NIC over TCP/IP, for a same-
+#                            fabric comparison; pass e.g. eth0 to instead
+#                            compare against a separate management NIC).
 #   -h, --help              Show this help and exit.
 #
 # Each test's API (UCT vs UCP) is looked up from the TESTS table below,
@@ -81,9 +86,11 @@ TRANSPORTS_FILTER=""
 LAYOUT="short"
 LOG_LEVEL="warn"
 SLEEP="0.2"
+CXI_DEVICE_OVERRIDE=""
+TCP_DEVICE_OVERRIDE=""
 
 usage() {
-    sed -n '2,33p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -94,6 +101,8 @@ while [[ $# -gt 0 ]]; do
         --layout)       LAYOUT="$2"; shift 2 ;;
         --log-level)    LOG_LEVEL="$2"; shift 2 ;;
         --sleep)        SLEEP="$2"; shift 2 ;;
+        --cxi-device)   CXI_DEVICE_OVERRIDE="$2"; shift 2 ;;
+        --tcp-device)   TCP_DEVICE_OVERRIDE="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              echo "Error: unknown option '$1'" >&2; usage; exit 1 ;;
     esac
@@ -141,6 +150,19 @@ if [[ -n "$TRANSPORTS_FILTER" ]]; then
     done
 else
     TRANSPORTS=("${ALL_TRANSPORTS[@]}")
+fi
+
+if [[ -n "$CXI_DEVICE_OVERRIDE" || -n "$TCP_DEVICE_OVERRIDE" ]]; then
+    for i in "${!TRANSPORTS[@]}"; do
+        label="${TRANSPORTS[$i]%%:*}"
+        rest="${TRANSPORTS[$i]#*:}"
+        transport="${rest%%:*}"
+        if [[ "$label" == "cxi" && -n "$CXI_DEVICE_OVERRIDE" ]]; then
+            TRANSPORTS[$i]="$label:$transport:$CXI_DEVICE_OVERRIDE"
+        elif [[ "$label" == "tcp" && -n "$TCP_DEVICE_OVERRIDE" ]]; then
+            TRANSPORTS[$i]="$label:$transport:$TCP_DEVICE_OVERRIDE"
+        fi
+    done
 fi
 
 mkdir -p "$UCX/bench/out"
