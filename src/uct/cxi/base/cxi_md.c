@@ -307,7 +307,7 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
  *  2. Kernel-side service discovery (uct_cxi_find_svc_by_membership) when
  *     the launcher does not export those variables.
  *
- * Returns UCS_OK with *svc_id_p/*vni_p filled, or UCS_ERR_NO_DEVICE if
+ * Returns UCS_OK with *svc_id_p / *vni_p filled, or UCS_ERR_NO_DEVICE if
  * neither path found a usable service.
  */
 static ucs_status_t uct_cxi_get_rgroup_vni(struct cxil_dev *dev,
