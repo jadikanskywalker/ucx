@@ -18,6 +18,7 @@ typedef struct uct_cxi_md_config {
     ucs_ternary_auto_value_t enable_ats;    /**< Enable PCIe ATS scalable map */
     ucs_ternary_auto_value_t enable_rcache; /**< Enable registration cache */
     ucs_rcache_config_t      rcache;        /**< Registration cache config */
+    ucs_ternary_auto_value_t enable_dmabuf; /**< Prefer a dmabuf fd for device mem */
 } uct_cxi_md_config_t;
 
 
@@ -38,6 +39,7 @@ typedef struct uct_cxi_md {
     uint8_t           pid_bits;   /**< NIC PID width (cxil_dev->info.pid_bits) */
     ucs_rcache_t     *rcache;     /**< Registration cache; NULL if disabled */
     struct cxi_md    *ats_md;    /**< Scalable ATS mapping; NULL if ATS disabled */
+    int               dmabuf_enabled; /**< Advertise UCT_MD_FLAG_REG_DMABUF */
 } uct_cxi_md_t;
 
 
@@ -106,6 +108,8 @@ extern uct_component_t uct_cxi_component;
 /* Shared registration helpers used by both cxi_md.c and cxi_iface.c. */
 struct cxil_lni;
 ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address, size_t length,
+                             int dmabuf_fd, size_t dmabuf_offset,
+                             ucs_memory_type_t mem_type,
                              uct_cxi_mem_handle_t *mh);
 void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh);
 

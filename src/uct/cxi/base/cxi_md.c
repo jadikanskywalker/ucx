@@ -62,6 +62,14 @@ static ucs_config_field_t uct_cxi_md_config_table[] = {
      ucs_offsetof(uct_cxi_md_config_t, rcache),
      UCS_CONFIG_TYPE_TABLE(ucs_config_rcache_table)},
 
+    {"DMABUF", "try",
+     "Prefer a dmabuf fd for device memory registration when UCP offers one.\n"
+     "  yes: require a dmabuf fd for device memory (fail mem_reg without one)\n"
+     "  no:  never request a dmabuf fd; use CXI_MAP_DEVICE with no hints\n"
+     "  try: use a dmabuf fd when UCP provides one, else CXI_MAP_DEVICE alone",
+     ucs_offsetof(uct_cxi_md_config_t, enable_dmabuf),
+     UCS_CONFIG_TYPE_TERNARY},
+
     {NULL}
 };
 
@@ -418,14 +426,21 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
 
 ucs_status_t uct_cxi_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
 {
+    uct_cxi_md_t *cxi_md = ucs_derived_of(md, uct_cxi_md_t);
+
     uct_md_base_md_query(md_attr);
     md_attr->flags            = UCT_MD_FLAG_REG | UCT_MD_FLAG_NEED_MEMH |
                                 UCT_MD_FLAG_NEED_RKEY;
-    md_attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST);
-    md_attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    if (cxi_md->dmabuf_enabled) {
+        md_attr->flags |= UCT_MD_FLAG_REG_DMABUF;
+    }
+    md_attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST) |
+                                UCS_BIT(UCS_MEMORY_TYPE_CUDA) |
+                                UCS_BIT(UCS_MEMORY_TYPE_ROCM);
+    md_attr->access_mem_types = md_attr->reg_mem_types;
     md_attr->cache_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     md_attr->detect_mem_types = 0;
-    md_attr->dmabuf_mem_types = 0;
+    md_attr->dmabuf_mem_types = 0; /* consumer only, never a dmabuf producer */
     md_attr->rkey_packed_size = sizeof(uct_cxi_rkey_t);
     md_attr->reg_cost         = ucs_linear_func_make(1000.0e-9, 0.007e-9);
     return UCS_OK;
@@ -489,14 +504,32 @@ void uct_cxi_md_close(uct_md_h mdh)
  *
  * CXI_MAP_PIN ensures physical page pinning (required for DMA).
  * CXI_MAP_READ | CXI_MAP_WRITE grants bidirectional NIC access.
+ *
+ * For device memory (mem_type != HOST), CXI_MAP_DEVICE is added. dmabuf_fd
+ * is optional: the Cassini driver supports CXI_MAP_DEVICE with or without
+ * dmabuf hints (confirmed in shs-libcxi's own map.c device_map_multiple /
+ * device_map_offset tests, both parameterized over use_dmabuf true/false).
  */
 ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
-                                   size_t length, uct_cxi_mem_handle_t *mh)
+                                   size_t length, int dmabuf_fd,
+                                   size_t dmabuf_offset,
+                                   ucs_memory_type_t mem_type,
+                                   uct_cxi_mem_handle_t *mh)
 {
     int flags = CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE;
+    struct cxi_md_hints hints = {};
     int ret;
 
-    ret = cxil_map(lni, address, length, flags, NULL, &mh->cxi_md);
+    if (mem_type != UCS_MEMORY_TYPE_HOST) {
+        flags |= CXI_MAP_DEVICE;
+        if (dmabuf_fd != UCT_DMABUF_FD_INVALID) {
+            hints.dmabuf_fd     = dmabuf_fd;
+            hints.dmabuf_offset = dmabuf_offset;
+            hints.dmabuf_valid  = true;
+        }
+    }
+
+    ret = cxil_map(lni, address, length, flags, &hints, &mh->cxi_md);
     if (ret != 0) {
         ucs_error("cxi cxil_map lni_id %u addr %p len %zu failed: %s",
                   lni->id, address, length, strerror(-ret));
@@ -540,15 +573,26 @@ static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
                                        uct_mem_h *memh_p)
 {
     uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    ucs_memory_type_t     mem_type;
+    int                   dmabuf_fd;
+    size_t                dmabuf_offset;
     uct_cxi_mem_handle_t *mh;
     ucs_status_t          status;
+
+    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, MEM_TYPE,
+                                          UCS_MEMORY_TYPE_HOST);
+    dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_fd, DMABUF_FD,
+                                           UCT_DMABUF_FD_INVALID);
+    dmabuf_offset = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_offset,
+                                               DMABUF_OFFSET, 0);
 
     mh = ucs_malloc(sizeof(*mh), "uct_cxi_mem_handle");
     if (mh == NULL) {
         return UCS_ERR_NO_MEMORY;
     }
 
-    status = uct_cxi_do_map(md->cxi_lni, address, length, mh);
+    status = uct_cxi_do_map(md->cxi_lni, address, length, dmabuf_fd,
+                            dmabuf_offset, mem_type, mh);
     if (status != UCS_OK) {
         ucs_free(mh);
         return status;
@@ -576,6 +620,13 @@ uct_cxi_md_mem_dereg(uct_md_h mdh, const uct_md_mem_dereg_params_t *params)
  * -------------------------------------------------------------------------
  */
 
+/* Carries mem_reg params + the caller's pre-page-alignment address through
+ * ucs_rcache_get() to the miss callback. */
+typedef struct uct_cxi_rcache_reg_arg {
+    const uct_md_mem_reg_params_t *params;
+    void                           *address;
+} uct_cxi_rcache_reg_arg_t;
+
 /*
  * Cache miss: the rcache calls this to create a new entry for a VA range it
  * has not seen before.  The region struct is already allocated by the rcache;
@@ -588,14 +639,35 @@ uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
                           void *arg, ucs_rcache_region_t *rregion,
                           uint16_t rcache_mem_reg_flags)
 {
-    uct_cxi_md_t            *md     = context;
-    uct_cxi_rcache_region_t *region = ucs_derived_of(rregion,
-                                                     uct_cxi_rcache_region_t);
+    uct_cxi_md_t                   *md      = context;
+    const uct_cxi_rcache_reg_arg_t *reg_arg = arg;
+    uct_cxi_rcache_region_t        *region  = ucs_derived_of(rregion,
+                                                              uct_cxi_rcache_region_t);
+    ucs_memory_type_t mem_type     = UCS_MEMORY_TYPE_HOST;
+    int                dmabuf_fd    = UCT_DMABUF_FD_INVALID;
+    size_t             dmabuf_offset = 0;
+
+    if (reg_arg != NULL) {
+        mem_type = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, mem_type,
+                                              MEM_TYPE, UCS_MEMORY_TYPE_HOST);
+        dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, dmabuf_fd,
+                                               DMABUF_FD, UCT_DMABUF_FD_INVALID);
+        dmabuf_offset = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params,
+                                                   dmabuf_offset,
+                                                   DMABUF_OFFSET, 0);
+
+        /* dmabuf_offset was computed relative to reg_arg->address; shift it
+         * by the same delta the rcache's page-aligned start moved by (see
+         * shs-libcxi tests/map.c device_map_offset for this pattern). */
+        if (dmabuf_fd != UCT_DMABUF_FD_INVALID) {
+            dmabuf_offset -= (uintptr_t)reg_arg->address - rregion->super.start;
+        }
+    }
 
     return uct_cxi_do_map(md->cxi_lni,
                           (void *)rregion->super.start,
                           rregion->super.end - rregion->super.start,
-                          &region->memh);
+                          dmabuf_fd, dmabuf_offset, mem_type, &region->memh);
 }
 
 /*
@@ -642,13 +714,14 @@ uct_cxi_md_mem_rcache_reg(uct_md_h uct_md, void *address, size_t length,
                           const uct_md_mem_reg_params_t *params,
                           uct_mem_h *memh_p)
 {
-    uct_cxi_md_t        *md = ucs_derived_of(uct_md, uct_cxi_md_t);
-    ucs_rcache_region_t *rregion;
-    ucs_status_t         status;
+    uct_cxi_md_t             *md = ucs_derived_of(uct_md, uct_cxi_md_t);
+    uct_cxi_rcache_reg_arg_t  reg_arg = {.params = params, .address = address};
+    ucs_rcache_region_t      *rregion;
+    ucs_status_t              status;
 
     status = ucs_rcache_get(md->rcache, address, length,
                             ucs_get_page_size(), PROT_READ | PROT_WRITE,
-                            NULL, &rregion);
+                            &reg_arg, &rregion);
     if (status != UCS_OK) {
         return status;
     }
@@ -831,7 +904,17 @@ uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
                        uct_mem_h *memh_p)
 {
     uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    ucs_memory_type_t     mem_type;
     uct_cxi_mem_handle_t *mh;
+
+    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, MEM_TYPE,
+                                          UCS_MEMORY_TYPE_HOST);
+
+    /* ATS's scalable VA-0 map covers host memory only; device memory
+     * always gets a real per-buffer cxil_map instead. */
+    if (mem_type != UCS_MEMORY_TYPE_HOST) {
+        return uct_cxi_md_mem_reg(mdh, address, length, params, memh_p);
+    }
 
     mh = ucs_malloc(sizeof(*mh), "uct_cxi_ats_memh");
     if (mh == NULL) {
@@ -852,8 +935,19 @@ static ucs_status_t
 uct_cxi_md_mem_ats_dereg(uct_md_h mdh,
                          const uct_md_mem_dereg_params_t *params)
 {
+    uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    uct_cxi_mem_handle_t *mh;
+
     UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
-    ucs_free(params->memh);
+    mh = params->memh;
+
+    /* Device memory bypassed the shared ATS map for a real per-buffer
+     * cxil_map (see uct_cxi_md_mem_ats_reg); unmap it like the direct path. */
+    if (mh->cxi_md != md->ats_md) {
+        return uct_cxi_md_mem_dereg(mdh, params);
+    }
+
+    ucs_free(mh);
     return UCS_OK;
 }
 
@@ -1034,6 +1128,7 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     md->pid_bits        = (uint8_t)md->cxi_dev->info.pid_bits;
     md->rcache          = NULL;
     md->ats_md          = NULL;
+    md->dmabuf_enabled  = (cfg->enable_dmabuf != UCS_NO);
 
     /*
      * Optionally enable PCIe ATS scalable mapping.  ATS replaces per-buffer

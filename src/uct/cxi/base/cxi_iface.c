@@ -783,6 +783,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     status = uct_cxi_do_map(lni, self->tx.get_short_buf, C_MAX_IDC_PAYLOAD_RES,
+                            UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
                             &self->tx.get_short_mh);
     if (status != UCS_OK) {
         goto err_free_get_short_buf;
@@ -809,6 +810,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
             goto err_am_rx_bufs;
         }
         status = uct_cxi_do_map(lni, self->am.rx_base, total,
+                                UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
                                 &self->am.rx_mh);
         if (status != UCS_OK) {
             ucs_free(self->am.rx_base);
