@@ -1,11 +1,4 @@
 #!/bin/bash
-#SBATCH --job-name=ucx-perftest
-#SBATCH --nodes=2
-#SBATCH --ntasks=2
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --time=00:10:00
-#SBATCH --output=/cosmos/nfs/home/jadhicks/ucx/bench/out/slurm/%x-%j.out
 
 # Cross-node ucx_perftest runner supporting both UCT and UCP modes.
 # Single-combo worker for bench/scripts/sweep_perftest.sh -- run directly
@@ -33,7 +26,7 @@
 # Output lands in bench/out/<test>_<type>_<transport>_<device>_<layout>.<jobid>/
 # so a sweep of many combos can be told apart without cross-referencing job IDs.
 
-UCX=/cosmos/nfs/home/jadhicks/ucx
+UCX=/users/jadhicks/ucx
 
 TEST="${1:-}"
 TYPE="${2:-UCT}"
@@ -117,4 +110,4 @@ fi
 EOF
 chmod +x "$OUT/wrap.sh"
 
-srun "$OUT/wrap.sh"
+srun --time=00:01:00 --output=/users/jadhicks/ucx/bench/out/slurm/%x-%j-$TEST-$TRANSPORT.out "$OUT/wrap.sh"

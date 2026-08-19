@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=/users/jadhicks/ucx/bench/scripts
 UCX="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 MANIFESTS=()

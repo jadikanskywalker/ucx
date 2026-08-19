@@ -1,4 +1,12 @@
 #!/bin/bash
+#SBATCH --job-name=ucx-perftest
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=00:30:00
+#SBATCH --output=/users/jadhicks/ucx/bench/out/slurm/%x-%j.out
+
 #
 # Submit the full ucx_perftest test matrix once per transport (cxi/cxi0 and
 # tcp/hsn0 by default) via bench/scripts/run_perftest.sh, so results for both
@@ -17,11 +25,6 @@
 #   --layout LAYOUT         short, bcopy, or zcopy (default: short)
 #   --log-level LEVEL       UCX_LOG_LEVEL value (default: warn)
 #   --sleep SECONDS         Delay between sbatch submissions (default: 0.2)
-#   --cxi-device DEVICE     Override the cxi transport's device (default: cxi0)
-#   --tcp-device DEVICE     Override the tcp transport's device (default: hsn0
-#                            -- the Slingshot NIC over TCP/IP, for a same-
-#                            fabric comparison; pass e.g. eth0 to instead
-#                            compare against a separate management NIC).
 #   -h, --help              Show this help and exit.
 #
 # Each test's API (UCT vs UCP) is looked up from the TESTS table below,
@@ -40,8 +43,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UCX="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SCRIPT_DIR=/users/jadhicks/ucx/bench/scripts
+UCX=/users/jadhicks/ucx/
 RUN_SCRIPT="$SCRIPT_DIR/run_perftest.sh"
 
 # name:api, in the order they appear in src/tools/perf/perftest.c's tests[].
@@ -50,13 +53,13 @@ ALL_TESTS=(
     "put_lat:UCT"
     "add_lat:UCT"
     "get:UCT"
-    "fadd:UCT"
-    "swap:UCT"
-    "cswap:UCT"
+    # "fadd:UCT"
+    # "swap:UCT"
+    # "cswap:UCT"
     "am_bw:UCT"
     "put_bw:UCT"
     "get_bw:UCT"
-    "add_mr:UCT"
+    # "add_mr:UCT"
     "tag_lat:UCP"
     "tag_bw:UCP"
     "tag_sync_lat:UCP"
@@ -64,14 +67,14 @@ ALL_TESTS=(
     "ucp_put_lat:UCP"
     "ucp_put_bw:UCP"
     "ucp_get:UCP"
-    "ucp_add:UCP"
-    "ucp_fadd:UCP"
-    "ucp_swap:UCP"
-    "ucp_cswap:UCP"
-    "stream_bw:UCP"
-    "stream_lat:UCP"
+    # "ucp_add:UCP"
+    # "ucp_fadd:UCP"
+    # "ucp_swap:UCP"
+    # "ucp_cswap:UCP"
+    # "stream_bw:UCP"
+    # "stream_lat:UCP"
     "ucp_am_lat:UCP"
-    "ucp_am_bw:UCP"
+    # "ucp_am_bw:UCP"
 )
 
 # label:transport:device
@@ -86,11 +89,9 @@ TRANSPORTS_FILTER=""
 LAYOUT="short"
 LOG_LEVEL="warn"
 SLEEP="0.2"
-CXI_DEVICE_OVERRIDE=""
-TCP_DEVICE_OVERRIDE=""
 
 usage() {
-    sed -n '2,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '10,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -101,8 +102,6 @@ while [[ $# -gt 0 ]]; do
         --layout)       LAYOUT="$2"; shift 2 ;;
         --log-level)    LOG_LEVEL="$2"; shift 2 ;;
         --sleep)        SLEEP="$2"; shift 2 ;;
-        --cxi-device)   CXI_DEVICE_OVERRIDE="$2"; shift 2 ;;
-        --tcp-device)   TCP_DEVICE_OVERRIDE="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              echo "Error: unknown option '$1'" >&2; usage; exit 1 ;;
     esac
@@ -152,19 +151,6 @@ else
     TRANSPORTS=("${ALL_TRANSPORTS[@]}")
 fi
 
-if [[ -n "$CXI_DEVICE_OVERRIDE" || -n "$TCP_DEVICE_OVERRIDE" ]]; then
-    for i in "${!TRANSPORTS[@]}"; do
-        label="${TRANSPORTS[$i]%%:*}"
-        rest="${TRANSPORTS[$i]#*:}"
-        transport="${rest%%:*}"
-        if [[ "$label" == "cxi" && -n "$CXI_DEVICE_OVERRIDE" ]]; then
-            TRANSPORTS[$i]="$label:$transport:$CXI_DEVICE_OVERRIDE"
-        elif [[ "$label" == "tcp" && -n "$TCP_DEVICE_OVERRIDE" ]]; then
-            TRANSPORTS[$i]="$label:$transport:$TCP_DEVICE_OVERRIDE"
-        fi
-    done
-fi
-
 mkdir -p "$UCX/bench/out"
 MANIFEST="$UCX/bench/out/manifest.$(date +%Y%m%d-%H%M%S).tsv"
 if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -188,20 +174,22 @@ for transport_entry in "${TRANSPORTS[@]}"; do
         type="${test_entry#*:}"
         n=$((n + 1))
 
-        cmd=(sbatch --parsable
-             --job-name="pt-${test}-${label}"
-             "$RUN_SCRIPT" "$test" "$type" "$transport" "$device" "$LAYOUT" "$LOG_LEVEL")
+        cmd=("$RUN_SCRIPT" "$test" "$type" "$transport" "$device" "$LAYOUT" "$LOG_LEVEL")
 
         printf '[%d/%d] %s %s %s ' "$n" "$total" "$test" "$type" "$label"
         if [[ "$DRY_RUN" -eq 1 ]]; then
-            printf '%s\n' "-> ${cmd[*]}"
+            printf '%s\n' "-> bash ${cmd[*]}"
             continue
         fi
 
-        jobid="$("${cmd[@]}")"
-        printf '%s\n' "-> job $jobid"
+        if bash "${cmd[@]}"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        printf '%s\n' "-> exit $rc"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$jobid" "$test" "$type" "$transport" "$device" "$LAYOUT" >> "$MANIFEST"
+            "${SLURM_JOB_ID:-none}" "$test" "$type" "$transport" "$device" "$LAYOUT" "$rc" >> "$MANIFEST"
 
         sleep "$SLEEP"
     done
