@@ -4,6 +4,7 @@
 * Copyright (C) UT-Battelle, LLC. 2015. ALL RIGHTS RESERVED.
 * Copyright (C) ARM Ltd. 2017.  ALL RIGHTS RESERVED
 * Copyright (C) Advanced Micro Devices, Inc. 2016 - 2017. ALL RIGHTS RESERVED.
+* Copyright (C) Intel Corporation, 2026. ALL RIGHTS RESERVED.
 * See file LICENSE for terms.
 */
 
@@ -193,7 +194,6 @@ protected:
         void revoke_ep(unsigned index);
         void destroy_eps();
         void connect(unsigned index, entity& other, unsigned other_index);
-        void connect_p2p_ep(uct_ep_h from, uct_ep_h to);
         void connect_to_iface(unsigned index, entity &other,
                               unsigned path_index = 0);
         void connect_to_ep(unsigned index, entity &other, unsigned other_index,
@@ -226,6 +226,9 @@ protected:
         private:
             async_wrapper(const async_wrapper &);
         };
+
+
+        void connect_p2p_ep(uct_ep_h from, uct_ep_h to);
 
         const resource              m_resource;
         ucs::handle<uct_md_h>       m_md;
@@ -506,6 +509,8 @@ protected:
 #define UCT_TEST_ROCM_MEM_TYPE_TLS \
     rocm_copy
 
+#define UCT_TEST_ZE_MEM_TYPE_TLS ze_copy
+
 #define UCT_TEST_NO_GPU_MEM_TYPE_TLS \
     UCT_TEST_NO_SELF_TLS, \
     self
@@ -580,6 +585,16 @@ protected:
  */
 #define UCT_INSTANTIATE_CUDA_TEST_CASE(_test_case) \
     UCS_PP_FOREACH(_UCT_INSTANTIATE_TEST_CASE, _test_case, UCT_TEST_CUDA_MEM_TYPE_TLS)
+
+
+/**
+ * Instantiate the parametrized test case for ZE copy transport.
+ *
+ * @param _test_case  Test case class, derived from uct_test.
+ */
+#define UCT_INSTANTIATE_ZE_TEST_CASE(_test_case) \
+    UCS_PP_FOREACH(_UCT_INSTANTIATE_TEST_CASE, _test_case, \
+                   UCT_TEST_ZE_MEM_TYPE_TLS)
 
 
 /**
