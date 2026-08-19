@@ -490,7 +490,9 @@ static uct_iface_internal_ops_t uct_cxi_iface_internal_ops = {
     .iface_is_reachable_v2  = uct_cxi_iface_is_reachable_v2,
     .ep_is_connected        = (uct_ep_is_connected_func_t)ucs_empty_function_return_zero_int,
     .ep_get_device_ep       = (uct_ep_get_device_ep_func_t)ucs_empty_function_return_unsupported,
-    .ep_put_sgl_zcopy       = (uct_ep_put_sgl_zcopy_func_t)ucs_empty_function_return_unsupported
+    .ep_put_sgl_zcopy       = (uct_ep_put_sgl_zcopy_func_t)ucs_empty_function_return_unsupported,
+    .ep_get_sgl_zcopy       = (uct_ep_get_sgl_zcopy_func_t)ucs_empty_function_return_unsupported,
+    .ep_outstanding_purge   = (uct_ep_outstanding_purge_func_t)ucs_empty_function_return_unsupported
 };
 
 ucs_status_t uct_cxi_query_devices(uct_md_h md,
