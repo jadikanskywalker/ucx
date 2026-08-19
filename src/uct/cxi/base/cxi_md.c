@@ -579,12 +579,12 @@ static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
     uct_cxi_mem_handle_t *mh;
     ucs_status_t          status;
 
-    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, MEM_TYPE,
+    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, FIELD_MEM_TYPE,
                                           UCS_MEMORY_TYPE_HOST);
-    dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_fd, DMABUF_FD,
+    dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_fd, FIELD_DMABUF_FD,
                                            UCT_DMABUF_FD_INVALID);
     dmabuf_offset = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_offset,
-                                               DMABUF_OFFSET, 0);
+                                               FIELD_DMABUF_OFFSET, 0);
 
     mh = ucs_malloc(sizeof(*mh), "uct_cxi_mem_handle");
     if (mh == NULL) {
@@ -649,12 +649,12 @@ uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
 
     if (reg_arg != NULL) {
         mem_type = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, mem_type,
-                                              MEM_TYPE, UCS_MEMORY_TYPE_HOST);
+                                              FIELD_MEM_TYPE, UCS_MEMORY_TYPE_HOST);
         dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, dmabuf_fd,
-                                               DMABUF_FD, UCT_DMABUF_FD_INVALID);
+                                               FIELD_DMABUF_FD, UCT_DMABUF_FD_INVALID);
         dmabuf_offset = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params,
                                                    dmabuf_offset,
-                                                   DMABUF_OFFSET, 0);
+                                                   FIELD_DMABUF_OFFSET, 0);
 
         /* dmabuf_offset was computed relative to reg_arg->address; shift it
          * by the same delta the rcache's page-aligned start moved by (see
@@ -907,7 +907,7 @@ uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
     ucs_memory_type_t     mem_type;
     uct_cxi_mem_handle_t *mh;
 
-    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, MEM_TYPE,
+    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, FIELD_MEM_TYPE,
                                           UCS_MEMORY_TYPE_HOST);
 
     /* ATS's scalable VA-0 map covers host memory only; device memory
