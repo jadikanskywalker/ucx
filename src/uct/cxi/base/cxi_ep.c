@@ -6,9 +6,9 @@
  *
  * RMA operations (ep_put_zcopy, ep_get_zcopy) live in cxi_rma.c.
  *
- * ep_create precomputes dfa_rma[0] for LAC 0 and marks it valid.  Additional
- * LAC DFAs (1-7, only when built with --enable-huge-pages) are built lazily
- * in cxi_rma.c on first use of that LAC in an rkey.
+ * ep_create builds all UCT_CXI_MAX_LACS dfa_rma[] entries eagerly (one per
+ * LAC, pid_offset = lac) so the hot path in cxi_rma.c/cxi_amo.c never needs
+ * a check -- it just indexes dfa_rma[rkey->lac].
  */
 
 #ifdef HAVE_CONFIG_H
@@ -48,8 +48,7 @@ uct_cxi_ep_md(uct_cxi_ep_t *ep)
  * uct_cxi_ep_create — allocate and connect an EP to a remote iface.
  *
  * Reads device_addr (nid) and iface_addr (pid) from params, stores them in
- * the EP, and precomputes dfa_rma[0] for LAC 0.  Additional LAC DFAs are
- * built lazily in cxi_rma.c on first use.
+ * the EP, and precomputes every dfa_rma[lac] (0..UCT_CXI_MAX_LACS-1).
  */
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
 {

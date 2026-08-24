@@ -9,10 +9,12 @@
  *
  * Resource groups (allocated in order, destroyed in reverse):
  *   wait_obj → eq_buf → eq_md → evtq → tx.cp → tx.cmdq → tgt.cmdq →
- *   domain → rma.pte[0] / rma.pte_map[0] (+ LE) → tx.op_pool
+ *   domain → rma.pte[0..UCT_CXI_MAX_LACS-1] (+ one LE each) → tx.op_pool
  *
- * Additional rma.pte[1..UCT_CXI_MAX_LACS-1] are opened lazily by
- * uct_cxi_rma_ensure_lac() in cxi_rma.c on first use of each LAC.
+ * All UCT_CXI_MAX_LACS RMA PTEs are opened eagerly here, not lazily on
+ * first use of a LAC -- ep_create builds every ep->dfa_rma[lac] up front
+ * (see cxi_ep.c) so the hot path never needs an "is this LAC's PTE open
+ * yet?" check.
  */
 
 #ifdef HAVE_CONFIG_H

@@ -7,10 +7,17 @@
  * Restricted-mode DMA model
  * ─────────────────────────
  * Both PUT and GET use c_full_dma_cmd with restricted=1.  The NIC routes the
- * command to the remote peer's RMA portal at pid_offset = rkey->lac via the
- * precomputed DFA.  The remote portal's catch-all LE (posted at iface_open
- * for LAC 0, lazily for LACs 1-7) tells the NIC which IOMMU context (AC) to
- * use for the remote memory access.
+ * command to the remote peer's RMA portal at pid_offset = rkey->lac (the
+ * *target* buffer's LAC) via ep->dfa_rma[rkey->lac], precomputed for every
+ * LAC at ep_create.  Routing has to be per-LAC rather than one shared PTE:
+ * a restricted-mode wire packet carries no LAC field at all (verified —
+ * cassini_user_defs.h's struct c_port_restricted_hdr has only opcode,
+ * index_ext, remote_offset, request_len), so index_ext/PTE selection is the
+ * only per-packet signal available to tell the target which LAC's address
+ * context (and therefore which of its per-LAC PTEs' catch-all LE) should
+ * resolve remote_offset. Each RMA PTE (opened eagerly at iface_open, one
+ * per LAC — see cxi_iface.c) carries exactly one catch-all LE with an
+ * unambiguous .lac, so there's nothing for the target to disambiguate.
  *
  * PUT short: data is inline in the IDC command — no local mem_reg needed, no DMA.
  *   c_idc_hdr carries no user_ptr, so a c_cstate_cmd is emitted first.
@@ -20,17 +27,6 @@
  *
  * PUT zcopy: NIC DMA from app's registered IOVA.  Completion: C_EVENT_ACK.
  * GET zcopy: NIC reads remote memory → local registered buffer.  Completion: C_EVENT_REPLY.
- *
- * DFA lazy construction
- * ─────────────────────
- * ep->dfa_rma[lac] is built on first use of that LAC (bit lac of
- * ep->dfa_rma_valid).  For the default build (UCT_CXI_MAX_LACS = 1) LAC 0
- * is always pre-built at ep_create so the lazy branch is dead code.
- *
- * Per-LAC PTE lazy open
- * ─────────────────────
- * iface->rma.pte[0] is opened at iface_init.  For UCT_CXI_MAX_LACS = 8,
- * PTEs 1-7 are opened by uct_cxi_rma_ensure_lac() on first use.
  */
 
 #ifdef HAVE_CONFIG_H

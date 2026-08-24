@@ -75,7 +75,10 @@ typedef struct uct_cxi_send_desc {
  * at ep_create — no hot-path conditional needed.
  *
  * dfa_rma[lac]: per-LAC DFA for restricted-mode RMA/AMO (pid_offset = lac).
- *   With the default build (UCT_CXI_MAX_LACS = 1) only dfa_rma[0] is built.
+ *   All UCT_CXI_MAX_LACS entries are built at ep_create; an operation
+ *   selects dfa_rma[rkey->lac] -- the *target* buffer's LAC, since that's
+ *   what determines which of the target's per-LAC PTEs/LEs must resolve
+ *   remote_offset (see cxi_rma.c for why routing has to be per-LAC).
  * dfa_am: DFA for unrestricted Active Messages (pid_offset = UCT_CXI_PTE_AM).
  */
 typedef struct uct_cxi_ep {
