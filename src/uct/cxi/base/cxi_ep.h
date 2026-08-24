@@ -74,16 +74,17 @@ typedef struct uct_cxi_send_desc {
  * rem_nid and rem_pid identify the remote peer.  All DFAs are built eagerly
  * at ep_create — no hot-path conditional needed.
  *
- * dfa_rma[lac]: per-LAC DFA for restricted-mode RMA/AMO (pid_offset = lac).
- *   With the default build (UCT_CXI_MAX_LACS = 1) only dfa_rma[0] is built.
+ * dfa_rma: DFA for restricted-mode RMA/AMO (pid_offset = UCT_CXI_PTE_RMA,
+ *   one PTE for all LACs -- the LAC of an operation only affects which local
+ *   buffer/rkey it uses, never which PTE it targets).
  * dfa_am: DFA for unrestricted Active Messages (pid_offset = UCT_CXI_PTE_AM).
  */
 typedef struct uct_cxi_ep {
     uct_base_ep_t     super;                              /**< Must be first */
     uint32_t          rem_nid;                            /**< Remote NID */
     uint32_t          rem_pid;                            /**< Remote PID */
-    union c_fab_addr  dfa_rma[UCT_CXI_MAX_LACS];         /**< Per-LAC DFAs (pid_offset=lac) */
-    uint8_t           dfa_rma_idx_ext[UCT_CXI_MAX_LACS]; /**< Per-LAC idx_ext */
+    union c_fab_addr  dfa_rma;                            /**< RMA/AMO DFA */
+    uint8_t           dfa_rma_idx_ext;                    /**< RMA/AMO idx_ext */
     union c_fab_addr  dfa_am;                             /**< AM DFA (pid_offset=UCT_CXI_PTE_AM) */
     uint8_t           dfa_am_idx_ext;                    /**< AM idx_ext */
     unsigned          outstanding;     /**< In-flight send ops for this EP */

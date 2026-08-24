@@ -9,10 +9,7 @@
  *
  * Resource groups (allocated in order, destroyed in reverse):
  *   wait_obj → eq_buf → eq_md → evtq → tx.cp → tx.cmdq → tgt.cmdq →
- *   domain → rma.pte[0] / rma.pte_map[0] (+ LE) → tx.op_pool
- *
- * Additional rma.pte[1..UCT_CXI_MAX_LACS-1] are opened lazily by
- * uct_cxi_rma_ensure_lac() in cxi_rma.c on first use of each LAC.
+ *   domain → rma.pte / rma.pte_map (+ one catch-all LE per LAC) → tx.op_pool
  */
 
 #ifdef HAVE_CONFIG_H
@@ -150,38 +147,48 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_cxi_iface_t, uct_iface_t);
 
 /*
- * uct_cxi_iface_open_rma_pte — allocate, map, enable, and post a catch-all
- * LE for one RMA portal (pid_offset = lac).  Called once per LAC at iface_open.
+ * uct_cxi_iface_open_rma_pte — allocate, map, and enable the single RMA/AMO
+ * portal (pid_offset = UCT_CXI_PTE_RMA), then post one catch-all LE per
+ * possible LAC value (0..UCT_CXI_MAX_LACS-1) on it.
+ *
+ * PTE routing is LAC-independent (verified against the driver: cass_pt.c
+ * never references LAC), so a single PTE serves every LAC's traffic.
+ * Whether a catch-all LE's own .lac field gates List-Processing-Engine
+ * matching for restricted-mode ops isn't something visible from software
+ * (LPE matching is implemented in NIC hardware) -- so rather than assume,
+ * post one LE per hardware-supported LAC value up front; the cost is one
+ * cheap APPEND per LAC at iface_open, not per operation.
+ *
  * On error, undoes whatever was partially completed.
  */
 static ucs_status_t
-uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
-                            uint8_t lac)
+uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
     const union c_event      *ev;
+    uint8_t                   lac;
     int                       ret;
 
     {
         /* en_flowctrl: on EQ-full pressure, transition DISABLED (graceful,
          * accountable via drop_count) instead of silently dropping the
-         * event. This LE has event_success_disable=1 below, so it can
-         * never itself generate a target-side event needing a slot — the
-         * bit is armed here for consistency / in case that ever changes,
-         * not because RMA/AMO can hit this path today. */
+         * event. These LEs have event_success_disable=1 below, so they can
+         * never themselves generate a target-side event needing a slot —
+         * the bit is armed here for consistency / in case that ever
+         * changes, not because RMA/AMO can hit this path today. */
         struct cxi_pt_alloc_opts pt_opts = {
             .en_flowctrl = 1
         };
-        ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->rma.pte[lac]);
+        ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->rma.pte);
     }
     if (ret != 0) {
-        ucs_error("cxi cxil_alloc_pte lac %u: %s", lac, strerror(-ret));
+        ucs_error("cxi cxil_alloc_pte rma: %s", strerror(-ret));
         return UCS_ERR_IO_ERROR;
     }
 
-    ret = cxil_map_pte(self->rma.pte[lac], self->domain, (int)lac,
-                       false, &self->rma.pte_map[lac]);
+    ret = cxil_map_pte(self->rma.pte, self->domain, (int)UCT_CXI_PTE_RMA,
+                       false, &self->rma.pte_map);
     if (ret != 0) {
-        ucs_error("cxi cxil_map_pte lac %u: %s", lac, strerror(-ret));
+        ucs_error("cxi cxil_map_pte rma: %s", strerror(-ret));
         goto err_destroy_pte;
     }
 
@@ -191,12 +198,12 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         bool                   enabled = false;
 
         ss.command.opcode = C_CMD_TGT_SETSTATE;
-        ss.ptlte_index    = self->rma.pte[lac]->ptn;
+        ss.ptlte_index    = self->rma.pte->ptn;
         ss.ptlte_state    = C_PTLTE_ENABLED;
 
         ret = cxi_cq_emit_target(self->tgt.cmdq, &ss);
         if (ret != 0) {
-            ucs_error("cxi SETSTATE lac %u: %d", lac, ret);
+            ucs_error("cxi SETSTATE rma: %d", ret);
             goto err_unmap_pte;
         }
         cxi_cq_ring(self->tgt.cmdq);
@@ -213,12 +220,13 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         }
     }
 
-    /* Post catch-all LE so the NIC can resolve IOVAs via this LAC. */
-    {
+    /* Post one catch-all LE per LAC so the NIC can resolve IOVAs regardless
+     * of which LAC a given registration landed in. */
+    for (lac = 0; lac < UCT_CXI_MAX_LACS; lac++) {
         struct c_target_cmd le = {};
         le.command.opcode        = C_CMD_TGT_APPEND;
         le.ptl_list              = C_PTL_LIST_PRIORITY;
-        le.ptlte_index           = self->rma.pte[lac]->ptn;
+        le.ptlte_index           = self->rma.pte->ptn;
         le.op_put                = 1;
         le.op_get                = 1;
         le.event_link_disable    = 1;
@@ -231,22 +239,22 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
 
         ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
         if (ret != 0) {
-            ucs_error("cxi APPEND LE lac %u: %d", lac, ret);
+            ucs_error("cxi APPEND LE lac %u: %d", (unsigned)lac, ret);
             goto err_unmap_pte;
         }
         cxi_cq_ring(self->tgt.cmdq);
     }
 
-    ucs_debug("cxi RMA PTE lac %u ptn %u enabled",
-              (unsigned)lac, self->rma.pte[lac]->ptn);
+    ucs_debug("cxi RMA PTE ptn %u enabled (%u LACs)",
+              self->rma.pte->ptn, (unsigned)UCT_CXI_MAX_LACS);
     return UCS_OK;
 
 err_unmap_pte:
-    cxil_unmap_pte(self->rma.pte_map[lac]);
-    self->rma.pte_map[lac] = NULL;
+    cxil_unmap_pte(self->rma.pte_map);
+    self->rma.pte_map = NULL;
 err_destroy_pte:
-    cxil_destroy_pte(self->rma.pte[lac]);
-    self->rma.pte[lac] = NULL;
+    cxil_destroy_pte(self->rma.pte);
+    self->rma.pte = NULL;
     return UCS_ERR_IO_ERROR;
 }
 
@@ -590,7 +598,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     self->eq_flap_limit    = config->eq_flap_limit;
     self->eq_flap_window   = ucs_time_from_sec(config->eq_flap_window);
     memset(&self->am.fc, 0, sizeof(self->am.fc));
-    memset(self->rma.fc, 0, sizeof(self->rma.fc));
+    memset(&self->rma.fc, 0, sizeof(self->rma.fc));
 
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
@@ -679,21 +687,15 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     /*
-     * Steps 10–11: open UCT_CXI_MAX_LACS RMA PTEs (one per LAC, eagerly).
+     * Steps 10-11: open the single RMA/AMO PTE (all LACs).
      *
-     * Building all DFAs at ep_create requires all PTEs open at iface_open so
-     * the hot path never needs to check "is PTE N ready?" — it just uses
-     * ep->dfa_rma[rkey->lac] directly with no conditional.
+     * Building the DFA at ep_create requires the PTE open at iface_open so
+     * the hot path never needs to check "is it ready?" — it just uses
+     * ep->dfa_rma directly with no conditional.
      */
-    {
-        uint8_t lac;
-        for (lac = 0; lac < UCT_CXI_MAX_LACS; lac++) {
-            status = uct_cxi_iface_open_rma_pte(self, lni, lac);
-            if (status != UCS_OK) {
-                goto err_rma_ptes;
-            }
-            self->rma.lac_count++;
-        }
+    status = uct_cxi_iface_open_rma_pte(self, lni);
+    if (status != UCS_OK) {
+        goto err_rma_ptes;
     }
 
     /*
@@ -829,7 +831,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     ucs_info("cxi iface open %p nid 0x%x pid %u ptn %u pid_bits %u "
              "max_lacs %u",
              self, cxi_md->device.nid, self->domain->pid,
-             self->rma.pte[0]->ptn, (unsigned)cxi_md->pid_bits,
+             self->rma.pte->ptn, (unsigned)cxi_md->pid_bits,
              (unsigned)UCT_CXI_MAX_LACS);
     return UCS_OK;
 
@@ -848,16 +850,11 @@ err_cleanup_desc_pool:
 err_cleanup_op_pool:
     ucs_mpool_cleanup(&self->tx.op_pool, 1);
 err_rma_ptes:
-    {
-        uint8_t lac;
-        for (lac = UCT_CXI_MAX_LACS; lac-- > 0; ) {
-            if (self->rma.pte_map[lac] != NULL) {
-                cxil_unmap_pte(self->rma.pte_map[lac]);
-            }
-            if (self->rma.pte[lac] != NULL) {
-                cxil_destroy_pte(self->rma.pte[lac]);
-            }
-        }
+    if (self->rma.pte_map != NULL) {
+        cxil_unmap_pte(self->rma.pte_map);
+    }
+    if (self->rma.pte != NULL) {
+        cxil_destroy_pte(self->rma.pte);
     }
 err_destroy_domain:
     cxil_destroy_domain(self->domain);
@@ -881,8 +878,7 @@ err:
 
 static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
 {
-    int     ret;
-    uint8_t lac;
+    int ret;
 
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
@@ -911,21 +907,17 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     ucs_mpool_cleanup(&self->tx.desc_pool, 1);
     ucs_mpool_cleanup(&self->tx.op_pool, 1);
 
-    /* Close RMA PTEs in reverse order. */
-    for (lac = UCT_CXI_MAX_LACS; lac-- > 0; ) {
-        if (self->rma.pte_map[lac] != NULL) {
-            ret = cxil_unmap_pte(self->rma.pte_map[lac]);
-            if (ret != 0) {
-                ucs_warn("cxi cxil_unmap_pte lac %u failed: %s",
-                         (unsigned)lac, strerror(-ret));
-            }
+    /* Close the RMA PTE (implicitly drops every LAC's catch-all LE on it). */
+    if (self->rma.pte_map != NULL) {
+        ret = cxil_unmap_pte(self->rma.pte_map);
+        if (ret != 0) {
+            ucs_warn("cxi cxil_unmap_pte rma failed: %s", strerror(-ret));
         }
-        if (self->rma.pte[lac] != NULL) {
-            ret = cxil_destroy_pte(self->rma.pte[lac]);
-            if (ret != 0) {
-                ucs_warn("cxi cxil_destroy_pte lac %u failed: %s",
-                         (unsigned)lac, strerror(-ret));
-            }
+    }
+    if (self->rma.pte != NULL) {
+        ret = cxil_destroy_pte(self->rma.pte);
+        if (ret != 0) {
+            ucs_warn("cxi cxil_destroy_pte rma failed: %s", strerror(-ret));
         }
     }
 
@@ -1101,20 +1093,14 @@ uct_cxi_iface_pte_recover(uct_cxi_iface_t *iface, struct cxil_pte *pte,
 }
 
 /*
- * uct_cxi_iface_recover_ptes — check every locally-owned PTE (AM + each open
- * RMA LAC — bounded by UCT_CXI_MAX_LACS+1, not connection count) and recover
- * any found DISABLED.  Called once the EQ has been drained enough
+ * uct_cxi_iface_recover_ptes — check every locally-owned PTE (AM, RMA) and
+ * recover any found DISABLED.  Called once the EQ has been drained enough
  * (eq_need_to_drain reaching 0), not per-drop.
  */
 static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
 {
-    unsigned lac;
-
     uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
-    for (lac = 0; lac < iface->rma.lac_count; lac++) {
-        uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
-                                  &iface->rma.fc[lac]);
-    }
+    uct_cxi_iface_pte_recover(iface, iface->rma.pte, &iface->rma.fc);
 }
 
 /*
@@ -1311,18 +1297,11 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                     (event->tgt_long.ptlte_index == iface->am.pte->ptn)) {
                     uct_cxi_iface_pte_recover(iface, iface->am.pte,
                                               &iface->am.fc);
-                } else {
-                    unsigned lac;
-                    for (lac = 0; lac < iface->rma.lac_count; lac++) {
-                        if ((iface->rma.pte[lac] != NULL) &&
-                            (event->tgt_long.ptlte_index ==
-                                    iface->rma.pte[lac]->ptn)) {
-                            uct_cxi_iface_pte_recover(iface,
-                                                      iface->rma.pte[lac],
-                                                      &iface->rma.fc[lac]);
-                            break;
-                        }
-                    }
+                } else if ((iface->rma.pte != NULL) &&
+                          (event->tgt_long.ptlte_index ==
+                                  iface->rma.pte->ptn)) {
+                    uct_cxi_iface_pte_recover(iface, iface->rma.pte,
+                                              &iface->rma.fc);
                 }
             }
         } else if (event->hdr.event_type == C_EVENT_UNLINK) {

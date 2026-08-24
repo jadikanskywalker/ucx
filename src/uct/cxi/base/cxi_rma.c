@@ -7,10 +7,14 @@
  * Restricted-mode DMA model
  * ─────────────────────────
  * Both PUT and GET use c_full_dma_cmd with restricted=1.  The NIC routes the
- * command to the remote peer's RMA portal at pid_offset = rkey->lac via the
- * precomputed DFA.  The remote portal's catch-all LE (posted at iface_open
- * for LAC 0, lazily for LACs 1-7) tells the NIC which IOMMU context (AC) to
- * use for the remote memory access.
+ * command to the remote peer's single RMA/AMO portal at pid_offset =
+ * UCT_CXI_PTE_RMA via ep->dfa_rma (built once at ep_create, shared by every
+ * LAC — routing is LAC-independent, see cxi_iface.h). remote_offset is
+ * already a resolved IOVA (rkey->iova + remote_addr, where rkey->iova came
+ * from the target's own cxil_map() at registration), so the target NIC DMAs
+ * straight to it; no LAC-based translation happens on the receive path.
+ * rkey->lac only matters locally, for cmd.lac on an operation touching a
+ * local buffer (e.g. GET's local landing buffer).
  *
  * PUT short: data is inline in the IDC command — no local mem_reg needed, no DMA.
  *   c_idc_hdr carries no user_ptr, so a c_cstate_cmd is emitted first.
@@ -20,17 +24,6 @@
  *
  * PUT zcopy: NIC DMA from app's registered IOVA.  Completion: C_EVENT_ACK.
  * GET zcopy: NIC reads remote memory → local registered buffer.  Completion: C_EVENT_REPLY.
- *
- * DFA lazy construction
- * ─────────────────────
- * ep->dfa_rma[lac] is built on first use of that LAC (bit lac of
- * ep->dfa_rma_valid).  For the default build (UCT_CXI_MAX_LACS = 1) LAC 0
- * is always pre-built at ep_create so the lazy branch is dead code.
- *
- * Per-LAC PTE lazy open
- * ─────────────────────
- * iface->rma.pte[0] is opened at iface_init.  For UCT_CXI_MAX_LACS = 8,
- * PTEs 1-7 are opened by uct_cxi_rma_ensure_lac() on first use.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -113,12 +106,12 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
+        cmd.index_ext          = ep->dfa_rma_idx_ext;
         cmd.lac                = iface->tx.get_short_mh.cxi_md->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
+        cmd.dfa                = ep->dfa_rma;
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = iface->tx.get_short_mh.iova_offset +
                                  (uint64_t)(uintptr_t)iface->tx.get_short_buf;
@@ -208,7 +201,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
         struct c_cstate_cmd cstate = {};
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
-        cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
+        cstate.index_ext           = ep->dfa_rma_idx_ext;
         cstate.eq                  = iface->evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)op;
 
@@ -222,7 +215,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
 
     {
         struct c_idc_put_cmd idc = {};
-        idc.idc_header.dfa           = ep->dfa_rma[rkey_p->lac];
+        idc.idc_header.dfa           = ep->dfa_rma;
         idc.idc_header.remote_offset = rkey_p->iova + remote_addr;
 
         ret = cxi_cq_emit_idc_put(iface->tx.cmdq, &idc, buffer, (size_t)length);
@@ -326,12 +319,12 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_PUT;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
+        cmd.index_ext          = ep->dfa_rma_idx_ext;
         cmd.lac                = desc->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
+        cmd.dfa                = ep->dfa_rma;
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = desc->iova;
         cmd.request_len        = (uint32_t)length;
@@ -403,12 +396,12 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
+        cmd.index_ext          = ep->dfa_rma_idx_ext;
         cmd.lac                = desc->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
+        cmd.dfa                = ep->dfa_rma;
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = desc->iova;
         cmd.request_len        = (uint32_t)length;
@@ -469,12 +462,12 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_PUT;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
+        cmd.index_ext          = ep->dfa_rma_idx_ext;
         cmd.lac                = local_mh->cxi_md->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
+        cmd.dfa                = ep->dfa_rma;
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = local_mh->iova_offset +
                                  (uint64_t)(uintptr_t)iov[0].buffer;
@@ -538,12 +531,12 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
+        cmd.index_ext          = ep->dfa_rma_idx_ext;
         cmd.lac                = local_mh->cxi_md->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
+        cmd.dfa                = ep->dfa_rma;
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = local_mh->iova_offset +
                                  (uint64_t)(uintptr_t)iov[0].buffer;

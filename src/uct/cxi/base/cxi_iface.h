@@ -44,28 +44,33 @@
 
 
 /*
- * Number of Logical Address Contexts (LACs) supported per iface.
+ * C_NUM_LACS: hardware limit on Logical Address Contexts (LACs) per iface
+ * (cass_atu.c validates registrations against this bound). A registration's
+ * LAC is assigned by the driver at cxil_map() time based on its own
+ * allocation policy (e.g. device/dmabuf-backed memory does not necessarily
+ * land in LAC 0 the way host pages do) -- not something UCX chooses.
  *
- * Default (1): only LAC 0 is used; standard 4 KiB-page registrations always
- * land in LAC 0.  Build with --enable-huge-pages (sets UCT_CXI_ENABLE_HUGE_PAGES)
- * to support LACs 1-7 for huge-page registrations.
- *
- * This is a compile-time constant because it controls array sizes in
- * uct_cxi_iface_t and uct_cxi_ep_t; a runtime flag would not shrink them.
+ * LAC only affects local address translation (mem_reg, and cmd.lac for an
+ * operation's own local buffer); PTE routing (nid/pid/pid_offset -> DFA) is
+ * LAC-independent (verified against the driver: cass_pt.c, PTE/routing
+ * logic, never references LAC). So one RMA/AMO PTE serves every LAC. What
+ * isn't confirmed from source (List Processing Engine matching is
+ * implemented in NIC hardware, not software) is whether a catch-all List
+ * Entry's own .lac field gates matching for restricted-mode ops -- so
+ * uct_cxi_iface_open_rma_pte() posts one catch-all LE per LAC value
+ * (0..UCT_CXI_MAX_LACS-1) on that single PTE, covering every LAC the driver
+ * could ever hand out regardless of whether that turns out to be necessary.
  *
  * Portal table entry (PTE) pid_offset assignment:
- *   pid_offsets 0 .. UCT_CXI_MAX_LACS-1  → RMA/AMO, one per LAC
- *   pid_offset  UCT_CXI_MAX_LACS          → Tag-matching (Phase 7)
- *   pid_offset  UCT_CXI_MAX_LACS + 1      → Active messages (Phase 6)
+ *   pid_offset  UCT_CXI_PTE_RMA   → RMA/AMO (one PTE, all LACs)
+ *   pid_offset  UCT_CXI_PTE_TAG   → Tag-matching (Phase 7)
+ *   pid_offset  UCT_CXI_PTE_AM    → Active messages (Phase 6)
  */
-#ifdef UCT_CXI_ENABLE_HUGE_PAGES
-#  define UCT_CXI_MAX_LACS   8
-#else
-#  define UCT_CXI_MAX_LACS   1
-#endif
-#define UCT_CXI_PTE_TAG    UCT_CXI_MAX_LACS
-#define UCT_CXI_PTE_AM    (UCT_CXI_MAX_LACS + 1)
-#define UCT_CXI_PTE_COUNT (UCT_CXI_MAX_LACS + 2)
+#define UCT_CXI_MAX_LACS   8
+#define UCT_CXI_PTE_RMA    0
+#define UCT_CXI_PTE_TAG    1
+#define UCT_CXI_PTE_AM     2
+#define UCT_CXI_PTE_COUNT  3
 
 
 /**
@@ -79,8 +84,8 @@ typedef struct uct_cxi_device_addr {
 /**
  * Per-iface address.
  *
- * Advertises only the PID.  Per-operation pid_offsets (0..UCT_CXI_MAX_LACS-1
- * for RMA, UCT_CXI_PTE_TAG for tag, UCT_CXI_PTE_AM for AM) are protocol
+ * Advertises only the PID.  Per-operation pid_offsets (UCT_CXI_PTE_RMA for
+ * RMA/AMO, UCT_CXI_PTE_TAG for tag, UCT_CXI_PTE_AM for AM) are protocol
  * constants; the initiator adds them when building the DFA so iface_addr
  * stays compact.
  */
@@ -184,12 +189,11 @@ typedef struct uct_cxi_iface {
     unsigned   eq_flap_limit;    /**< Resolved from config at iface_open */
     ucs_time_t eq_flap_window;   /**< Resolved from config at iface_open */
 
-    /* ── RMA/AMO portals (restricted, pid_offset = LAC index) ───────── */
+    /* ── RMA/AMO portal (restricted, pid_offset = UCT_CXI_PTE_RMA) ──── */
     struct {
-        struct cxil_pte     *pte[UCT_CXI_MAX_LACS];     /**< NULL until LAC used */
-        struct cxil_pte_map *pte_map[UCT_CXI_MAX_LACS];
-        uint8_t              lac_count;                   /**< # of open RMA PTEs */
-        uct_cxi_pte_fc_t      fc[UCT_CXI_MAX_LACS];       /**< Per-LAC recovery state */
+        struct cxil_pte     *pte;      /**< Single PTE for all LACs */
+        struct cxil_pte_map *pte_map;
+        uct_cxi_pte_fc_t      fc;      /**< Recovery state for rma.pte */
     } rma;
 
     /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) — Phase 7 */
