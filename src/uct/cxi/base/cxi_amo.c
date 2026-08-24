@@ -100,7 +100,7 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         struct c_cstate_cmd cstate = {};
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
-        cstate.index_ext           = ep->dfa_rma_idx_ext;
+        cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)op;
 
@@ -113,7 +113,7 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
 
     {
         struct c_idc_amo_cmd amo = {};
-        amo.idc_header.dfa           = ep->dfa_rma;
+        amo.idc_header.dfa           = ep->dfa_rma[rkey_p->lac];
         amo.idc_header.remote_offset = rkey_p->iova + remote_addr;
         amo.atomic_op                = uct_cxi_amo_op_table[opcode];
         amo.atomic_type              = amo_type;
@@ -189,7 +189,7 @@ uct_cxi_ep_atomic_fetch_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
         cstate.write_lac           = desc->lac;
-        cstate.index_ext           = ep->dfa_rma_idx_ext;
+        cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)desc;
 
@@ -202,7 +202,7 @@ uct_cxi_ep_atomic_fetch_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
 
     {
         struct c_idc_amo_cmd amo = {};
-        amo.idc_header.dfa           = ep->dfa_rma;
+        amo.idc_header.dfa           = ep->dfa_rma[rkey_p->lac];
         amo.idc_header.remote_offset = rkey_p->iova + remote_addr;
         amo.atomic_op                = uct_cxi_amo_op_table[opcode];
         amo.atomic_type              = amo_type;
@@ -287,7 +287,7 @@ uct_cxi_ep_atomic_cswap_common(uct_ep_h tl_ep, uint64_t compare,
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
         cstate.write_lac           = desc->lac;
-        cstate.index_ext           = ep->dfa_rma_idx_ext;
+        cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)desc;
 
@@ -300,7 +300,7 @@ uct_cxi_ep_atomic_cswap_common(uct_ep_h tl_ep, uint64_t compare,
 
     {
         struct c_idc_amo_cmd amo = {};
-        amo.idc_header.dfa           = ep->dfa_rma;
+        amo.idc_header.dfa           = ep->dfa_rma[rkey_p->lac];
         amo.idc_header.remote_offset = rkey_p->iova + remote_addr;
         amo.atomic_op                = C_AMO_OP_CSWAP;
         amo.atomic_type              = amo_type;

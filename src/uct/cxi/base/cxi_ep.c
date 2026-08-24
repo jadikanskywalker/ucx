@@ -6,8 +6,9 @@
  *
  * RMA operations (ep_put_zcopy, ep_get_zcopy) live in cxi_rma.c.
  *
- * ep_create builds one DFA for RMA/AMO (pid_offset = UCT_CXI_PTE_RMA) that
- * every LAC shares -- routing is LAC-independent (see cxi_iface.h).
+ * ep_create precomputes dfa_rma[0] for LAC 0 and marks it valid.  Additional
+ * LAC DFAs (1-7, only when built with --enable-huge-pages) are built lazily
+ * in cxi_rma.c on first use of that LAC in an rkey.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -47,7 +48,8 @@ uct_cxi_ep_md(uct_cxi_ep_t *ep)
  * uct_cxi_ep_create — allocate and connect an EP to a remote iface.
  *
  * Reads device_addr (nid) and iface_addr (pid) from params, stores them in
- * the EP, and precomputes the single RMA/AMO DFA (shared by every LAC).
+ * the EP, and precomputes dfa_rma[0] for LAC 0.  Additional LAC DFAs are
+ * built lazily in cxi_rma.c on first use.
  */
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
 {
@@ -79,12 +81,17 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->fc_blocked_until = 0;
     ucs_arbiter_group_init(&ep->arb_group);
 
-    /* Build both DFAs at creation time so the hot path needs no check.
-     * RMA/AMO DFA: pid_offset = UCT_CXI_PTE_RMA (one PTE, all LACs).
-     * AM DFA:      pid_offset = UCT_CXI_PTE_AM (fixed protocol constant). */
-    cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
-                  (uint32_t)UCT_CXI_PTE_RMA,
-                  &ep->dfa_rma, &ep->dfa_rma_idx_ext);
+    /* Build all DFAs at creation time so the hot path needs no check.
+     * RMA DFAs: pid_offset = lac index (one per LAC).
+     * AM DFA:   pid_offset = UCT_CXI_PTE_AM (fixed protocol constant). */
+    {
+        uint8_t lac;
+        for (lac = 0; lac < UCT_CXI_MAX_LACS; lac++) {
+            cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
+                          (uint32_t)lac,
+                          &ep->dfa_rma[lac], &ep->dfa_rma_idx_ext[lac]);
+        }
+    }
     cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
                   (uint32_t)UCT_CXI_PTE_AM, &ep->dfa_am, &ep->dfa_am_idx_ext);
 

@@ -137,9 +137,9 @@ UCS_TEST_P(test_cxi_iface, get_device_address)
  *       cxil_alloc_domain is called).
  *
  * The pid is the only field in uct_cxi_iface_addr_t; per-operation
- * pid_offsets (UCT_CXI_PTE_RMA for RMA/AMO, UCT_CXI_PTE_TAG for tag,
- * UCT_CXI_PTE_AM for AM) are protocol constants added by the initiator when
- * building the DFA, so they are not exchanged in the iface address.
+ * pid_offsets (0 for RMA/LAC-0, UCT_CXI_PTE_TAG for tag, UCT_CXI_PTE_AM
+ * for AM) are protocol constants added by the initiator when building the
+ * DFA, so they are not exchanged in the iface address.
  */
 UCS_TEST_P(test_cxi_iface, get_address)
 {
