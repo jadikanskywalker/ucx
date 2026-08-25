@@ -437,7 +437,7 @@ ucs_status_t uct_cxi_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
     md_attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_HOST) |
                                 UCS_BIT(UCS_MEMORY_TYPE_CUDA) |
                                 UCS_BIT(UCS_MEMORY_TYPE_ROCM);
-    md_attr->access_mem_types = md_attr->reg_mem_types;
+    md_attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     md_attr->cache_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     md_attr->detect_mem_types = 0;
     md_attr->dmabuf_mem_types = 0; /* consumer only, never a dmabuf producer */
