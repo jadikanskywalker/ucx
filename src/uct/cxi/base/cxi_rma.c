@@ -19,6 +19,12 @@
  * per LAC — see cxi_iface.c) carries exactly one catch-all LE with an
  * unambiguous .lac, so there's nothing for the target to disambiguate.
  *
+ * UCT_CXI_MAX_LACS is currently 1 (LAC 0 only — see cxi_iface.h), so in
+ * practice there's exactly one RMA PTE and rkey->lac is always 0;
+ * uct_cxi_md_mem_reg() rejects any registration that lands elsewhere. The
+ * per-LAC structure above still describes the actual mechanism, just
+ * degenerate at N=1 for now.
+ *
  * PUT short: data is inline in the IDC command — no local mem_reg needed, no DMA.
  *   c_idc_hdr carries no user_ptr, so a c_cstate_cmd is emitted first.
  *   The cstate carries user_ptr, eq, index_ext, and restricted; the NIC pairs

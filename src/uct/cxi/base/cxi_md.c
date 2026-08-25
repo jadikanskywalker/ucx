@@ -566,6 +566,25 @@ void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh)
     }
 }
 
+/*
+ * uct_cxi_check_lac — reject a registration that landed on any LAC other
+ * than 0.  See UCT_CXI_MAX_LACS in cxi_iface.h: only LAC 0 is supported
+ * (non-dmabuf GPU registration and huge-page host registration, the only
+ * two paths that can produce a different LAC, are both unsupported).  On
+ * rejection, unmaps mh so the caller only needs to free/release it.
+ */
+static ucs_status_t uct_cxi_check_lac(uct_cxi_mem_handle_t *mh)
+{
+    if (mh->cxi_md->lac != 0) {
+        ucs_error("cxi registration landed on lac %u; only lac 0 is "
+                  "supported (non-dmabuf GPU registration and huge-page "
+                  "host registration are not)", (unsigned)mh->cxi_md->lac);
+        uct_cxi_do_unmap(mh);
+        return UCS_ERR_UNSUPPORTED;
+    }
+    return UCS_OK;
+}
+
 /* Direct (non-cached) path: allocate a handle, call cxil_map. */
 static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
                                        size_t length,
@@ -593,6 +612,12 @@ static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
 
     status = uct_cxi_do_map(md->cxi_lni, address, length, dmabuf_fd,
                             dmabuf_offset, mem_type, mh);
+    if (status != UCS_OK) {
+        ucs_free(mh);
+        return status;
+    }
+
+    status = uct_cxi_check_lac(mh);
     if (status != UCS_OK) {
         ucs_free(mh);
         return status;
@@ -646,6 +671,7 @@ uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
     ucs_memory_type_t mem_type     = UCS_MEMORY_TYPE_HOST;
     int                dmabuf_fd    = UCT_DMABUF_FD_INVALID;
     size_t             dmabuf_offset = 0;
+    ucs_status_t       status;
 
     if (reg_arg != NULL) {
         mem_type = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, mem_type,
@@ -664,10 +690,15 @@ uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
         }
     }
 
-    return uct_cxi_do_map(md->cxi_lni,
-                          (void *)rregion->super.start,
-                          rregion->super.end - rregion->super.start,
-                          dmabuf_fd, dmabuf_offset, mem_type, &region->memh);
+    status = uct_cxi_do_map(md->cxi_lni,
+                            (void *)rregion->super.start,
+                            rregion->super.end - rregion->super.start,
+                            dmabuf_fd, dmabuf_offset, mem_type, &region->memh);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    return uct_cxi_check_lac(&region->memh);
 }
 
 /*
@@ -889,6 +920,18 @@ static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
 
     ucs_debug("cxi ATS scalable map iova 0x%"PRIx64" lac %u",
               (uint64_t)md->ats_md->iova, (unsigned)md->ats_md->lac);
+
+    /* Only lac 0 is supported (see UCT_CXI_MAX_LACS in cxi_iface.h). ATS's
+     * lac is a single value fixed for the md's whole lifetime, so this is
+     * checked once here rather than per mem_reg call. */
+    if (md->ats_md->lac != 0) {
+        ucs_error("cxi ATS scalable map landed on lac %u; only lac 0 is "
+                  "supported", (unsigned)md->ats_md->lac);
+        cxil_unmap(md->ats_md);
+        md->ats_md = NULL;
+        return UCS_ERR_UNSUPPORTED;
+    }
+
     return UCS_OK;
 }
 
