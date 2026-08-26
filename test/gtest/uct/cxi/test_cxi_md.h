@@ -34,6 +34,16 @@ protected:
     uint16_t env_vni() const;
 
     /*
+     * Re-implementation of uct_cxi_find_svc_by_membership()'s selection
+     * logic (cxi_md.c) for cross-checking the kernel-side service-
+     * membership fallback path independently of the production code under
+     * test.  Returns the chosen service ID and fills *vni_out (0 if the
+     * service does not restrict VNIs), or -1 if no usable service is
+     * found for this process's uid/gid.
+     */
+    int membership_svc_id(struct cxil_dev *dev, uint16_t *vni_out) const;
+
+    /*
      * Convenience wrapper for uct_md_mem_dereg_v2 so that rcache tests
      * can release references without repeating the params boilerplate.
      */

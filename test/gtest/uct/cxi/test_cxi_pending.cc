@@ -324,8 +324,18 @@ UCS_TEST_P(test_cxi_pending, pending_purged_on_ep_destroy)
     ASSERT_UCS_OK(uct_ep_pending_add(ep, &ctx.req, 0));
 
     /* Destroying the entity's EP must purge ctx.req via
-     * uct_cxi_ep_pending_purge_warn_cb (a warning, not a crash/leak). */
-    sender().destroy_ep(0);
+     * uct_cxi_ep_pending_purge_warn_cb -- a deliberate warning (not a
+     * crash/leak), so wrap (not hide) it and assert exactly one fired.
+     * wrap_warns_logger returns UCS_LOG_FUNC_RC_STOP, consuming the
+     * message into m_warnings and preventing it from ever reaching
+     * whatever increments the num_warnings() counter -- m_warnings.size()
+     * is the correct check here (see test_ucp_worker.cc's
+     * check_leak_warnings for the same pattern), not num_warnings(). */
+    {
+        scoped_log_handler wrap_warn(wrap_warns_logger);
+        sender().destroy_ep(0);
+        EXPECT_EQ(1u, m_warnings.size());
+    }
 
     uct_rkey_release(GetParam()->component, &rkey_bundle);
     dereg(receiver(), target_memh);
