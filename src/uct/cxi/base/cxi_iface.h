@@ -47,9 +47,22 @@
 /*
  * Number of Logical Address Contexts (LACs) supported per iface.
  *
- * Default (1): only LAC 0 is used; standard 4 KiB-page registrations always
- * land in LAC 0.  Build with --enable-huge-pages (sets UCT_CXI_ENABLE_HUGE_PAGES)
- * to support LACs 1-7 for huge-page registrations.
+ * Deliberately fixed at 1 (LAC 0 only) -- not a hardware limit (the NIC
+ * supports up to C_NUM_LACS = 8). Only two registration paths can ever
+ * produce a driver-assigned LAC != 0: non-dmabuf/raw-P2P GPU memory
+ * registration, and huge-page host registration. Both are unsupported;
+ * uct_cxi_md_mem_reg() rejects any registration whose LAC isn't 0 with
+ * UCS_ERR_UNSUPPORTED, so this is never violated in practice. The
+ * supported GPU path (dmabuf-backed, via cuda_copy) always lands on LAC 0.
+ *
+ * Supporting LAC != 0 is possible but nontrivial: a restricted op's wire
+ * packet carries no LAC field at all (verified: cassini_user_defs.h's
+ * struct c_port_restricted_hdr has only opcode/index_ext/remote_offset/
+ * request_len), so routing would need one PTE per LAC, opened lazily
+ * (eagerly opening a PTE for a LAC before any registration under it
+ * exists was tried and produced C_RC_INVALID_AC). See the
+ * project_cxi_multi_lac_lazy_pte_deferred memory for the full design if
+ * this scope needs to expand again.
  *
  * This is a compile-time constant because it controls array sizes in
  * uct_cxi_iface_t and uct_cxi_ep_t; a runtime flag would not shrink them.
@@ -59,11 +72,7 @@
  *   pid_offset  UCT_CXI_MAX_LACS          → Tag-matching (Phase 7)
  *   pid_offset  UCT_CXI_MAX_LACS + 1      → Active messages (Phase 6)
  */
-#ifdef UCT_CXI_ENABLE_HUGE_PAGES
-#  define UCT_CXI_MAX_LACS   8
-#else
-#  define UCT_CXI_MAX_LACS   1
-#endif
+#define UCT_CXI_MAX_LACS   1
 #define UCT_CXI_PTE_TAG    UCT_CXI_MAX_LACS
 #define UCT_CXI_PTE_AM    (UCT_CXI_MAX_LACS + 1)
 #define UCT_CXI_PTE_COUNT (UCT_CXI_MAX_LACS + 2)
@@ -252,9 +261,9 @@ typedef struct uct_cxi_iface {
 
     /* ── RMA/AMO portals (restricted, pid_offset = LAC index) ───────── */
     struct {
-        struct cxil_pte     *pte[UCT_CXI_MAX_LACS];     /**< NULL until LAC used */
+        struct cxil_pte     *pte[UCT_CXI_MAX_LACS];     /**< One PTE per LAC, all opened eagerly at iface_open */
         struct cxil_pte_map *pte_map[UCT_CXI_MAX_LACS];
-        uint8_t              lac_count;                   /**< # of open RMA PTEs */
+        uint8_t              lac_count;                   /**< # of open RMA PTEs (== UCT_CXI_MAX_LACS once iface_open succeeds) */
         uct_cxi_pte_fc_t      fc[UCT_CXI_MAX_LACS];       /**< Per-LAC recovery state */
     } rma;
 

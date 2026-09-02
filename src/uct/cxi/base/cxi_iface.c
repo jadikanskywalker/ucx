@@ -9,10 +9,12 @@
  *
  * Resource groups (allocated in order, destroyed in reverse):
  *   wait_obj → eq_buf → eq_md → evtq → tx.cp → tx.cmdq → tgt.cmdq →
- *   domain → rma.pte[0] / rma.pte_map[0] (+ LE) → tx.op_pool
+ *   domain → rma.pte[0..UCT_CXI_MAX_LACS-1] (+ one LE each) → tx.op_pool
  *
- * Additional rma.pte[1..UCT_CXI_MAX_LACS-1] are opened lazily by
- * uct_cxi_rma_ensure_lac() in cxi_rma.c on first use of each LAC.
+ * All UCT_CXI_MAX_LACS RMA PTEs are opened eagerly here, not lazily on
+ * first use of a LAC -- ep_create builds every ep->dfa_rma[lac] up front
+ * (see cxi_ep.c) so the hot path never needs an "is this LAC's PTE open
+ * yet?" check.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -525,7 +527,9 @@ static uct_iface_internal_ops_t uct_cxi_iface_internal_ops = {
     .iface_is_reachable_v2  = uct_cxi_iface_is_reachable_v2,
     .ep_is_connected        = (uct_ep_is_connected_func_t)ucs_empty_function_return_zero_int,
     .ep_get_device_ep       = (uct_ep_get_device_ep_func_t)ucs_empty_function_return_unsupported,
-    .ep_put_sgl_zcopy       = (uct_ep_put_sgl_zcopy_func_t)ucs_empty_function_return_unsupported
+    .ep_put_sgl_zcopy       = (uct_ep_put_sgl_zcopy_func_t)ucs_empty_function_return_unsupported,
+    .ep_get_sgl_zcopy       = (uct_ep_get_sgl_zcopy_func_t)ucs_empty_function_return_unsupported,
+    .ep_outstanding_purge   = (uct_ep_outstanding_purge_func_t)ucs_empty_function_return_unsupported
 };
 
 ucs_status_t uct_cxi_query_devices(uct_md_h md,
@@ -843,6 +847,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     status = uct_cxi_do_map(lni, self->tx.get_short_buf, C_MAX_IDC_PAYLOAD_RES,
+                            UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
                             &self->tx.get_short_mh);
     if (status != UCS_OK) {
         goto err_free_get_short_buf;
@@ -869,6 +874,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
             goto err_am_rx_bufs;
         }
         status = uct_cxi_do_map(lni, self->am.rx_base, total,
+                                UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
                                 &self->am.rx_mh);
         if (status != UCS_OK) {
             ucs_free(self->am.rx_base);

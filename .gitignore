@@ -110,6 +110,7 @@ test/apps/uct_info/uct_info
 test/apps/uct_info/uct_info_static
 test/apps/uct_info/ucp_hello_world_static
 test/apps/test_cuda_get_symbol_address
+test/apps/test_ucx_dlopen_isolation
 cmake/*.cmake
 *.gcno
 *.gcda
@@ -122,3 +123,8 @@ bindings/go/go.sum
 
 # Allow Gitlab CI config file (otherwise matched by build-* ignore above)
 !.ci/pipeline/*_matrix.yaml
+
+# UCX perftest sweep output (bench/scripts/sweep_perftest.sh) -- generated
+# per-run benchmark logs and manifests, not checked in.
+bench/out/*
+!bench/out/.gitkeep

@@ -2,12 +2,17 @@
  * CXI memory-domain unit tests.
  * Modeled after test/gtest/uct/ib/test_ib_md.cc.
  *
- * Hardware guard: uct_cxi_query_md_resources() returns an empty list when
- * SLINGSHOT_SVC_IDS is not set (single-node job or non-Slingshot system).
- * enum_mds("cxi") therefore returns an empty vector, and
- * INSTANTIATE_TEST_SUITE_P produces zero instances — tests are silently
- * skipped without any explicit UCS_TEST_SKIP_R call.  This mirrors the
- * IB transport's guard on HAVE_IB device presence.
+ * Hardware guard: uct_cxi_query_md_resources() unconditionally enumerates
+ * every physical CXI device via cxil_get_device_list() — it returns an
+ * empty list only when no CXI devices are present at all (non-Slingshot
+ * system), which is when enum_mds("cxi") is empty and
+ * INSTANTIATE_TEST_SUITE_P produces zero instances, silently skipping
+ * these tests without any explicit UCS_TEST_SKIP_R call.  Credential
+ * resolution (SLINGSHOT_SVC_IDS/SLINGSHOT_VNIS env vars, falling back to
+ * kernel-side service-membership discovery when they're absent — see
+ * uct_cxi_get_rgroup_vni in cxi_md.c) happens later, per-device, at
+ * md_open time — a device is present in enum_mds("cxi") either way, and
+ * only fails md_open if neither credential path finds a usable service.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -25,6 +30,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 
 /* -------------------------------------------------------------------------
@@ -93,6 +99,83 @@ uint16_t test_cxi_md::env_vni() const
     return vni;
 }
 
+/*
+ * Independent re-derivation of uct_cxi_find_svc_by_membership()'s
+ * priority-selection logic (cxi_md.c:212-296): UID match, then GID match,
+ * then unrestricted, walking the service list back-to-front and locking
+ * in the first (highest-index) match per category.  Deliberately
+ * duplicated rather than exposing the production function purely for
+ * testing (same tradeoff env_svc_id()/env_vni() above already carry for
+ * the env-var path) -- needs manual sync if the production logic changes.
+ */
+int test_cxi_md::membership_svc_id(struct cxil_dev *dev,
+                                   uint16_t *vni_out) const
+{
+    struct cxil_svc_list *svc_list;
+    struct cxi_svc_desc  *desc;
+    uid_t                 uid = geteuid();
+    gid_t                 gid = getegid();
+    int                   found_uid = -1;
+    int                   found_gid = -1;
+    int                   found_unrestricted = -1;
+    int                   i, j;
+
+    if (cxil_get_svc_list(dev, &svc_list) != 0) {
+        return -1;
+    }
+
+    for (i = (int)svc_list->count - 1; i >= 0; i--) {
+        desc = svc_list->descs + i;
+
+        if (!desc->enable || desc->is_system_svc) {
+            continue;
+        }
+
+        if (!desc->restricted_members) {
+            if (found_unrestricted == -1) {
+                found_unrestricted = i;
+            }
+            continue;
+        }
+
+        for (j = 0; j < CXI_SVC_MAX_MEMBERS; j++) {
+            if ((desc->members[j].type == CXI_SVC_MEMBER_UID) &&
+                (desc->members[j].svc_member.uid == uid) &&
+                (found_uid == -1)) {
+                found_uid = i;
+            } else if ((desc->members[j].type == CXI_SVC_MEMBER_GID) &&
+                       (desc->members[j].svc_member.gid == gid) &&
+                       (found_gid == -1)) {
+                found_gid = i;
+            }
+        }
+    }
+
+    if (found_uid != -1) {
+        i = found_uid;
+    } else if (found_gid != -1) {
+        i = found_gid;
+    } else if (found_unrestricted != -1) {
+        i = found_unrestricted;
+    } else {
+        cxil_free_svc_list(svc_list);
+        return -1;
+    }
+
+    desc = svc_list->descs + i;
+
+    if (desc->restricted_vnis && (desc->num_vld_vnis > 0)) {
+        *vni_out = (uint16_t)desc->vnis[0];
+    } else {
+        *vni_out = 0;
+    }
+
+    i = (int)desc->svc_id;
+
+    cxil_free_svc_list(svc_list);
+    return i;
+}
+
 ucs_status_t test_cxi_md::dereg_mem(uct_mem_h memh)
 {
     uct_md_mem_dereg_params_t params;
@@ -135,6 +218,10 @@ UCS_TEST_P(test_cxi_md, device_info)
  * Verify that the svc_id and VNI recorded in the MD match the values the
  * SLURM Slingshot plugin injected into SLINGSHOT_SVC_IDS and SLINGSHOT_VNIS.
  * Also checks that the LNI was assigned a non-zero ID by the kernel.
+ *
+ * Only covers the env-var credential path; skips (not fails) when the
+ * launcher doesn't set those vars -- that's the other valid path, covered
+ * by lni_credentials_membership_fallback below.
  */
 UCS_TEST_P(test_cxi_md, lni_credentials)
 {
@@ -142,14 +229,63 @@ UCS_TEST_P(test_cxi_md, lni_credentials)
     int                 exp_svc = env_svc_id(m.device.dev_id);
     uint16_t            exp_vni = env_vni();
 
-    ASSERT_GE(exp_svc, 0) << "SLINGSHOT_SVC_IDS missing or too short";
-    ASSERT_NE(0, exp_vni) << "SLINGSHOT_VNIS missing or zero";
+    if (exp_svc < 0) {
+        UCS_TEST_SKIP_R("SLINGSHOT_SVC_IDS missing or too short");
+    }
+    if (exp_vni == 0) {
+        UCS_TEST_SKIP_R("SLINGSHOT_VNIS missing or zero");
+    }
 
     EXPECT_EQ((uint32_t)exp_svc, m.svc_id);
     EXPECT_EQ(exp_vni,           m.vni);
 
     /* A successfully allocated LNI always has a non-zero kernel-assigned ID. */
     EXPECT_NE(0u, m.cxi_lni->id);
+}
+
+/*
+ * Verify the kernel-side service-membership fallback path
+ * (uct_cxi_find_svc_by_membership, used when SLINGSHOT_SVC_IDS/
+ * SLINGSHOT_VNIS aren't set) independently of the ambient launcher's env.
+ *
+ * scoped_setenv always *sets* a value; "" parses to zero tokens in
+ * env_svc_id()/env_vni() (and in the production uct_cxi_get_svc_id/
+ * uct_cxi_get_vni, which use the same strtok-on-empty-string behavior),
+ * which is indistinguishable from unset -- this forces
+ * uct_cxi_get_rgroup_vni's fallback branch deterministically without
+ * needing to save/restore via unsetenv.
+ */
+UCS_TEST_P(test_cxi_md, lni_credentials_membership_fallback)
+{
+    ucs::scoped_setenv no_svc("SLINGSHOT_SVC_IDS", "");
+    ucs::scoped_setenv no_vni("SLINGSHOT_VNIS", "");
+
+    ucs::handle<uct_md_h> fallback_md;
+    {
+        /* uct_cxi_get_svc_id() legitimately warns ("SLINGSHOT_SVC_IDS has
+         * no entry for device index N") when the var is set but empty --
+         * an expected side effect of forcing the fallback path this way,
+         * not a bug; suppress it so it doesn't fail the test. */
+        scoped_log_handler hide_warn(hide_warns_logger);
+        UCS_TEST_CREATE_HANDLE(uct_md_h, fallback_md, uct_md_close,
+                               uct_md_open, GetParam().component,
+                               GetParam().md_name.c_str(), m_md_config);
+    }
+
+    const uct_cxi_md_t &m = *ucs_derived_of((uct_md_h)fallback_md,
+                                            uct_cxi_md_t);
+    EXPECT_NE(0u, m.cxi_lni->id);
+
+    /* Cross-check against an independent re-implementation of the same
+     * UID > GID > unrestricted priority selection uct_cxi_find_svc_by_membership
+     * uses, rather than just checking md_open didn't crash. */
+    uint16_t expected_vni;
+    int      expected_svc = membership_svc_id(m.cxi_dev, &expected_vni);
+
+    ASSERT_GE(expected_svc, 0) << "no matching/unrestricted service available "
+                                  "for this process's uid/gid";
+    EXPECT_EQ((uint32_t)expected_svc, m.svc_id);
+    EXPECT_EQ(expected_vni, m.vni);
 }
 
 /*
