@@ -310,6 +310,7 @@ uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
     le.unrestricted_body_ro  = 1;  /* required companion to manage_local on OVERFLOW LEs */
     le.unrestricted_end_ro   = 1;  /* required companion to manage_local on OVERFLOW LEs */
     le.event_link_disable       = 1;
+    le.event_unlink_disable     = 1;  /* UNLINK notification not needed, last PUT carries auto_unlink */
     le.no_truncate              = 1;  /* reject oversized messages instead of silently truncating */
     le.unexpected_hdr_disable   = 1;  /* don't create per-msg OE in LPE pool; we read directly
                                        * from C_EVENT_PUT and never issue TGT_SEARCH */
@@ -1494,12 +1495,18 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                 len += sizeof(uint64_t);
             }
 
-            // if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-            //     ucs_info("cxi AM LE auto_unlinked buf=%d",
-            //              buf_idx);
-            // }
-
             uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
+
+            if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+                /* This Put exhausted the buffer's remaining space and
+                 * triggered auto-unlink as a side effect (min_free).  EQ
+                 * delivery is ordered, so this is guaranteed to be the
+                 * last Put for this buffer generation — safe to repost
+                 * right here, no separate tracking needed.  (The genuine
+                 * C_EVENT_UNLINK below only fires for explicit/manual
+                 * unlinks, e.g. teardown — it never drives repost.) */
+                uct_cxi_iface_post_am_le(iface, buf_idx, 1);
+            }
 
         } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
             /* Two distinct things produce this event, and ptlte_state alone
@@ -1578,12 +1585,13 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                 }
             }
         } else if (event->hdr.event_type == C_EVENT_UNLINK) {
-            /* LE was auto-unlinked (min_free) or software-unlinked.  Repost
-             * at the tail of the PRIORITY list so the ring keeps rotating. */
-            int u_buf = (int)event->tgt_long.buffer_id;
-            // ucs_info("cxi AM LE C_EVENT_UNLINK buf=%d → reposting",
-            //          u_buf);
-            uct_cxi_iface_post_am_le(iface, u_buf, 1);
+            /* Auto-unlink (min_free) is signaled via auto_unlinked on the
+             * triggering C_EVENT_PUT above, not via this event — that's
+             * where repost happens.  A genuine C_EVENT_UNLINK here means
+             * an explicit/manual unlink (e.g. teardown); nothing to
+             * repost for those. */
+            ucs_debug("cxi AM LE C_EVENT_UNLINK buf=%d (manual)",
+                      (int)event->tgt_long.buffer_id);
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                      "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",
