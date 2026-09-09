@@ -104,6 +104,8 @@ typedef struct uct_cxi_ep {
     uint8_t           dfa_rma_idx_ext[UCT_CXI_MAX_LACS]; /**< Per-LAC idx_ext */
     union c_fab_addr  dfa_am;                             /**< AM DFA (pid_offset=UCT_CXI_PTE_AM) */
     uint8_t           dfa_am_idx_ext;                    /**< AM idx_ext */
+    union c_fab_addr  dfa_tag;                            /**< TAG DFA (pid_offset=UCT_CXI_PTE_TAG) */
+    uint8_t           dfa_tag_idx_ext;                   /**< TAG idx_ext */
     unsigned          outstanding;     /**< In-flight send ops for this EP */
     uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
     ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */

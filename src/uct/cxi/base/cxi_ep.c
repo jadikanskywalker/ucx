@@ -97,6 +97,11 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     }
     cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
                   (uint32_t)UCT_CXI_PTE_AM, &ep->dfa_am, &ep->dfa_am_idx_ext);
+    /* Built unconditionally, same as dfa_am -- pure address arithmetic,
+     * no local resource needed even if this iface's own tag.pte is
+     * disabled (the peer's tag PTE may still be open). */
+    cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
+                  (uint32_t)UCT_CXI_PTE_TAG, &ep->dfa_tag, &ep->dfa_tag_idx_ext);
 
     ucs_debug("cxi ep %p create nid 0x%x pid %u",
               ep, ep->rem_nid, ep->rem_pid);

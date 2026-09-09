@@ -20,7 +20,8 @@ noinst_HEADERS = \
     base/cxi_iface.h \
     base/cxi_rma.h \
     base/cxi_device.h \
-    base/cxi_md.h
+    base/cxi_md.h \
+    base/cxi_tag.h
 
 libuct_cxi_la_SOURCES = \
     base/cxi_am.c \
@@ -29,7 +30,8 @@ libuct_cxi_la_SOURCES = \
     base/cxi_iface.c \
     base/cxi_rma.c \
     base/cxi_device.c \
-    base/cxi_md.c
+    base/cxi_md.c \
+    base/cxi_tag.c
 
 PKG_CONFIG_NAME=cxi
 

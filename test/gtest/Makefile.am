@@ -278,7 +278,8 @@ gtest_SOURCES += \
     uct/cxi/test_cxi_rma.cc \
     uct/cxi/test_cxi_am.cc \
     uct/cxi/test_cxi_amo.cc \
-    uct/cxi/test_cxi_pending.cc
+    uct/cxi/test_cxi_pending.cc \
+    uct/cxi/test_cxi_tag.cc
 gtest_LDADD += \
     $(top_builddir)/src/uct/cxi/libuct_cxi.la \
     $(CXI_LIBS)
@@ -365,6 +366,7 @@ noinst_HEADERS = \
 	uct/cxi/test_cxi_md.h \
 	uct/cxi/test_cxi_am.h \
 	uct/cxi/test_cxi_rma.h \
+	uct/cxi/test_cxi_tag.h \
 	uct/ib/test_rc.h \
 	uct/ib/ud_base.h \
 	uct/ib/test_ib.h \

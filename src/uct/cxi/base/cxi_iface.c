@@ -27,6 +27,7 @@
 #include "cxi_iface.h"
 #include "cxi_md.h"
 #include "cxi_rma.h"
+#include "cxi_tag.h"
 
 #include <uct/base/uct_iface.h>
 #include <ucs/datastruct/mpool.h>
@@ -180,6 +181,44 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      "if AM_MAX_ZCOPY exceeds AM_RX_BUF_SIZE, the buffer size is raised.",
      ucs_offsetof(uct_cxi_iface_config_t, am_max_zcopy),
      UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"TAG_ENABLE", "try",
+     "Enable hardware tag-matching offload when UCP requests it. \"no\"\n"
+     "force-disables it even if requested, falling back to UCX's existing\n"
+     "software tag matching over AM.",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_enable),
+     UCS_CONFIG_TYPE_TERNARY},
+
+    {"TAG_OVERFLOW_NUM_BUFS", "4",
+     "Number of overflow-list buffers rotated for unexpected tagged\n"
+     "messages (no priority LE posted for them yet).",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_num_bufs),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"TAG_OVERFLOW_BUF_SIZE", "512k",
+     "Size of each overflow-list buffer in bytes.\n"
+     "Automatically increased to TAG_EAGER_MAX if that is larger.",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_buf_size),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"TAG_EAGER_MAX", "512k",
+     "Maximum eager tag bcopy/zcopy payload in bytes.  Also sizes the\n"
+     "unexpected-message copy-out pool elements.",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_eager_max),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"TAG_MAX_OUTSTANDING", "512",
+     "Maximum number of simultaneously-posted priority-list receive LEs.\n"
+     "Hard ceiling 65535 (the hardware buffer_id correlation field is\n"
+     "16 bits).",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_max_outstanding),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"TAG_UNEXP_MAX_BUFS", "512",
+     "Maximum number of buffered unexpected tagged messages awaiting\n"
+     "delivery to UCP's software tag matching.",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_unexp_max_bufs),
+     UCS_CONFIG_TYPE_UINT},
 
     {NULL}
 };
@@ -482,14 +521,16 @@ static uct_iface_ops_t uct_cxi_iface_ops = {
     .ep_atomic64_post         = uct_cxi_ep_atomic64_post,
     .ep_atomic32_fetch        = uct_cxi_ep_atomic32_fetch,
     .ep_atomic64_fetch        = uct_cxi_ep_atomic64_fetch,
-    .ep_tag_eager_short       = (uct_ep_tag_eager_short_func_t)ucs_empty_function_return_unsupported,
-    .ep_tag_eager_bcopy       = (uct_ep_tag_eager_bcopy_func_t)ucs_empty_function_return_unsupported,
-    .ep_tag_eager_zcopy       = (uct_ep_tag_eager_zcopy_func_t)ucs_empty_function_return_unsupported,
+    .ep_tag_eager_short       = uct_cxi_ep_tag_eager_short,
+    .ep_tag_eager_bcopy       = uct_cxi_ep_tag_eager_bcopy,
+    .ep_tag_eager_zcopy       = uct_cxi_ep_tag_eager_zcopy,
+    /* RNDV stays unsupported for Phase A -- UCP already falls back to SW
+     * rendezvous over AM when UCT_IFACE_FLAG_TAG_RNDV_ZCOPY is unset. */
     .ep_tag_rndv_zcopy        = (uct_ep_tag_rndv_zcopy_func_t)ucs_empty_function_return_unsupported,
     .ep_tag_rndv_cancel       = (uct_ep_tag_rndv_cancel_func_t)ucs_empty_function_return_unsupported,
     .ep_tag_rndv_request      = (uct_ep_tag_rndv_request_func_t)ucs_empty_function_return_unsupported,
-    .iface_tag_recv_zcopy     = (uct_iface_tag_recv_zcopy_func_t)ucs_empty_function_return_unsupported,
-    .iface_tag_recv_cancel    = (uct_iface_tag_recv_cancel_func_t)ucs_empty_function_return_unsupported,
+    .iface_tag_recv_zcopy     = uct_cxi_iface_tag_recv_zcopy,
+    .iface_tag_recv_cancel    = uct_cxi_iface_tag_recv_cancel,
     .ep_pending_add           = uct_cxi_ep_pending_add,
     .ep_pending_purge         = uct_cxi_ep_pending_purge,
     .ep_flush                 = uct_cxi_ep_flush,
@@ -889,6 +930,16 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err_am_rx_bufs;
     }
 
+    /*
+     * Step 15: hardware tag-matching offload -- a no-op (tag.pte stays
+     * NULL) unless UCP requested it (supplied both HW_TM callbacks) and
+     * UCX_CXI_TAG_ENABLE != no. See cxi_tag.c.
+     */
+    status = uct_cxi_iface_open_tag_pte(self, lni, config, params);
+    if (status != UCS_OK) {
+        goto err_am_pte;
+    }
+
     ucs_info("cxi iface open %p nid 0x%x pid %u ptn %u pid_bits %u "
              "max_lacs %u",
              self, cxi_md->device.nid, self->domain->pid,
@@ -896,6 +947,15 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
              (unsigned)UCT_CXI_MAX_LACS);
     return UCS_OK;
 
+err_am_pte:
+    if (self->am.pte_map != NULL) {
+        cxil_unmap_pte(self->am.pte_map);
+        self->am.pte_map = NULL;
+    }
+    if (self->am.pte != NULL) {
+        cxil_destroy_pte(self->am.pte);
+        self->am.pte = NULL;
+    }
 err_am_rx_bufs:
     if (self->am.rx_base != NULL) {
         uct_cxi_do_unmap(&self->am.rx_mh);
@@ -964,6 +1024,10 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     }
 
     ucs_arbiter_cleanup(&self->tx.arbiter);
+
+    /* Close TAG PTE first (opened after AM, so closed before it). No-op
+     * if HW tag offload was never enabled for this iface. */
+    uct_cxi_iface_close_tag_pte(self);
 
     /* Close AM PTE and rx_buf in reverse allocation order. */
     if (self->am.pte_map != NULL) {
@@ -1104,6 +1168,28 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
     iface_attr->cap.am.align_mtu      = 1;
     iface_attr->cap.am.max_iov        = 1;
 
+    if (iface->tag.enabled) {
+        iface_attr->cap.flags |= UCT_IFACE_FLAG_TAG_EAGER_SHORT |
+                                 UCT_IFACE_FLAG_TAG_EAGER_BCOPY |
+                                 UCT_IFACE_FLAG_TAG_EAGER_ZCOPY;
+
+        iface_attr->cap.tag.recv.min_recv       = 0;
+        iface_attr->cap.tag.recv.max_zcopy      = iface->tag.buf_size;
+        iface_attr->cap.tag.recv.max_iov        = 1; /* no send/recv SG anywhere
+                                                          in this transport */
+        iface_attr->cap.tag.recv.max_outstanding = iface->tag.max_outstanding;
+
+        iface_attr->cap.tag.eager.max_short = C_MAX_IDC_PAYLOAD_UNR; /* no
+                                                 header reservation needed,
+                                                 unlike AM -- see cxi_tag.c */
+        iface_attr->cap.tag.eager.max_bcopy = iface->tag.buf_size;
+        iface_attr->cap.tag.eager.max_zcopy = iface->tag.buf_size;
+        iface_attr->cap.tag.eager.max_iov   = 1;
+
+        /* rndv left zeroed -- Phase A doesn't advertise
+         * UCT_IFACE_FLAG_TAG_RNDV_ZCOPY, so UCP never consults these. */
+    }
+
     iface_attr->device_addr_len       = sizeof(uct_cxi_device_addr_t);
     iface_attr->iface_addr_len        = sizeof(uct_cxi_iface_addr_t);
     iface_attr->ep_addr_len           = 0;
@@ -1187,6 +1273,7 @@ static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
     unsigned lac;
 
     uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
+    uct_cxi_iface_pte_recover(iface, iface->tag.pte, &iface->tag.fc);
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
                                   &iface->rma.fc[lac]);
@@ -1209,6 +1296,10 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
     if ((iface->am.pte != NULL) && (ptlte_index == iface->am.pte->ptn)) {
         *pte_p = iface->am.pte;
         return &iface->am.fc;
+    }
+    if ((iface->tag.pte != NULL) && (ptlte_index == iface->tag.pte->ptn)) {
+        *pte_p = iface->tag.pte;
+        return &iface->tag.fc;
     }
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         if ((iface->rma.pte[lac] != NULL) &&
@@ -1459,6 +1550,17 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                     ucs_mpool_put(op);     /* zcopy / short */
                 }
             }
+        } else if ((event->hdr.event_type == C_EVENT_PUT) &&
+                   (iface->tag.pte != NULL) &&
+                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+            /* Target-side TAG receive.  Both LE populations on this PTE
+             * report C_EVENT_PUT; ptl_list is the discriminator (shared
+             * ptlte_index alone can't tell them apart) -- see cxi_tag.h. */
+            if (event->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) {
+                uct_cxi_iface_tag_handle_ovf_arrival(iface, event);
+            } else {
+                uct_cxi_iface_tag_handle_match(iface, event);
+            }
         } else if (event->hdr.event_type == C_EVENT_PUT) {
             /* Target-side AM receive.  buffer_id identifies which rx_buf the
              * NIC wrote into.  start is the absolute IOVA of the first byte. */
@@ -1584,6 +1686,10 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                     iface->am.fc.exhausted = 0;
                 }
             }
+        } else if ((event->hdr.event_type == C_EVENT_UNLINK) &&
+                   (iface->tag.pte != NULL) &&
+                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+            uct_cxi_iface_tag_handle_unlink(iface, event);
         } else if (event->hdr.event_type == C_EVENT_UNLINK) {
             /* Auto-unlink (min_free) is signaled via auto_unlinked on the
              * triggering C_EVENT_PUT above, not via this event — that's
@@ -1592,6 +1698,13 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
              * repost for those. */
             ucs_debug("cxi AM LE C_EVENT_UNLINK buf=%d (manual)",
                       (int)event->tgt_long.buffer_id);
+        } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
+                   (iface->tag.pte != NULL) &&
+                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+            /* Delayed correlation: this priority LE was posted after the
+             * matching message had already landed in the overflow ring --
+             * same disposition as a direct match, see cxi_tag.c. */
+            uct_cxi_iface_tag_handle_match(iface, event);
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                      "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",

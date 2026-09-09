@@ -132,6 +132,19 @@ typedef struct uct_cxi_iface_config {
     unsigned                  eq_grow_thresh_pct; /**< Fill % that triggers a resize */
     unsigned                  eq_max_len;     /**< Ceiling on eq_num_events growth,
                                               in events (same unit as eq_size)      */
+    ucs_ternary_auto_value_t  tag_enable;     /**< Force-disable HW tag offload
+                                              even if UCP requests it (UCS_NO) --
+                                              falls back to SW tag matching over AM */
+    unsigned                  tag_ovf_num_bufs; /**< # overflow-ring buffers        */
+    size_t                    tag_ovf_buf_size; /**< Size of each overflow buffer   */
+    size_t                    tag_eager_max;    /**< Max eager bcopy/zcopy payload;
+                                              also sizes unexp_pool elements and the
+                                              overflow ring buffers if larger       */
+    unsigned                  tag_max_outstanding; /**< Max simultaneously-posted
+                                              priority LEs (hard ceiling 65535 --
+                                              buffer_id is uint16_t)                */
+    unsigned                  tag_unexp_max_bufs; /**< Cap on the unexpected-message
+                                              copy-out pool                        */
 } uct_cxi_iface_config_t;
 
 
@@ -267,10 +280,51 @@ typedef struct uct_cxi_iface {
         uct_cxi_pte_fc_t      fc[UCT_CXI_MAX_LACS];       /**< Per-LAC recovery state */
     } rma;
 
-    /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) — Phase 7 */
+    /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) ────
+     * Real hardware matching (is_matching=1, genuinely exploited here --
+     * unlike AM's identically-configured but always-wildcarded PTE).
+     * Two independent LE populations share it: on-demand, use_once
+     * priority LEs (one per tag_recv_zcopy() call, ctx[]/free_list[]
+     * below) bound directly to the caller's own registered buffer for
+     * zero-copy direct match, and a genuine Portals4 overflow-list ring
+     * (rx_base/rx_mh below) catching unexpected messages -- see cxi_tag.c
+     * for why this is a real overflow list, unlike the AM ring. */
     struct {
-        struct cxil_pte     *pte;          /**< NULL until tag ops enabled */
+        struct cxil_pte     *pte;          /**< NULL until HW tag offload enabled */
         struct cxil_pte_map *pte_map;
+        int                  enabled;      /**< Opened this run: UCP supplied both
+                                                HW_TM callbacks and TAG_ENABLE!=no */
+
+        /* Unexpected-message delivery, registered once at iface_open. */
+        uct_tag_unexp_eager_cb_t eager_cb;
+        void                     *eager_arg;
+        uct_tag_unexp_rndv_cb_t  rndv_cb;
+        void                     *rndv_arg;
+
+        /* Outstanding priority-LE tracking -- one slot per posted
+         * tag_recv_zcopy() call. buffer_id on the APPEND command is the
+         * only correlation field hardware returns (c_target_cmd has no
+         * user_ptr, unlike c_full_dma_cmd), so it doubles as the slot
+         * index into ctx[]. */
+        uct_tag_context_t  **ctx;          /**< [max_outstanding]; NULL = free */
+        uint16_t             *free_list;   /**< Stack of free slot indices     */
+        unsigned              free_count;  /**< Valid entries in free_list     */
+        unsigned              max_outstanding;
+
+        /* Overflow ring: same shape as am.rx_base/am.rx_mh (contiguous
+         * alloc, one registration, buffer_id-indexed, manage_local), but
+         * real overflow-list semantics (unexpected_hdr_disable=0). Data
+         * is copied out and handed to eager_cb/rndv_cb immediately and
+         * unconditionally -- never retained waiting for a future post. */
+        uint8_t              *rx_base;
+        uct_cxi_mem_handle_t  rx_mh;
+        unsigned              num_bufs;
+        size_t                buf_size;
+
+        ucs_mpool_t           unexp_pool;  /**< Copy-out buffers for unexpected
+                                                messages handed to eager_cb/rndv_cb */
+
+        uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;
 
     /* ── Active-message portal (unrestricted, pid_offset = UCT_CXI_PTE_AM) */
