@@ -14,6 +14,7 @@
 #include <uct/base/uct_md.h>
 #include <uct/api/uct.h>
 #include <ucs/datastruct/arbiter.h>
+#include <ucs/datastruct/list.h>
 #include <ucs/datastruct/mpool.h>
 #include <ucs/time/time.h>
 
@@ -71,11 +72,18 @@
  *   pid_offsets 0 .. UCT_CXI_MAX_LACS-1  → RMA/AMO, one per LAC
  *   pid_offset  UCT_CXI_MAX_LACS          → Tag-matching (Phase 7)
  *   pid_offset  UCT_CXI_MAX_LACS + 1      → Active messages (Phase 6)
+ *
+ * The rendezvous source-exposure PTE (Phase B) is NOT in this scheme --
+ * confirmed on real hardware (every NIC-auto-issued rendezvous Get failed
+ * with C_RC_PTLTE_NOT_FOUND) that its pid_idx is a fixed, hardware/driver-
+ * mandated value (md->cxi_dev->info.rdzv_get_idx), not something software
+ * gets to choose, unlike every PTE above. See uct_cxi_iface_open_rdzv_pte's
+ * own comment (cxi_tag.c) and libfabric's matching use of
+ * iface->dev->info.rdzv_get_idx (cxip_msg_hpc.c:377, cxip_rdzv_pte.c:290).
  */
 #define UCT_CXI_MAX_LACS   1
 #define UCT_CXI_PTE_TAG    UCT_CXI_MAX_LACS
 #define UCT_CXI_PTE_AM    (UCT_CXI_MAX_LACS + 1)
-#define UCT_CXI_PTE_COUNT (UCT_CXI_MAX_LACS + 2)
 
 
 /**
@@ -324,8 +332,52 @@ typedef struct uct_cxi_iface {
         ucs_mpool_t           unexp_pool;  /**< Copy-out buffers for unexpected
                                                 messages handed to eager_cb/rndv_cb */
 
+        /* uct_cxi_rdzv_get_op_t pool for software-issued (get_issued==0)
+         * rendezvous Gets -- see cxi_tag.h. Capped the same as
+         * max_outstanding: can never have more outstanding software Gets
+         * than outstanding priority-LE receives. */
+        ucs_mpool_t           rdzv_get_op_pool;
+
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;
+
+    /* ── Rendezvous source-exposure portal (restricted, pid_offset =
+     * md->cxi_dev->info.rdzv_get_idx -- a fixed hardware-mandated value,
+     * see UCT_CXI_MAX_LACS's own comment above) ──────────────────────
+     * Structurally a second RMA-style PTE (no is_matching, one
+     * persistent whole-LAC-range catch-all LE, address-routed via
+     * remote_offset) -- NOT matching-mode like TAG/AM. Differs from the
+     * RMA PTE only in having events enabled (op_get only, no op_put) and
+     * living on its own PTE so it can't interfere with RMA's own hot
+     * path. LAC 0 only, opened eagerly at iface_open whenever tag
+     * offload is enabled (rendezvous has no meaning without it). See
+     * cxi_tag.c. */
+    struct {
+        struct cxil_pte      *pte;        /**< NULL until HW tag offload enabled */
+        struct cxil_pte_map  *pte_map;
+        int                   enabled;
+
+        /* Outstanding zcopy-exposed sends, one entry per uct_ep_tag_rndv_zcopy()
+         * call not yet completed or cancelled, currently matched back to the
+         * right entry by address (start == the local_addr we ourselves
+         * supplied when exposing it) via linear scan on the arriving
+         * C_EVENT_GET -- see cxi_tag.c. Under investigation: whether
+         * event->tgt_long.rendezvous_id (a dedicated field on every target
+         * event, cassini_user_defs.h:1195, distinct from match_bits) can
+         * replace this with an O(1) lookup -- see next_id below and
+         * uct_cxi_iface_tag_handle_rdzv_get's verification logging. */
+        ucs_list_link_t       outstanding;
+        ucs_mpool_t           op_pool;    /**< uct_cxi_rdzv_op_t pool */
+        uint8_t               next_id;    /**< Rolling counter for
+                                            * uct_cxi_rdzv_op_t::rdzv_id,
+                                            * stamped into the rendezvous
+                                            * Put's own cmd.rendezvous_id --
+                                            * see uct_ep_tag_rndv_zcopy.
+                                            * Temporary: verification-only
+                                            * until confirmed on hardware. */
+
+        uct_cxi_pte_fc_t      fc;         /**< Recovery state for rdzv.pte */
+    } rdzv;
 
     /* ── Active-message portal (unrestricted, pid_offset = UCT_CXI_PTE_AM) */
     struct {
@@ -348,6 +400,35 @@ typedef struct uct_cxi_iface {
     struct cxil_domain   *domain;
 
 } uct_cxi_iface_t;
+
+
+static UCS_F_ALWAYS_INLINE uct_cxi_md_t *
+uct_cxi_iface_md(uct_cxi_iface_t *iface)
+{
+    return ucs_derived_of(iface->super.md, uct_cxi_md_t);
+}
+
+/*
+ * uct_cxi_rc_to_status — map a CXI hardware return code to a ucs_status_t
+ * for completion reporting.
+ *
+ * C_RC_PT_DISABLED maps to UCS_ERR_BUSY rather than a connection/endpoint
+ * failure code: the target PTE is in a known, actively-recovering state
+ * (en_flowctrl), not a broken connection — UCS_ERR_BUSY's "try again"
+ * connotation matches that. Everything else not explicitly handled here
+ * maps to the generic UCS_ERR_IO_ERROR.
+ */
+static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
+{
+    switch (rc) {
+    case C_RC_OK:
+        return UCS_OK;
+    case C_RC_PT_DISABLED:
+        return UCS_ERR_BUSY;
+    default:
+        return UCS_ERR_IO_ERROR;
+    }
+}
 
 
 UCS_CLASS_DECLARE(uct_cxi_iface_t, uct_md_h, uct_worker_h,

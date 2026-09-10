@@ -100,9 +100,9 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
 
     {
         struct c_cstate_cmd cstate    = {};
-        cstate.event_send_disable     = 1; /* fire-and-forget: no events */
+        cstate.event_send_disable     = 1;
         cstate.event_success_disable  = 0;
-        cstate.restricted             = 0; /* unrestricted → AM OVERFLOW LE */
+        cstate.restricted             = 0;
         cstate.index_ext              = ep->dfa_am_idx_ext;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
@@ -189,9 +189,9 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.command.opcode       = C_CMD_PUT;
         cmd.index_ext            = ep->dfa_am_idx_ext;
         cmd.lac                  = desc->lac;
-        cmd.event_send_disable     = 1; /* fire-and-forget: no events */
-        cmd.event_success_disable = 0; /* unrestricted PUT: no ACK; use SEND */
-        cmd.restricted           = 0;  /* unrestricted → AM OVERFLOW LE */
+        cmd.event_send_disable     = 1;
+        cmd.event_success_disable = 0;
+        cmd.restricted           = 0;
         cmd.eq                   = iface->evtq->eqn;
         cmd.dfa                  = ep->dfa_am;
         cmd.match_bits           = (uint64_t)id;

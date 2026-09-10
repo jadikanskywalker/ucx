@@ -45,13 +45,6 @@
 #include <string.h>
 
 
-static UCS_F_ALWAYS_INLINE uct_cxi_md_t *
-uct_cxi_iface_md(uct_cxi_iface_t *iface)
-{
-    return ucs_derived_of(iface->super.md, uct_cxi_md_t);
-}
-
-
 static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"", "", NULL, ucs_offsetof(uct_cxi_iface_config_t, super),
      UCS_CONFIG_TYPE_TABLE(uct_iface_config_table)},
@@ -524,11 +517,15 @@ static uct_iface_ops_t uct_cxi_iface_ops = {
     .ep_tag_eager_short       = uct_cxi_ep_tag_eager_short,
     .ep_tag_eager_bcopy       = uct_cxi_ep_tag_eager_bcopy,
     .ep_tag_eager_zcopy       = uct_cxi_ep_tag_eager_zcopy,
-    /* RNDV stays unsupported for Phase A -- UCP already falls back to SW
-     * rendezvous over AM when UCT_IFACE_FLAG_TAG_RNDV_ZCOPY is unset. */
-    .ep_tag_rndv_zcopy        = (uct_ep_tag_rndv_zcopy_func_t)ucs_empty_function_return_unsupported,
-    .ep_tag_rndv_cancel       = (uct_ep_tag_rndv_cancel_func_t)ucs_empty_function_return_unsupported,
-    .ep_tag_rndv_request      = (uct_ep_tag_rndv_request_func_t)ucs_empty_function_return_unsupported,
+    /* Phase B (direct-match only) -- see the design plan's "Current
+     * increment". ep_tag_rndv_request stays unsupported: making it
+     * correct needs receive-side rndv_cb dispatch, out of scope here;
+     * confirmed safe to defer (ucp_rndv_send_handle_status_from_pending()
+     * turns UCS_ERR_UNSUPPORTED into a clean error completion, not a
+     * hang). */
+    .ep_tag_rndv_zcopy        = uct_cxi_ep_tag_rndv_zcopy,
+    .ep_tag_rndv_cancel       = uct_cxi_ep_tag_rndv_cancel,
+    .ep_tag_rndv_request      = uct_cxi_ep_tag_rndv_request,
     .iface_tag_recv_zcopy     = uct_cxi_iface_tag_recv_zcopy,
     .iface_tag_recv_cancel    = uct_cxi_iface_tag_recv_cancel,
     .ep_pending_add           = uct_cxi_ep_pending_add,
@@ -940,6 +937,18 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err_am_pte;
     }
 
+    /*
+     * Step 16: rendezvous source-exposure PTE -- only meaningful (and
+     * only opened) if tag offload actually enabled above. See cxi_tag.c
+     * and the design plan's Part 1 point 4.
+     */
+    if (self->tag.enabled) {
+        status = uct_cxi_iface_open_rdzv_pte(self, lni);
+        if (status != UCS_OK) {
+            goto err_tag_pte;
+        }
+    }
+
     ucs_info("cxi iface open %p nid 0x%x pid %u ptn %u pid_bits %u "
              "max_lacs %u",
              self, cxi_md->device.nid, self->domain->pid,
@@ -947,6 +956,8 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
              (unsigned)UCT_CXI_MAX_LACS);
     return UCS_OK;
 
+err_tag_pte:
+    uct_cxi_iface_close_tag_pte(self);
 err_am_pte:
     if (self->am.pte_map != NULL) {
         cxil_unmap_pte(self->am.pte_map);
@@ -1025,8 +1036,10 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
 
     ucs_arbiter_cleanup(&self->tx.arbiter);
 
-    /* Close TAG PTE first (opened after AM, so closed before it). No-op
-     * if HW tag offload was never enabled for this iface. */
+    /* Close RDZV PTE first (opened after TAG, so closed before it), then
+     * TAG PTE (opened after AM, so closed before it). Both are no-ops if
+     * HW tag offload was never enabled for this iface. */
+    uct_cxi_iface_close_rdzv_pte(self);
     uct_cxi_iface_close_tag_pte(self);
 
     /* Close AM PTE and rx_buf in reverse allocation order. */
@@ -1186,8 +1199,21 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
         iface_attr->cap.tag.eager.max_zcopy = iface->tag.buf_size;
         iface_attr->cap.tag.eager.max_iov   = 1;
 
-        /* rndv left zeroed -- Phase A doesn't advertise
-         * UCT_IFACE_FLAG_TAG_RNDV_ZCOPY, so UCP never consults these. */
+        /* Phase B (direct-match only) -- see the design plan's "Current
+         * increment". max_hdr must be >= sizeof(ucp_tag_offload_unexp_
+         * rndv_hdr_t) (17 bytes) unconditionally once tag_lane is
+         * selected -- UCP asserts this (ucp_ep.c's ucs_assertv_always on
+         * rndv.max_hdr) regardless of whether the header is ever
+         * meaningfully used. We accept but discard header_length up to
+         * this max -- see uct_cxi_ep_tag_rndv_zcopy's own comment on why
+         * (header only matters for the genuinely-unexpected case, out of
+         * scope this increment). max_zcopy/max_iov bounded by
+         * c_full_dma_cmd's own request_len (uint32_t) and our own
+         * single-iov restriction. */
+        iface_attr->cap.flags              |= UCT_IFACE_FLAG_TAG_RNDV_ZCOPY;
+        iface_attr->cap.tag.rndv.max_hdr    = UCT_CXI_TAG_RNDV_MAX_HDR;
+        iface_attr->cap.tag.rndv.max_zcopy  = UINT32_MAX;
+        iface_attr->cap.tag.rndv.max_iov    = 1;
     }
 
     iface_attr->device_addr_len       = sizeof(uct_cxi_device_addr_t);
@@ -1274,6 +1300,7 @@ static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
 
     uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
     uct_cxi_iface_pte_recover(iface, iface->tag.pte, &iface->tag.fc);
+    uct_cxi_iface_pte_recover(iface, iface->rdzv.pte, &iface->rdzv.fc);
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
                                   &iface->rma.fc[lac]);
@@ -1301,6 +1328,10 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
         *pte_p = iface->tag.pte;
         return &iface->tag.fc;
     }
+    if ((iface->rdzv.pte != NULL) && (ptlte_index == iface->rdzv.pte->ptn)) {
+        *pte_p = iface->rdzv.pte;
+        return &iface->rdzv.fc;
+    }
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         if ((iface->rma.pte[lac] != NULL) &&
             (ptlte_index == iface->rma.pte[lac]->ptn)) {
@@ -1325,27 +1356,6 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
  * ACK, REPLY, and SEND all carry the send_op pointer in init_short.user_ptr.
  */
 
-/*
- * uct_cxi_rc_to_status — map a CXI hardware return code to a ucs_status_t
- * for completion reporting.
- *
- * C_RC_PT_DISABLED maps to UCS_ERR_BUSY rather than a connection/endpoint
- * failure code: the target PTE is in a known, actively-recovering state
- * (en_flowctrl), not a broken connection — UCS_ERR_BUSY's "try again"
- * connotation matches that. Everything else not explicitly handled here
- * maps to the generic UCS_ERR_IO_ERROR.
- */
-static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
-{
-    switch (rc) {
-    case C_RC_OK:
-        return UCS_OK;
-    case C_RC_PT_DISABLED:
-        return UCS_ERR_BUSY;
-    default:
-        return UCS_ERR_IO_ERROR;
-    }
-}
 
 /*
  * uct_cxi_iface_eq_grow_start — begin a preemptive EQ resize.
@@ -1494,13 +1504,33 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
      * UCT_TCP_MAX_EVENTS) rather than draining to empty. */
     while ((n < iface->eq_max_poll) &&
            ((event = cxi_eq_get_event(iface->evtq)) != NULL)) {
-        if (event->hdr.event_type == C_EVENT_ACK  ||
+        if ((event->hdr.event_type == C_EVENT_REPLY) &&
+            event->init_short.rendezvous) {
+            /* NIC-auto-issued (get_issued==1) rendezvous Get completed.
+             * user_ptr here is not a pointer -- it's a bit-packed struct
+             * cxi_rdzv_user_ptr, not something the generic op-based
+             * dispatch below can touch at all -- see
+             * uct_cxi_iface_tag_handle_rdzv_reply's own doc comment
+             * (cxi_tag.c). */
+            uct_cxi_iface_tag_handle_rdzv_reply(iface, event);
+        } else if (event->hdr.event_type == C_EVENT_ACK  ||
             event->hdr.event_type == C_EVENT_REPLY) {
             /* Initiator-side TX completion.
              * ACK   = restricted PUT confirmed by remote (RMA).
-             * REPLY = GET data returned (RMA). */
+             * REPLY = GET data returned (RMA, or a software-issued
+             *         get_issued==0 rendezvous Get -- see below). */
             op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
-            {
+            if (op->ep == NULL) {
+                /* Software-issued rendezvous Get (uct_cxi_rdzv_get_op_t,
+                 * see uct_cxi_iface_issue_rdzv_get in cxi_tag.c) --
+                 * deliberately has no uct_cxi_ep_t (tag receives are
+                 * posted on the iface, not a specific peer), so none of
+                 * the ep-bookkeeping below applies; dispatch straight to
+                 * its handler. No other op type in this transport ever
+                 * has ep==NULL. */
+                ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
+                op->handler(op, status);
+            } else {
                 ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
 
                 if (ucs_unlikely(status != UCS_OK)) {
@@ -1550,16 +1580,37 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                     ucs_mpool_put(op);     /* zcopy / short */
                 }
             }
+        } else if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
+                   (iface->tag.pte != NULL) &&
+                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+            /* Direct-matched rendezvous Put (Phase B) -- always on the
+             * priority list (an unexpected rendezvous arrival stays
+             * C_EVENT_PUT/ptl_list==OVERFLOW, handled by the branch
+             * below). Joins tag_handle_rndv_match's 3-event completion
+             * accounting -- see its doc comment. */
+            uct_cxi_iface_tag_handle_rndv_match(iface, event);
+        } else if ((event->hdr.event_type == C_EVENT_GET) &&
+                   (iface->rdzv.pte != NULL) &&
+                   (event->tgt_long.ptlte_index == iface->rdzv.pte->ptn)) {
+            /* A peer's Get read from our exposed rendezvous catch-all LE
+             * -- the send side of a rendezvous transfer completing. */
+            uct_cxi_iface_tag_handle_rdzv_get(iface, event);
         } else if ((event->hdr.event_type == C_EVENT_PUT) &&
                    (iface->tag.pte != NULL) &&
                    (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
             /* Target-side TAG receive.  Both LE populations on this PTE
              * report C_EVENT_PUT; ptl_list is the discriminator (shared
-             * ptlte_index alone can't tell them apart) -- see cxi_tag.h. */
+             * ptlte_index alone can't tell them apart) -- see cxi_tag.h.
+             * A direct-matched rendezvous Put's eager-attached prefix
+             * also lands here (ptl_list==PRIORITY, event->tgt_long.
+             * rendezvous==1) alongside its own separate C_EVENT_RENDEZVOUS
+             * above -- route by that flag, not just ptl_list. */
             if (event->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) {
                 uct_cxi_iface_tag_handle_ovf_arrival(iface, event);
+            } else if (event->tgt_long.rendezvous) {
+                uct_cxi_iface_tag_handle_rndv_match(iface, event);
             } else {
-                uct_cxi_iface_tag_handle_match(iface, event);
+                uct_cxi_iface_tag_handle_eager_match(iface, event);
             }
         } else if (event->hdr.event_type == C_EVENT_PUT) {
             /* Target-side AM receive.  buffer_id identifies which rx_buf the
@@ -1703,8 +1754,14 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                    (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
             /* Delayed correlation: this priority LE was posted after the
              * matching message had already landed in the overflow ring --
-             * same disposition as a direct match, see cxi_tag.c. */
-            uct_cxi_iface_tag_handle_match(iface, event);
+             * same disposition as a direct match, see cxi_tag.c. Route by
+             * event->tgt_long.rendezvous the same way the direct-match
+             * C_EVENT_PUT branch above does. */
+            if (event->tgt_long.rendezvous) {
+                uct_cxi_iface_tag_handle_rndv_match(iface, event);
+            } else {
+                uct_cxi_iface_tag_handle_eager_match(iface, event);
+            }
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                      "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",

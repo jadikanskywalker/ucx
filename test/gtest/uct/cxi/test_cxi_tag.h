@@ -100,6 +100,33 @@ static void uct_cxi_tag_completed_cb(uct_tag_context_t *self, uct_tag_t stag,
 
 
 /**
+ * Send-side rendezvous completion context -- filled by the completion
+ * callback uct_ep_tag_rndv_zcopy's own `comp` argument fires once the
+ * peer's Get has reliably pulled the data (see uct_ep_tag_rndv_zcopy's own
+ * doc comment in uct.h).
+ */
+struct uct_cxi_rndv_send_ctx {
+    uct_completion_t super;
+    volatile bool     fired;
+};
+
+static inline void uct_cxi_rndv_send_comp_cb(uct_completion_t *self)
+{
+    uct_cxi_rndv_send_ctx *ctx =
+            reinterpret_cast<uct_cxi_rndv_send_ctx *>(self);
+    ctx->fired = true;
+}
+
+static inline void init_rndv_send_ctx(uct_cxi_rndv_send_ctx &ctx)
+{
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.super.func   = uct_cxi_rndv_send_comp_cb;
+    ctx.super.count  = 1;
+    ctx.super.status = UCS_OK;
+}
+
+
+/**
  * test_cxi_tag_base -- two-entity fixture for CXI hardware tag-matching
  * loopback tests. Both entities are opened with real eager_cb/rndv_cb
  * (matching how UCP itself always supplies both -- HW offload is gated
