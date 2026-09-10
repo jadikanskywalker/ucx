@@ -372,15 +372,20 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
 
 
 /*
- * uct_cxi_iface_open_rdzv_pte -- rendezvous source-exposure PTE. Structurally
- * a second RMA-style PTE (restricted/address-routed, no is_matching, one
- * persistent whole-LAC catch-all LE spanning the full address range) --
- * direct template is uct_cxi_iface_open_rma_pte() (cxi_iface.c). Differs
- * from RMA's catch-all LE only in: events enabled (RMA's passive side must
- * never be interrupted; rendezvous needs the local completion signal for
- * uct_ep_tag_rndv_zcopy's own uct_completion_t) and op_get only, no
- * op_put (nothing should ever Put to this PTE). LAC 0 only -- see the
- * design plan's Part 1 scoping. Called only when tag offload is enabled;
+ * uct_cxi_iface_open_rdzv_pte -- rendezvous source-exposure PTE. Matching
+ * mode (is_matching=1), one persistent whole-LAC catch-all LE spanning the
+ * full address range, fully wildcarded (match_bits=0/ignore_bits=~0) --
+ * same shape as libfabric's own DEFAULT rendezvous protocol source PTE
+ * (cxip_rdzv_match_pte_alloc/cxip_rdzv_pte_src_req_alloc, cxip_rdzv_pte.c),
+ * not the restricted/address-routed design this replaced. Matching mode
+ * has nothing to disambiguate here (LAC-0-only) -- it exists purely so the
+ * resulting Get lands on the wire format that actually carries match_bits,
+ * which is how we get O(1) id-based correlation instead of an address
+ * scan; see uct_cxi_rdzv_op_t's own comment in cxi_tag.h for the full
+ * design and why the restricted approach doesn't work. Differs from a
+ * "real" matching PTE like TAG/AM only in being op_get-only, no op_put
+ * (nothing should ever Put to this PTE). LAC 0 only -- see the design
+ * plan's Part 1 scoping. Called only when tag offload is enabled;
  * rendezvous has no meaning without it.
  */
 ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
@@ -390,26 +395,32 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
     const union c_event       *ev;
     ucs_status_t               status;
     int                        ret;
-    ucs_mpool_params_t         mp_params;
+    uint32_t                   i;
 
     memset(&self->rdzv, 0, sizeof(self->rdzv));
-    ucs_list_head_init(&self->rdzv.outstanding);
 
-    ucs_mpool_params_reset(&mp_params);
-    mp_params.elem_size       = sizeof(uct_cxi_rdzv_op_t);
-    mp_params.elems_per_chunk = ucs_max(ucs_min(64u,
-                                                self->tag.max_outstanding),
-                                        1u);
-    mp_params.max_elems       = self->tag.max_outstanding;
-    mp_params.ops             = &uct_cxi_tag_unexp_mpool_ops;
-    mp_params.name            = "cxi-rdzv-op";
-    status = ucs_mpool_init(&mp_params, &self->rdzv.op_pool);
-    if (status != UCS_OK) {
-        return status;
+    self->rdzv.max_outstanding = ucs_min(self->tag.max_outstanding,
+                                         UCT_CXI_RDZV_MAX_OUTSTANDING_MAX);
+    self->rdzv.ops = ucs_calloc(self->rdzv.max_outstanding,
+                               sizeof(*self->rdzv.ops), "cxi-rdzv-ops");
+    if (self->rdzv.ops == NULL) {
+        return UCS_ERR_NO_MEMORY;
     }
+    self->rdzv.free_ids = ucs_malloc(self->rdzv.max_outstanding *
+                                     sizeof(*self->rdzv.free_ids),
+                                     "cxi-rdzv-free-ids");
+    if (self->rdzv.free_ids == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_ops;
+    }
+    for (i = 0; i < self->rdzv.max_outstanding; i++) {
+        self->rdzv.free_ids[i] = i;
+    }
+    self->rdzv.free_count = self->rdzv.max_outstanding;
 
     {
         struct cxi_pt_alloc_opts pt_opts = {
+            .is_matching = 1,
             .en_flowctrl = 1
         };
         ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->rdzv.pte);
@@ -417,7 +428,7 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte RDZV: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
-        goto err_cleanup_op_pool;
+        goto err_free_ids;
     }
 
     /* pid_idx must be the device's own driver-reported rdzv_get_idx, not a
@@ -470,7 +481,11 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         }
     }
 
-    /* Post the persistent whole-LAC catch-all LE, LAC 0 only. */
+    /* Post the persistent whole-LAC catch-all LE, LAC 0 only. Fully
+     * wildcarded (match_bits=0/ignore_bits=~0 -- nothing to disambiguate,
+     * LAC-0-only) and unrestricted-flavored (unrestricted_body_ro/end_ro),
+     * matching libfabric's own DEFAULT catch-all LE exactly
+     * (cxip_rdzv_pte_src_req_alloc, cxip_rdzv_pte.c:78-123). */
     {
         struct c_target_cmd le = {};
         le.command.opcode        = C_CMD_TGT_APPEND;
@@ -478,10 +493,20 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         le.ptlte_index           = self->rdzv.pte->ptn;
         le.op_put                = 0;
         le.op_get                = 1;
+        le.unrestricted_body_ro  = 1;
+        le.unrestricted_end_ro   = 1;
         le.event_link_disable    = 1;
+        le.event_unlink_disable  = 1;
         le.lac                   = 0;
         le.start                 = 0;
         le.length                = (1ULL << 56) - 1;
+        le.match_id              = CXI_MATCH_ID_ANY; /* accept any initiator
+                                   -- zero-init default targets one specific
+                                   (bogus) identity instead, matching
+                                   nothing; every other matching-mode LE in
+                                   this transport (TAG, AM) already sets
+                                   this */
+        le.match_bits            = 0;
         le.ignore_bits           = UINT64_MAX;
 
         ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
@@ -503,8 +528,12 @@ err_unmap_pte:
 err_destroy_pte:
     cxil_destroy_pte(self->rdzv.pte);
     self->rdzv.pte = NULL;
-err_cleanup_op_pool:
-    ucs_mpool_cleanup(&self->rdzv.op_pool, 1);
+err_free_ids:
+    ucs_free(self->rdzv.free_ids);
+    self->rdzv.free_ids = NULL;
+err_free_ops:
+    ucs_free(self->rdzv.ops);
+    self->rdzv.ops = NULL;
     return status;
 }
 
@@ -528,7 +557,10 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self)
             ucs_warn("cxi cxil_destroy_pte RDZV failed: %s", strerror(-ret));
         }
     }
-    ucs_mpool_cleanup(&self->rdzv.op_pool, 1);
+    ucs_free(self->rdzv.free_ids);
+    self->rdzv.free_ids = NULL;
+    ucs_free(self->rdzv.ops);
+    self->rdzv.ops = NULL;
 }
 
 
@@ -661,13 +693,21 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
 
 /*
  * uct_cxi_iface_issue_rdzv_get -- software-issued (get_issued==0) pull for
- * a direct-matched rendezvous receive. Restricted DMA GET, same shape as
- * cxi_rma.c's get_zcopy, targeting the sender's dedicated rendezvous
- * source PTE (at the device's rdzv_get_idx) instead of its RMA PTE. The destination
- * DFA is computed fresh from the event's own initiator field (there is no
- * uct_cxi_ep_t available here -- tag receives are posted on the iface, not
- * a specific peer -- see cxi_dfa_nid/cxi_dfa_pid, the same decode libfabric
- * itself uses on this exact field, cxip_msg_hpc.c:182-184).
+ * a direct-matched rendezvous receive. Unrestricted (matching-mode) DMA
+ * GET -- restricted was tried first and confirmed not to work (see
+ * uct_cxi_rdzv_op_t's doc comment in cxi_tag.h) -- targeting the sender's
+ * dedicated rendezvous source PTE (at the device's rdzv_get_idx) instead
+ * of its RMA PTE. The destination DFA is computed fresh from the event's
+ * own initiator field (there is no uct_cxi_ep_t available here -- tag
+ * receives are posted on the iface, not a specific peer -- see
+ * cxi_dfa_nid/cxi_dfa_pid, the same decode libfabric itself uses on this
+ * exact field, cxip_msg_hpc.c:182-184).
+ *
+ * cmd.match_bits carries the sender's own rendezvous op id straight
+ * through from event->tgt_long.rendezvous_id (populated because our Put
+ * is unrestricted) -- the sender reads it back off its own C_EVENT_GET to
+ * do an O(1) lookup instead of a scan, DEFAULT-protocol style. See
+ * uct_cxi_rdzv_op_t's doc comment in cxi_tag.h for the full design.
  *
  * local_addr skips past the eager-attached prefix already delivered
  * (event->tgt_long.start is the destination buffer's own base address,
@@ -736,12 +776,15 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
         cmd.index_ext          = idx_ext;
         cmd.lac                = 0; /* LAC 0 only -- see design plan scoping */
         cmd.event_send_disable = 1;
-        cmd.restricted         = 1;
+        cmd.restricted         = 0;
         cmd.eq                 = iface->evtq->eqn;
         cmd.dfa                = dfa;
         cmd.remote_offset      = event->tgt_long.remote_offset;
         cmd.local_addr         = local_addr;
         cmd.request_len        = request_len;
+        cmd.match_bits         = event->tgt_long.rendezvous_id; /* the
+                                   sender's own op id -- see this
+                                   function's doc comment */
         cmd.user_ptr           = (uint64_t)(uintptr_t)rop;
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
@@ -1348,7 +1391,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
  * Get) -- both sides of that pull already correctly propagate a failed
  * cxi_event_rc() through to completed_cb, independent of this ACK. So on
  * success this handler must never free the op or touch comp -- it stays
- * alive in iface->rdzv.outstanding.
+ * alive in iface->rdzv.ops[], waiting for that Get.
  *
  * On failure, though, the Put itself never landed -- nothing on the target
  * was ever exposed to a Rendezvous match, so no Get will ever be issued
@@ -1356,23 +1399,24 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
  * normal path. This is the ACK's entire reason for existing (matches
  * libfabric's own rdzv_send_req_complete() on a bad ACK,
  * cxip_msg_hpc.c:4386-4389) -- without handling it here, a dropped/failed
- * rendezvous Put would leave rop in iface->rdzv.outstanding forever,
- * hanging the caller's completion.
+ * rendezvous Put would leave rop's id permanently allocated, hanging the
+ * caller's completion.
  */
 void uct_cxi_rdzv_put_ack_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
-    uct_cxi_rdzv_op_t *rop = (uct_cxi_rdzv_op_t *)op;
+    uct_cxi_rdzv_op_t *rop   = (uct_cxi_rdzv_op_t *)op;
+    uct_cxi_iface_t   *iface = uct_cxi_tag_ep_iface(rop->op.ep);
 
     if (ucs_likely(status == UCS_OK)) {
         return;
     }
 
     ucs_error("cxi TAG rndv Put ACK failed: %s", ucs_status_string(status));
-    ucs_list_del(&rop->list);
+    rop->valid = 0;
+    iface->rdzv.free_ids[iface->rdzv.free_count++] = rop->id;
     if (rop->comp != NULL) {
         uct_invoke_completion(rop->comp, status);
     }
-    ucs_mpool_put(rop);
 }
 
 /*
@@ -1392,14 +1436,19 @@ void uct_cxi_rdzv_put_ack_comp(uct_cxi_send_op_t *op, ucs_status_t status)
  * increment. remote_offset is set to the iov's own address (mirroring
  * libfabric's local_addr==remote_offset pattern, cxip_msg_hpc.c:4565-4572)
  * so the receiver's later Get (software-issued or NIC-auto-issued) can
- * address straight into it -- restricted/address-routed against the
- * dedicated rendezvous PTE, not matching-mode, see
- * Part 1 point 4's correction.
+ * address straight into it, against the dedicated rendezvous PTE -- a
+ * matching PTE (DEFAULT-protocol style), not restricted, see
+ * uct_cxi_rdzv_op_t's own doc comment in cxi_tag.h for why.
  *
- * The returned handle is a uct_cxi_rdzv_op_t*, tracked on
- * iface->rdzv.outstanding until the peer's Get lands (C_EVENT_GET on our
- * own exposed catch-all LE, correlated by address since that LE is
- * shared/persistent -- see cxi_tag.h) and comp fires, or until
+ * cmd.rendezvous_id carries this op's own id (its index in
+ * iface->rdzv.ops[]) to the receiver via its RENDEZVOUS event -- the
+ * receiver stamps it into its own Get's match_bits, which comes back to
+ * us on our own C_EVENT_GET for an O(1) lookup instead of a scan; see
+ * uct_cxi_rdzv_op_t's doc comment for the full round trip.
+ *
+ * The returned handle is a uct_cxi_rdzv_op_t* (&iface->rdzv.ops[id]),
+ * tracked there (rop->valid) until the peer's Get lands
+ * (uct_cxi_iface_tag_handle_rdzv_get) and comp fires, or until
  * uct_ep_tag_rndv_cancel() removes it first.
  */
 ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
@@ -1414,6 +1463,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     uct_cxi_mem_handle_t *memh   = (uct_cxi_mem_handle_t *)iov[0].memh;
     size_t                length = uct_iov_get_length(iov);
     uint64_t              local_addr;
+    uint32_t              id;
     uct_cxi_rdzv_op_t    *rop;
     int                   ret;
 
@@ -1425,10 +1475,11 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
     }
 
-    rop = (uct_cxi_rdzv_op_t *)ucs_mpool_get(&iface->rdzv.op_pool);
-    if (ucs_unlikely(rop == NULL)) {
-        return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
+    if (ucs_unlikely(iface->rdzv.free_count == 0)) {
+        return UCS_STATUS_PTR(UCS_ERR_EXCEEDS_LIMIT);
     }
+    id  = iface->rdzv.free_ids[--iface->rdzv.free_count];
+    rop = &iface->rdzv.ops[id];
 
     local_addr    = memh->iova_offset + (uint64_t)(uintptr_t)iov[0].buffer;
     rop->op.ep      = ep;   /* real ep -- unlike uct_cxi_rdzv_get_op_t, this
@@ -1442,10 +1493,9 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
                              * lands, not from this generic dispatch path */
     rop->op.handler = uct_cxi_rdzv_put_ack_comp;
     rop->comp     = comp;
-    rop->start    = local_addr;
     rop->length   = (uint32_t)length;
-    rop->rdzv_id  = iface->rdzv.next_id++; /* verification-only -- see
-                                             * uct_cxi_rdzv_op_t::rdzv_id */
+    rop->id       = (uint8_t)id;
+    rop->valid    = 1;
 
     {
         struct c_full_dma_cmd cmd  = {};
@@ -1462,17 +1512,17 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.remote_offset           = local_addr;
         cmd.eager_length            = 0;
         cmd.use_offset_for_get      = 1;
-        cmd.rendezvous_id           = rop->rdzv_id; /* verification-only for
-                                            now -- we still correlate the
-                                            later Get by address (below);
-                                            this is cross-checked, not yet
-                                            relied on, see cxi_tag.h */
+        cmd.rendezvous_id           = (uint8_t)id; /* carried to the
+                                            receiver via its RENDEZVOUS
+                                            event -- see this function's
+                                            own doc comment */
         cmd.user_ptr                = (uint64_t)(uintptr_t)&rop->op;
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(rop);
+        rop->valid = 0;
+        iface->rdzv.free_ids[iface->rdzv.free_count++] = id;
         ucs_error("cxi ep %p tag_rndv_zcopy emit failed: %d", ep, ret);
         return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
     }
@@ -1480,9 +1530,9 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
-    ucs_list_add_tail(&iface->rdzv.outstanding, &rop->list);
-    ucs_debug("cxi TAG [RNDV-SEND] ep=%p tag=0x%lx local_addr=0x%lx len=%zu",
-             ep, (unsigned long)tag, (unsigned long)local_addr, length);
+    ucs_debug("cxi TAG [RNDV-SEND] ep=%p tag=0x%lx id=%u local_addr=0x%lx "
+             "len=%zu", ep, (unsigned long)tag, id,
+             (unsigned long)local_addr, length);
     return rop;
 }
 
@@ -1496,64 +1546,58 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
  */
 ucs_status_t uct_cxi_ep_tag_rndv_cancel(uct_ep_h tl_ep, void *op)
 {
-    uct_cxi_rdzv_op_t *rop = (uct_cxi_rdzv_op_t *)op;
+    uct_cxi_ep_t      *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
+    uct_cxi_iface_t   *iface = uct_cxi_tag_ep_iface(ep);
+    uct_cxi_rdzv_op_t *rop   = (uct_cxi_rdzv_op_t *)op;
 
-    ucs_list_del(&rop->list);
-    ucs_mpool_put(rop);
+    rop->valid = 0;
+    iface->rdzv.free_ids[iface->rdzv.free_count++] = rop->id;
     return UCS_OK;
 }
 
 /*
  * uct_cxi_iface_tag_handle_rdzv_get -- C_EVENT_GET on iface->rdzv.pte: a
- * peer's Get read from our exposed catch-all LE. Correlates back to the
- * outstanding uct_ep_tag_rndv_zcopy() call by address (event->tgt_long.start
- * -- the persistent, shared LE carries no per-request correlator, see
- * uct_cxi_rdzv_op_t's own comment in cxi_tag.h) via a linear scan of
- * iface->rdzv.outstanding; low expected concurrency (send pipeline depth)
- * makes this sufficient. Fires comp once found -- the buffer is now safe
- * to reuse, per uct_ep_tag_rndv_zcopy's own doc.
+ * peer's Get read from our exposed catch-all LE. match_bits carries the
+ * op's own id straight back to us (DEFAULT-protocol style -- see
+ * uct_cxi_rdzv_op_t's own doc comment in cxi_tag.h for the full design and
+ * why this works only because the PTE is matching, not restricted), giving
+ * O(1) lookup into iface->rdzv.ops[] instead of a scan. Fires comp once
+ * found -- the buffer is now safe to reuse, per uct_ep_tag_rndv_zcopy's
+ * own doc.
+ *
+ * Only the low 8 bits of match_bits are ours -- confirmed on real hardware
+ * (id values checked bit-for-bit against what was assigned) that Cassini's
+ * own auto-issued Get construction places our id in exactly the bit range
+ * libfabric's own union cxip_match_bits reserves for rdzv_id_lo
+ * (CXIP_RDZV_ID_CMD_WIDTH=8 bits, cxip.h:592,650) -- bits above that carry
+ * something else hardware-internal (observed: consistently forced high,
+ * plausibly rdzv_lac or a protocol marker in the same union's other
+ * bitfields), so the raw value must be masked, not used directly. This
+ * also bounds UCT_CXI_RDZV_MAX_OUTSTANDING_MAX at 256 correctly -- see
+ * cxi_tag.h.
  */
 void uct_cxi_iface_tag_handle_rdzv_get(uct_cxi_iface_t *iface,
                                        const union c_event *event)
 {
+    uint32_t           id = (uint32_t)(event->tgt_long.match_bits & 0xFF);
     uct_cxi_rdzv_op_t *rop;
     ucs_status_t       status;
 
-    ucs_list_for_each(rop, &iface->rdzv.outstanding, list) {
-        if (rop->start == event->tgt_long.start) {
-            ucs_list_del(&rop->list);
-            status = uct_cxi_rc_to_status(cxi_event_rc(event));
-            ucs_debug("cxi TAG [RNDV-GOT] start=0x%lx len=%u rc=%d",
-                     (unsigned long)rop->start, rop->length,
-                     cxi_event_rc(event));
-            /* Verification-only: does event->tgt_long.rendezvous_id (a
-             * dedicated field on every target event, independent of
-             * match_bits, cassini_user_defs.h:1195) echo back the id we
-             * stamped on the original Put -- for BOTH get_issued outcomes?
-             * If so, this could replace the address scan above with an
-             * O(1) lookup. Not yet relied on -- see cxi_tag.h. */
-            if (event->tgt_long.rendezvous_id != rop->rdzv_id) {
-                ucs_warn("cxi TAG [RNDV-ID-CHECK] MISMATCH get_issued=%u "
-                        "event_rdzv_id=%u rop_rdzv_id=%u",
-                        (unsigned)event->tgt_long.get_issued,
-                        (unsigned)event->tgt_long.rendezvous_id,
-                        (unsigned)rop->rdzv_id);
-            } else {
-                ucs_debug("cxi TAG [RNDV-ID-CHECK] match get_issued=%u "
-                         "rdzv_id=%u", (unsigned)event->tgt_long.get_issued,
-                         (unsigned)rop->rdzv_id);
-            }
-            if (rop->comp != NULL) {
-                uct_invoke_completion(rop->comp, status);
-            }
-            ucs_mpool_put(rop);
-            return;
-        }
+    if ((id >= iface->rdzv.max_outstanding) || !iface->rdzv.ops[id].valid) {
+        ucs_debug("cxi TAG [RNDV-GOT-STALE] id=%u -- no matching outstanding "
+                 "rndv_zcopy, already cancelled?", id);
+        return;
     }
 
-    ucs_debug("cxi TAG [RNDV-GOT-STALE] start=0x%lx -- no matching "
-             "outstanding rndv_zcopy, already cancelled?",
-             (unsigned long)event->tgt_long.start);
+    rop        = &iface->rdzv.ops[id];
+    rop->valid = 0;
+    iface->rdzv.free_ids[iface->rdzv.free_count++] = id;
+    status     = uct_cxi_rc_to_status(cxi_event_rc(event));
+    ucs_debug("cxi TAG [RNDV-GOT] id=%u len=%u rc=%d", id, rop->length,
+             cxi_event_rc(event));
+    if (rop->comp != NULL) {
+        uct_invoke_completion(rop->comp, status);
+    }
 }
 
 /*

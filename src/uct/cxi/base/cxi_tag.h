@@ -152,18 +152,48 @@ typedef struct uct_cxi_tag_ctx_priv {
 #define UCT_CXI_RNDV_FLAG_IS_RNDV     UCS_BIT(0)
 #define UCT_CXI_RNDV_FLAG_TRUNCATED   UCS_BIT(4)
 
+/* Hard ceiling on iface->rdzv.max_outstanding: the id has to survive a hop
+ * through the original Put's own cmd.rendezvous_id field (struct
+ * c_full_dma_cmd, cassini_user_defs.h), which is uint8_t. Not a UCX-chosen
+ * limit -- it's the width of the actual hardware field carrying it. */
+#define UCT_CXI_RDZV_MAX_OUTSTANDING_MAX  256u
+
 /*
  * Per-send tracking for an outstanding uct_ep_tag_rndv_zcopy() exposure.
  * The opaque handle UCP holds (returned from rndv_zcopy, passed back to
- * rndv_cancel) *is* this pointer. Our source-side exposure is one
- * persistent, whole-LAC catch-all LE (restricted/address-routed, like the
- * RMA PTE's own catch-all LE -- see cxi_iface.c's uct_cxi_iface_open_rma_pte
- * for the template) -- there is no per-request LE to unlink, and a
- * restricted target event carries no per-request correlator, so an
- * arriving C_EVENT_GET is matched back to the right entry by address
- * (start == the local_addr we ourselves supplied). Low expected
- * concurrency (send pipeline depth) makes a linear-scan list sufficient --
- * see iface->rdzv.outstanding.
+ * rndv_cancel) *is* this pointer -- specifically &iface->rdzv.ops[id], a
+ * plain fixed-size array (not a pool), indexed by the same small dense id
+ * this struct's own `id` field holds.
+ *
+ * Correlation design mirrors libfabric's own DEFAULT rendezvous protocol
+ * (cxip_msg_hpc.c's issue_rdzv_get()/cxip_rdzv_pte_src_cb(), *not* the
+ * ALT_READ variant), traced and confirmed against real hardware this
+ * session -- an address-based linear scan was tried first and worked, but
+ * doesn't scale to high concurrency; a match_bits-embedded id on a
+ * *restricted* Get was tried next and confirmed NOT to work (a restricted
+ * command's actual wire packet, struct c_port_restricted_hdr,
+ * cassini_user_defs.h:2799, has no match_bits field at all -- nothing we
+ * put there can reach the target, regardless of what partial-looking data
+ * seemed to come back). What actually works, matching DEFAULT exactly:
+ *   1. iface->rdzv.pte is a *matching* PTE (is_matching=1) with one
+ *      persistent, fully-wildcarded catch-all LE (match_bits=0,
+ *      ignore_bits=~0) -- we have nothing to disambiguate being LAC-0-only,
+ *      matching mode is used purely to get onto the wire format
+ *      (c_port_unrestricted_hdr) that actually carries match_bits.
+ *   2. This op's `id` (this struct's own index in iface->rdzv.ops[]) is
+ *      stamped into the original Put's cmd.rendezvous_id.
+ *   3. The receiver reads that back off its own RENDEZVOUS event
+ *      (event->tgt_long.rendezvous_id -- populated because our Put is
+ *      unrestricted) and stamps it into its own Get's cmd.match_bits
+ *      (uct_cxi_iface_issue_rdzv_get, cmd.restricted=0 for this same
+ *      reason) -- or, for a NIC-auto-issued Get (get_issued==1), hardware
+ *      does this same propagation itself, the same way libfabric's own
+ *      cxip_rdzv_pte_src_cb() decodes match_bits identically regardless of
+ *      which get_issued outcome produced the event.
+ *   4. That Get's resulting C_EVENT_GET on our own matching LE reports
+ *      match_bits genuinely (unlike the restricted case), letting
+ *      uct_cxi_iface_tag_handle_rdzv_get index straight into
+ *      iface->rdzv.ops[id] -- O(1), no scan.
  *
  * `op` must be first -- same precedent as uct_cxi_rdzv_get_op_t below.
  * Confirmed on real hardware (a segfault, root-caused via gdb) and against
@@ -184,10 +214,9 @@ typedef struct uct_cxi_tag_ctx_priv {
  * their own, independent of this ACK. So on success uct_cxi_rdzv_put_ack_comp
  * must never free this op or fire `comp`. On failure, though, the Put
  * itself never landed -- no Get will ever be issued, so nothing else will
- * ever complete this op -- so the handler does fail it: removes it from
- * iface->rdzv.outstanding, fires `comp` with the error, frees it. Matches
- * libfabric's own rdzv_send_req_complete() on a bad ACK
- * (cxip_msg_hpc.c:4386-4389).
+ * ever complete this op -- so the handler does fail it: returns the id to
+ * iface->rdzv.free_ids[], fires `comp` with the error. Matches libfabric's
+ * own rdzv_send_req_complete() on a bad ACK (cxip_msg_hpc.c:4386-4389).
  */
 typedef struct uct_cxi_rdzv_op {
     uct_cxi_send_op_t op;      /* must be first; op.ep is the real, owning
@@ -200,23 +229,18 @@ typedef struct uct_cxi_rdzv_op {
                                    op.comp unused (this struct's own `comp`
                                    below is the real one), op.handler =
                                    uct_cxi_rdzv_put_ack_comp */
-    ucs_list_link_t   list;
     uct_completion_t *comp;    /* caller's own completion -- normally fired
                                    later from uct_cxi_iface_tag_handle_
                                    rdzv_get once the peer's Get lands; fired
                                    early with an error from
                                    uct_cxi_rdzv_put_ack_comp if the Put
                                    itself failed to land */
-    uint64_t          start;   /* local_addr we exposed; correlates the
-                                   eventual C_EVENT_GET */
     uint32_t          length;
-    uint8_t           rdzv_id; /* Verification-only for now: also stamped
-                                   into the Put's cmd.rendezvous_id, cross-
-                                   checked (not yet relied on) against
-                                   event->tgt_long.rendezvous_id in
-                                   uct_cxi_iface_tag_handle_rdzv_get to test
-                                   whether it can replace the address scan
-                                   above with an O(1) lookup. */
+    uint8_t           id;      /* this op's index in iface->rdzv.ops[] --
+                                   see the correlation design above */
+    uint8_t           valid;   /* 0 once freed (completed or cancelled) --
+                                   guards a stale/duplicate C_EVENT_GET the
+                                   same way the old STALE-drop path did */
 } uct_cxi_rdzv_op_t;
 
 /*
@@ -263,9 +287,11 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self);
  * is enabled (rendezvous has no meaning without it). Mapped at the
  * device's own rdzv_get_idx, not a self-chosen pid_idx -- see
  * uct_cxi_iface_open_rdzv_pte's own comment (cxi_tag.c) for why.
- * Restricted/address-routed, one persistent whole-LAC catch-all LE, same
- * shape as uct_cxi_iface_open_rma_pte()'s catch-all LE but with events
- * enabled. See cxi_tag.c and the design plan's Part 1 point 4.
+ * Matching (DEFAULT-protocol style, like libfabric's own rendezvous
+ * source PTE), one persistent, fully-wildcarded whole-LAC catch-all LE.
+ * See cxi_tag.c and uct_cxi_rdzv_op_t's own doc comment for the full
+ * design and why this replaced an earlier restricted/address-routed
+ * approach.
  */
 ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
                                           struct cxil_lni *lni);

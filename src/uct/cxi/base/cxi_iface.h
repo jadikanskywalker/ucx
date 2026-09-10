@@ -182,6 +182,11 @@ typedef struct uct_cxi_pte_fc {
 } uct_cxi_pte_fc_t;
 
 
+/* Defined in cxi_tag.h (included after this header, via cxi_ep.h); only a
+ * pointer to it is needed here, so a forward declaration avoids a circular
+ * include. */
+struct uct_cxi_rdzv_op;
+
 /**
  * CXI interface instance.
  *
@@ -341,15 +346,19 @@ typedef struct uct_cxi_iface {
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;
 
-    /* ── Rendezvous source-exposure portal (restricted, pid_offset =
+    /* ── Rendezvous source-exposure portal (matching, pid_offset =
      * md->cxi_dev->info.rdzv_get_idx -- a fixed hardware-mandated value,
      * see UCT_CXI_MAX_LACS's own comment above) ──────────────────────
-     * Structurally a second RMA-style PTE (no is_matching, one
-     * persistent whole-LAC-range catch-all LE, address-routed via
-     * remote_offset) -- NOT matching-mode like TAG/AM. Differs from the
-     * RMA PTE only in having events enabled (op_get only, no op_put) and
-     * living on its own PTE so it can't interfere with RMA's own hot
-     * path. LAC 0 only, opened eagerly at iface_open whenever tag
+     * Same shape as libfabric's own DEFAULT rendezvous protocol source
+     * PTE (cxip_rdzv_match_pte_alloc/cxip_rdzv_pte_src_req_alloc,
+     * cxip_rdzv_pte.c): is_matching=1, one persistent whole-LAC-range
+     * catch-all LE (match_bits=0/ignore_bits=~0, fully wildcarded -- we
+     * have nothing to disambiguate at the matching level itself, being
+     * LAC-0-only; matching mode is used here purely to put the resulting
+     * Get on the wire format that actually carries match_bits, see
+     * uct_ep_tag_rndv_zcopy's own comment). Differs from a genuine
+     * matching PTE like TAG/AM only in still being op_get-only, no
+     * op_put. LAC 0 only, opened eagerly at iface_open whenever tag
      * offload is enabled (rendezvous has no meaning without it). See
      * cxi_tag.c. */
     struct {
@@ -357,24 +366,21 @@ typedef struct uct_cxi_iface {
         struct cxil_pte_map  *pte_map;
         int                   enabled;
 
-        /* Outstanding zcopy-exposed sends, one entry per uct_ep_tag_rndv_zcopy()
-         * call not yet completed or cancelled, currently matched back to the
-         * right entry by address (start == the local_addr we ourselves
-         * supplied when exposing it) via linear scan on the arriving
-         * C_EVENT_GET -- see cxi_tag.c. Under investigation: whether
-         * event->tgt_long.rendezvous_id (a dedicated field on every target
-         * event, cassini_user_defs.h:1195, distinct from match_bits) can
-         * replace this with an O(1) lookup -- see next_id below and
-         * uct_cxi_iface_tag_handle_rdzv_get's verification logging. */
-        ucs_list_link_t       outstanding;
-        ucs_mpool_t           op_pool;    /**< uct_cxi_rdzv_op_t pool */
-        uint8_t               next_id;    /**< Rolling counter for
-                                            * uct_cxi_rdzv_op_t::rdzv_id,
-                                            * stamped into the rendezvous
-                                            * Put's own cmd.rendezvous_id --
-                                            * see uct_ep_tag_rndv_zcopy.
-                                            * Temporary: verification-only
-                                            * until confirmed on hardware. */
+        /* Outstanding zcopy-exposed sends, one entry per
+         * uct_ep_tag_rndv_zcopy() call not yet completed or cancelled.
+         * ops[] is a plain fixed-size array (not a pool) indexed by a
+         * small dense id that IS the array index -- the arriving
+         * C_EVENT_GET's own match_bits carries this id back to us
+         * (DEFAULT-protocol style, see uct_ep_tag_rndv_zcopy and
+         * uct_cxi_iface_tag_handle_rdzv_get), giving O(1) lookup instead
+         * of the address-based linear scan this replaced. Capped at
+         * UCT_CXI_RDZV_MAX_OUTSTANDING_MAX (256) -- see cxi_tag.h for
+         * why: the id has to survive a hop through the Put's own 8-bit
+         * cmd.rendezvous_id field first. */
+        struct uct_cxi_rdzv_op *ops;       /**< [max_outstanding] */
+        uint32_t              *free_ids;   /**< Stack of free indices into ops[] */
+        uint32_t               free_count;
+        uint32_t               max_outstanding;
 
         uct_cxi_pte_fc_t      fc;         /**< Recovery state for rdzv.pte */
     } rdzv;
