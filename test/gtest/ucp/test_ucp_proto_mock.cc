@@ -10,10 +10,12 @@ extern "C" {
 #include <ucp/core/ucp_ep.inl>
 #include <ucp/core/ucp_mm.h>
 #include <ucp/core/ucp_types.h>
-#include <ucp/rndv/proto_rndv.h>
-#include <uct/base/uct_iface.h>
+#include <ucp/core/ucp_worker.inl>
+#include <ucp/proto/proto.h>
 #include <ucp/proto/proto_debug.h>
 #include <ucp/proto/proto_select.inl>
+#include <ucp/rndv/proto_rndv.h>
+#include <uct/base/uct_iface.h>
 #include <ucs/memory/numa.h>
 #include <ucs/sys/sys.h>
 #include <ucs/sys/topo/base/topo.h>
@@ -75,24 +77,53 @@ public:
 
     void mock_transport(const std::string &tl_name)
     {
-        uct_component_h component;
-
         /* Currently only one TL can be mocked */
         ucs_assert(nullptr == m_tl);
+
+        m_tl = find_transport(tl_name);
+        if (m_tl != nullptr) {
+            m_mock.setup(&m_tl->query_devices, query_devices_mock);
+            m_mock.setup(&m_tl->iface_open, iface_open_mock);
+            return;
+        }
+
+        FAIL() << "Transport " << tl_name << " not found";
+    }
+
+    static bool is_transport_registered(const std::string &tl_name)
+    {
+        uct_component_h *components;
+        unsigned UCS_V_UNUSED num_components;
+        ucs_status_t status;
+
+        /*
+         * Load/register UCT components and modules, but do not query their
+         * resources. Querying resources would call TL query_devices callbacks.
+         */
+        status = uct_query_components(&components, &num_components);
+        if (status != UCS_OK) {
+            UCS_TEST_ABORT("Failed to query UCT components: "
+                           << ucs_status_string(status));
+        }
+
+        uct_release_component_list(components);
+        return find_transport(tl_name) != nullptr;
+    }
+
+    static uct_tl_t *find_transport(const std::string &tl_name)
+    {
+        uct_component_h component;
 
         ucs_list_for_each(component, &uct_components_list, list) {
             uct_tl_t *tl;
             ucs_list_for_each(tl, &component->tl_list, list) {
                 if (tl_name == tl->name) {
-                    m_mock.setup(&tl->query_devices, query_devices_mock);
-                    m_mock.setup(&tl->iface_open, iface_open_mock);
-                    m_tl = tl;
-                    return;
+                    return tl;
                 }
             }
         }
 
-        FAIL() << "Transport " << tl_name << " not found";
+        return nullptr;
     }
 
     void mock_cuda_ipc_remote_pid(ucp_worker_h worker)
@@ -682,8 +713,7 @@ protected:
 
     ucp_worker_cfg_index_t
     send_recv_rma(size_t size, ucp_operation_id_t op_id,
-                  ucs_memory_type_t mem_type = UCS_MEMORY_TYPE_HOST,
-                  unsigned rkey_cfg_index = 1)
+                  ucs_memory_type_t mem_type = UCS_MEMORY_TYPE_HOST)
     {
         mem_buffer recv_buf(size, mem_type);
         recv_buf.pattern_fill(1);
@@ -717,12 +747,7 @@ protected:
             send_buf.pattern_check(1);
         }
 
-        auto actual_rkey_cfg_index = rkey->cfg_index;
-        if (mem_type == UCS_MEMORY_TYPE_HOST) {
-            EXPECT_EQ(actual_rkey_cfg_index, rkey_cfg_index);
-        }
-
-        return actual_rkey_cfg_index;
+        return rkey->cfg_index;
     }
 };
 
@@ -856,7 +881,8 @@ UCS_TEST_P(test_ucp_proto_mock_rcx, rndv_4_paths,
 UCS_TEST_P(test_ucp_proto_mock_rcx, rma_put_2_lanes,
            "IB_NUM_PATHS?=1", "MAX_RMA_RAILS=2")
 {
-    send_recv_rma(64 * UCS_KBYTE, UCP_OP_ID_PUT);
+    auto rkey_cfg_index = send_recv_rma(64 * UCS_KBYTE,
+                                        UCP_OP_ID_PUT);
 
     ucp_proto_select_key_t key = any_key();
     key.param.op_id_flags      = UCP_OP_ID_PUT;
@@ -865,7 +891,7 @@ UCS_TEST_P(test_ucp_proto_mock_rcx, rma_put_2_lanes,
     check_rkey_config(sender(), {
         {0,    2048, "short",     "rc_mlx5/mock_1:1"},
         {2049, INF,  "zero-copy", "47% on rc_mlx5/mock_1:1 and 53% on rc_mlx5/mock_0:1"},
-    }, key, 0);
+    }, key, rkey_cfg_index);
 }
 
 UCP_INSTANTIATE_TEST_CASE_TLS(test_ucp_proto_mock_rcx, rcx, "rc_x")
@@ -993,6 +1019,10 @@ public:
             iface_attr.latency.m         = 1e-9;
             iface_attr.cap.get.max_zcopy = 16384;
         };
+
+        if (is_transport_registered("rc_gda")) {
+            UCS_TEST_SKIP_R("rc_gda transport is registered");
+        }
 
         setup_numa_topology();
         add_mock_iface_on_sys_device("mock_0:1", m_remote_sys_dev,
@@ -1335,23 +1365,137 @@ public:
     }
 };
 
-UCS_TEST_P(test_ucp_proto_mock_cuda_ipc, put, "IB_NUM_PATHS?=1")
+UCS_TEST_P(test_ucp_proto_mock_cuda_ipc, put, "ZCOPY_THRESH=1")
 {
     test_cuda_rma(UCP_OP_ID_PUT, {
-        {0, 0,   "short",     "rc_mlx5/mock"},
         {1, INF, "zero-copy", "cuda_ipc/cuda"},
     });
 }
 
-UCS_TEST_P(test_ucp_proto_mock_cuda_ipc, get, "IB_NUM_PATHS?=1")
+UCS_TEST_P(test_ucp_proto_mock_cuda_ipc, get, "ZCOPY_THRESH=1")
 {
     test_cuda_rma(UCP_OP_ID_GET, {
-        {0, 0,   "copy-out",  "rc_mlx5/mock"},
         {1, INF, "zero-copy", "cuda_ipc/cuda"},
     });
 }
 
 UCP_INSTANTIATE_TEST_CASE_TLS_GPU_AWARE(test_ucp_proto_mock_cuda_ipc,
+                                        shm_rc_ipc, "rc_x,cuda_ipc,rocm_ipc")
+
+/*
+ * cuda_ipc can copy memory from a different node only if the allocation is
+ * exportable to that node. Force the endpoint to be inter-node and check that
+ * the RTR protocol advertises the cuda_ipc memory domain only for buffers
+ * which have UCS_MEM_FLAG_MEMTYPE_COPY_INTER_NODE.
+ */
+class test_ucp_proto_mock_cuda_ipc_inter_node :
+        public test_ucp_proto_mock_cuda_ipc {
+public:
+    test_ucp_proto_mock_cuda_ipc_inter_node() :
+        m_ep_config(nullptr), m_ep_config_flags(0)
+    {
+    }
+
+    virtual void init() override
+    {
+        test_ucp_proto_mock_cuda_ipc::init();
+
+        m_ep_config       = ucp_ep_config(sender().ep());
+        m_ep_config_flags = m_ep_config->key.flags;
+        m_ep_config->key.flags &= ~(UCP_EP_CONFIG_KEY_FLAG_SELF |
+                                    UCP_EP_CONFIG_KEY_FLAG_INTRA_NODE);
+    }
+
+    virtual void cleanup() override
+    {
+        if (m_ep_config != nullptr) {
+            m_ep_config->key.flags = m_ep_config_flags;
+        }
+
+        test_ucp_proto_mock_cuda_ipc::cleanup();
+    }
+
+protected:
+    /* Return the memory domain index of the cuda_ipc lane, or
+     * UCP_NULL_RESOURCE if no such lane was selected. */
+    ucp_md_index_t cuda_ipc_md_index()
+    {
+        ucp_context_h context = sender().ucph();
+
+        for (auto lane = 0; lane < m_ep_config->key.num_lanes; ++lane) {
+            const ucp_rsc_index_t rsc_index =
+                    m_ep_config->key.lanes[lane].rsc_index;
+            if ((rsc_index != UCP_NULL_RESOURCE) &&
+                (std::string(context->tl_rscs[rsc_index].tl_rsc.tl_name) ==
+                 "cuda_ipc")) {
+                return context->tl_rscs[rsc_index].md_index;
+            }
+        }
+
+        return UCP_NULL_RESOURCE;
+    }
+
+    /* Return the memory domains which rndv/rtr would pack into the RTR message
+     * for a CUDA receive buffer with the given memory flags. */
+    ucp_md_map_t rtr_md_map(uint8_t mem_flags)
+    {
+        ucp_memory_info_t mem_info = {UCS_MEMORY_TYPE_CUDA,
+                                      UCS_SYS_DEVICE_ID_UNKNOWN, mem_flags};
+        ucp_proto_select_init_protocols_t *proto_init;
+        ucp_proto_select_param_t select_param;
+        ucp_proto_select_elem_t *select_elem;
+        ucp_proto_init_elem_t *proto;
+
+        ucp_proto_select_param_init(&select_param, UCP_OP_ID_RNDV_RECV, 0, 0,
+                                    UCP_DATATYPE_CONTIG, &mem_info, 1);
+
+        select_elem = ucp_proto_select_lookup_slow(sender().worker(),
+                                                   &m_ep_config->proto_select,
+                                                   1,
+                                                   ep_config_index(sender()),
+                                                   UCP_WORKER_CFG_INDEX_NULL,
+                                                   &select_param);
+        if (select_elem == nullptr) {
+            ADD_FAILURE() << "rendezvous receive protocols were not selected";
+            return 0;
+        }
+
+        proto_init = &select_elem->proto_init;
+        ucs_array_for_each(proto, &proto_init->protocols) {
+            if (std::string(ucp_proto_id_field(proto->proto_id, name)) !=
+                "rndv/rtr") {
+                continue;
+            }
+
+            auto rpriv = reinterpret_cast<const ucp_proto_rndv_ctrl_priv_t*>(
+                    &ucs_array_elem(&proto_init->priv_buf,
+                                    proto->priv_offset));
+            return rpriv->md_map;
+        }
+
+        ADD_FAILURE() << "rndv/rtr protocol was not initialized";
+        return 0;
+    }
+
+private:
+    ucp_ep_config_t *m_ep_config;
+    unsigned        m_ep_config_flags;
+};
+
+UCS_TEST_P(test_ucp_proto_mock_cuda_ipc_inter_node, rtr_md_map,
+           "IB_NUM_PATHS?=1")
+{
+    const ucp_md_index_t md_index = cuda_ipc_md_index();
+
+    ASSERT_NE(UCP_NULL_RESOURCE, md_index) << "no cuda_ipc lane";
+
+    EXPECT_FALSE(rtr_md_map(UCS_MEM_FLAG_REGISTRABLE) & UCS_BIT(md_index));
+    EXPECT_TRUE(rtr_md_map(UCS_MEM_FLAG_REGISTRABLE |
+                           UCS_MEM_FLAG_MEMTYPE_COPY_INTER_NODE) &
+                UCS_BIT(md_index));
+}
+
+UCP_INSTANTIATE_TEST_CASE_TLS_GPU_AWARE(test_ucp_proto_mock_cuda_ipc_inter_node,
                                         shm_rc_ipc, "rc_x,cuda_ipc,rocm_ipc")
 
 class test_ucp_proto_mock_rcx_twins : public test_ucp_proto_mock {
@@ -2390,8 +2534,8 @@ UCS_TEST_P(test_ucp_proto_mock_rcx_speed_change, rma_put,
            "IB_NUM_PATHS?=1", "MAX_RMA_RAILS=2", "ZCOPY_THRESH=0")
 {
     test_port_speed([this](unsigned rkey_cfg_index) {
-        send_recv_rma(64 * UCS_KBYTE, UCP_OP_ID_PUT, UCS_MEMORY_TYPE_HOST,
-                      rkey_cfg_index);
+        EXPECT_EQ(send_recv_rma(64 * UCS_KBYTE, UCP_OP_ID_PUT),
+                  rkey_cfg_index);
     }, UCP_OP_ID_PUT);
 }
 
@@ -2399,8 +2543,8 @@ UCS_TEST_P(test_ucp_proto_mock_rcx_speed_change, rma_get,
            "IB_NUM_PATHS?=1", "MAX_RMA_RAILS=2", "ZCOPY_THRESH=0")
 {
     test_port_speed([this](unsigned rkey_cfg_index) {
-        send_recv_rma(64 * UCS_KBYTE, UCP_OP_ID_GET, UCS_MEMORY_TYPE_HOST,
-                      rkey_cfg_index);
+        EXPECT_EQ(send_recv_rma(64 * UCS_KBYTE, UCP_OP_ID_GET),
+                  rkey_cfg_index);
     }, UCP_OP_ID_GET);
 }
 
