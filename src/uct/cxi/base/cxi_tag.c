@@ -582,31 +582,38 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                           const union c_event *event)
 {
     int                  buf_idx  = (int)event->tgt_long.buffer_id;
-#if 1
-    /* IN PROGRESS -- current, deliberate interim behavior, not a bug or a
-     * leftover experiment: drop every unexpected arrival entirely (no
-     * copy, no eager_cb/rndv_cb, no SEARCH_AND_DELETE), pending a decision
-     * on whether unexpected messages should ever be handed off to UCP at
-     * all vs. resolved entirely by the NIC (see the design plan's
-     * "Part 2/3" discussion -- explicitly undecided, not a blocker for
-     * the rendezvous work this increment is building). This trades away
-     * UCP's software tag-matching fallback for unexpected messages in
-     * exchange for zero risk of the Part-2 force-cancel race. The
-     * previous, known-racy-but-functional implementation (copy out,
-     * SEARCH_AND_DELETE, unconditional eager_cb) is kept below in #else
-     * for easy revert once that decision is made -- do not delete it.
-     * auto_unlinked repost stays unconditional since we never read the
-     * data here, so there's no reuse-before-read race to guard against. */
-    ucs_debug("cxi TAG [OVF-ARRIVAL-IGNORED] buf_idx=%d tag=0x%lx "
-             "mlength=%u -- unexpected-message handling not yet decided, "
-             "dropping", buf_idx, (unsigned long)event->tgt_long.match_bits,
-             (unsigned)event->tgt_long.mlength);
 
-    if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-        uct_cxi_iface_post_tag_ovf_le(iface, buf_idx, 1);
+    /* An unexpected *rendezvous* arrival (event->tgt_long.rendezvous==1)
+     * is explicitly out of scope for this increment -- see the design
+     * plan's "Part 2/3" discussion -- and stays on the drop path
+     * unconditionally: its eager-attached prefix is always 0 bytes
+     * (eager_length=0 on every rendezvous Put this transport sends, see
+     * uct_ep_tag_rndv_zcopy), so routing it through the eager_cb path
+     * below would silently report a 0-byte message to UCP instead of the
+     * real transfer -- worse than dropping it. Plain unexpected eager
+     * arrivals (rendezvous==0) go through the real path below, restored
+     * from the interim ignore-stub: without ever calling eager_cb here,
+     * worker->tm.offload.thresh can never leave SIZE_MAX (it's only set
+     * from inside ucp_tag_offload_iface_activate(), itself only reachable
+     * from an unexpected-arrival callback), so UCP can never activate
+     * hardware tag offload for *any* message, confirmed on real hardware
+     * as a permanent hang (the very first unexpected arrival in any
+     * exchange -- typical send-before-recv-posted ping-pong startup --
+     * was silently eaten, and UCP's software tag-matching waited forever
+     * for a message that had already arrived and been discarded). */
+    if (event->tgt_long.rendezvous) {
+        ucs_debug("cxi TAG [OVF-ARRIVAL-IGNORED] buf_idx=%d tag=0x%lx "
+                 "mlength=%u -- unexpected rendezvous arrival, out of "
+                 "scope for this increment, dropping", buf_idx,
+                 (unsigned long)event->tgt_long.match_bits,
+                 (unsigned)event->tgt_long.mlength);
+
+        if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+            uct_cxi_iface_post_tag_ovf_le(iface, buf_idx, 1);
+        }
+        return;
     }
-    return;
-#else
+    {
     uint8_t             *buf_va   = iface->tag.rx_base +
                                     (size_t)buf_idx * iface->tag.buf_size;
     uint64_t             buf_iova = iface->tag.rx_mh.iova_offset +
@@ -688,7 +695,7 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
          * last one for this buffer generation -- see file header. */
         uct_cxi_iface_post_tag_ovf_le(iface, buf_idx, 1);
     }
-#endif
+    }
 }
 
 /*
@@ -860,21 +867,34 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
  * trivially. inline_data is always NULL: this is the true zero-copy case,
  * data already sits in the caller's own registered buffer. Never called
  * for a rendezvous-flagged event -- see iface_progress()'s own dispatch.
+ *
+ * Checks priv->cancel_force before touching any callback -- see the design
+ * plan's Part 2 addendum. A force-cancel (tag_recv_cancel(force=1)) does
+ * not free our slot itself (only tag_handle_unlink()/this function do, on
+ * whichever event arrives first); it only sets the flag and lets the race
+ * play out. Per the UCT contract (uct.h), force=1 means UCP already
+ * treated the cancel as successful and may have freed/recycled the
+ * ucp_request_t ctx lives in by the time this event arrives -- so if the
+ * flag is set, the slot must still be reclaimed (the LE is consumed
+ * either way), but ctx's callbacks must never be touched again.
  */
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event)
 {
-    int                 slot;
-    uct_tag_context_t *ctx = uct_cxi_iface_tag_match_lookup(iface, event,
-                                                            &slot);
-    uint64_t            stag;
-    uint64_t            imm;
-    uint32_t            mlength;
-    ucs_status_t        status;
+    int                      slot;
+    uct_tag_context_t      *ctx = uct_cxi_iface_tag_match_lookup(iface, event,
+                                                                 &slot);
+    uct_cxi_tag_ctx_priv_t *priv;
+    uint64_t                 stag;
+    uint64_t                 imm;
+    uint32_t                 mlength;
+    ucs_status_t             status;
 
     if (ctx == NULL) {
         return;
     }
+
+    priv = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
 
     ucs_debug("cxi TAG [%s] slot=%d tag=0x%lx mlength=%u",
              (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) ?
@@ -882,14 +902,20 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
              slot, (unsigned long)event->tgt_long.match_bits,
              (unsigned)event->tgt_long.mlength);
 
+    iface->tag.ctx[slot] = NULL;
+    iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+
+    if (ucs_unlikely(priv->cancel_force)) {
+        ucs_debug("cxi TAG [MATCH-RACED-CANCEL] slot=%d -- force-cancelled, "
+                 "dropping match silently", slot);
+        return;
+    }
+
     stag    = event->tgt_long.match_bits;
     imm     = event->tgt_long.header_data;
     mlength = event->tgt_long.mlength;
     status  = (event->tgt_long.rlength > mlength) ? UCS_ERR_MESSAGE_TRUNCATED :
                                                     UCS_OK;
-
-    iface->tag.ctx[slot] = NULL;
-    iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
 
     ctx->tag_consumed_cb(ctx);
     ctx->completed_cb(ctx, stag, imm, mlength, NULL, status);
@@ -913,6 +939,13 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
  * arriving in any order. tag_consumed_cb fires on the *first* of the
  * three seen regardless: it only signals "don't also match this in
  * software", unrelated to whether the pull has completed.
+ *
+ * Checks priv->cancel_force at both callback points, same reasoning as
+ * uct_cxi_iface_tag_handle_eager_match() -- see its doc comment and the
+ * design plan's Part 2 addendum. A force-cancel can be observed already
+ * set on the very first event this slot ever sees (it races the hardware
+ * independently of anything here), so both the early tag_consumed_cb and
+ * the eventual completed_cb must check it, not just the latter.
  */
 void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
                                          const union c_event *event)
@@ -956,9 +989,13 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
     if (priv->rndv_flags == 0) {
         /* First of the three events seen for this slot -- fire
          * tag_consumed_cb immediately: it only concerns software
-         * double-matching, not pull completion. */
+         * double-matching, not pull completion. Skipped under
+         * cancel_force: ctx may already be freed/recycled by UCP (see
+         * this function's doc comment). */
         priv->rndv_flags |= UCT_CXI_RNDV_FLAG_IS_RNDV;
-        ctx->tag_consumed_cb(ctx);
+        if (!priv->cancel_force) {
+            ctx->tag_consumed_cb(ctx);
+        }
     }
 
     priv->stag        = event->tgt_long.match_bits;
@@ -975,15 +1012,43 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
 
     if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
         !event->tgt_long.get_issued) {
+        if (ucs_unlikely(priv->cancel_force)) {
+            /* UCP already assumes this receive's buffer is free to reuse
+             * (force-cancel contract, see this function's doc comment) --
+             * issuing our own pull now would DMA-write into memory we no
+             * longer have any claim to. Abandon instead: with no Get ever
+             * issued, no Reply will ever arrive to drive the ordinary
+             * completion path below, so nothing else will free this slot
+             * -- do it here. */
+            ucs_debug("cxi TAG [RNDV-GET-SKIPPED-CANCEL] slot=%d -- "
+                     "force-cancelled before software Get issue, "
+                     "abandoning pull", slot);
+            iface->tag.ctx[slot] = NULL;
+            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+            return;
+        }
         status = uct_cxi_iface_issue_rdzv_get(iface, event, (uint16_t)slot,
                                               priv->posted_len);
         if (ucs_unlikely(status != UCS_OK)) {
             /* Resource exhaustion issuing the pull -- nothing sane to do
              * but drop the receive; matches how other allocation
              * failures on this hot path are handled elsewhere in this
-             * transport (e.g. desc_pool exhaustion). */
+             * transport (e.g. desc_pool exhaustion). No Get means no
+             * Reply, so (like the cancel_force case above) nothing else
+             * will ever free this slot or complete this request -- do
+             * both here rather than leaking the slot and hanging UCP's
+             * caller forever. completed_cb accepts any ucs_status_t
+             * (confirmed via ucp_tag_offload_completed(), which forwards
+             * status verbatim with no allowlist), so propagating the
+             * real failure status is safe and accurate, not just the
+             * three statuses uct.h's doc comment enumerates as typical. */
             ucs_error("cxi TAG failed to issue software rdzv Get, "
                      "slot=%d: dropping receive", slot);
+            iface->tag.ctx[slot] = NULL;
+            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+            ctx->completed_cb(ctx, event->tgt_long.match_bits, 0, 0, NULL,
+                              status);
+            return;
         }
         /* get_issued==1: nothing further here -- the NIC auto-issued the
          * pull; its completion arrives via
@@ -995,6 +1060,15 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
         return; /* Still waiting for Rendezvous and/or Reply. */
     }
 
+    iface->tag.ctx[slot] = NULL;
+    iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+
+    if (ucs_unlikely(priv->cancel_force)) {
+        ucs_debug("cxi TAG [RNDV-RACED-CANCEL] slot=%d -- force-cancelled, "
+                 "dropping completion silently", slot);
+        return;
+    }
+
     stag   = priv->stag;
     /* Delivered length is capped at the posted buffer's own capacity on
      * truncation, matching the eager path's contract (see the "truncation"
@@ -1003,9 +1077,6 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
     length = ucs_min(priv->length, priv->posted_len);
     status = (priv->rndv_flags & UCT_CXI_RNDV_FLAG_TRUNCATED) ?
             UCS_ERR_MESSAGE_TRUNCATED : UCS_OK;
-
-    iface->tag.ctx[slot] = NULL;
-    iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
 
     /* imm is always 0 for rendezvous per uct_ep_tag_rndv_zcopy's own doc.
      * inline_data is always NULL, same reason as the eager handler. */

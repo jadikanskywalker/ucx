@@ -33,6 +33,7 @@
 
 #include <cstring>
 #include <vector>
+#include <unistd.h>
 
 
 class test_cxi_tag_rndv : public test_cxi_tag_base {
@@ -408,6 +409,95 @@ UCS_TEST_P(test_cxi_tag_rndv, rndv_request_unsupported)
 
     ucs_status_t status = uct_ep_tag_rndv_request(ep, 0x1234, NULL, 0, 0);
     EXPECT_EQ(UCS_ERR_UNSUPPORTED, status);
+}
+
+
+/* -------------------------------------------------------------------------
+ * Diagnostic: delayed-matched rendezvous -- does the NIC still auto-issue
+ * the Get, or does get_issued come back 0 (the software-issue path, never
+ * empirically observed on real hardware in this whole engagement -- every
+ * prior test here is direct-match, receive posted first, and every
+ * completion observed so far has been get_issued==1)?
+ *
+ * This is genuinely exploratory, not a known-good regression test: this
+ * file's own header documents unexpected/overflow rendezvous arrivals as
+ * out of scope, silently dropped by tag_handle_ovf_arrival()'s early
+ * return for event->tgt_long.rendezvous -- but that drop only touches the
+ * *initial* C_EVENT_PUT/PUT_OVERFLOW arrival (always a 0-byte eager
+ * prefix for this transport's rendezvous Puts, see uct_ep_tag_rndv_zcopy),
+ * not the later C_EVENT_RENDEZVOUS/C_EVENT_REPLY events, which are routed
+ * to tag_handle_rndv_match() regardless of arrival timing, and whose
+ * completion gate only requires those two (not the dropped Put) -- so this
+ * *might* already complete correctly today. Whether it does, and whether
+ * the eventual Get was NIC-auto-issued or not, is exactly what this test
+ * is for. Run with UCX_LOG_LEVEL=debug and grep the resulting
+ * "[RENDEZVOUS]" log line's get_issued=%u field for the answer -- it is
+ * not asserted on directly here since it is hardware's own decision, not
+ * something a passing/failing assertion should gate on either way (see
+ * this class's own header comment on why direct-match tests don't assert
+ * on it either).
+ *
+ * Same ordering discipline as test_cxi_tag's delayed_match_data_copy: no
+ * receiver-side progress at all until after the receive is posted, so the
+ * rendezvous Put is guaranteed (by real elapsed time) to have already
+ * landed before uct_iface_tag_recv_zcopy ever runs.
+ */
+UCS_TEST_P(test_cxi_tag_rndv, delayed_match_get_issued)
+{
+    static const uct_tag_t TAG     = 0xEE55667788990011ULL;
+    static const size_t    PAY_LEN = 512;
+    static const uint8_t   FILL    = 0x3D;
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> tx_buf(PAY_LEN, FILL);
+    uct_mem_h            tx_memh = reg(sender(), tx_buf.data(), PAY_LEN);
+    uct_cxi_rndv_send_ctx sctx;
+    init_rndv_send_ctx(sctx);
+
+    uct_iov_t siov;
+    siov.buffer = tx_buf.data();
+    siov.length = PAY_LEN;
+    siov.memh   = tx_memh;
+    siov.stride = 0;
+    siov.count  = 1;
+
+    ucs_status_ptr_t sp = uct_ep_tag_rndv_zcopy(ep, TAG, NULL, 0, &siov, 1,
+                                                0, &sctx.super);
+    ASSERT_FALSE(UCS_PTR_IS_ERR(sp));
+
+    usleep(100000); /* 100 ms, real elapsed time, no progress calls */
+
+    std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+    uct_cxi_tag_recv_ctx  rctx;
+    init_recv_ctx(rctx);
+
+    uct_iov_t riov;
+    riov.buffer = rx_buf.data();
+    riov.length = PAY_LEN;
+    riov.memh   = rx_memh;
+    riov.stride = 0;
+    riov.count  = 1;
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &riov, 1,
+                                           &rctx.super));
+
+    poll_until(rctx.completed, 5.0);
+    poll_until(sctx.fired, 5.0);
+
+    EXPECT_EQ(TAG, rctx.stag);
+    EXPECT_EQ(PAY_LEN, rctx.length);
+    EXPECT_EQ(UCS_OK, rctx.status);
+    EXPECT_EQ(UCS_OK, sctx.super.status);
+    for (size_t i = 0; i < PAY_LEN; i++) {
+        EXPECT_EQ(FILL, rx_buf[i]) << "byte " << i << " mismatch";
+    }
+
+    dereg(receiver(), rx_memh);
+    dereg(sender(), tx_memh);
+    flush_ep(sender(), ep);
 }
 
 
