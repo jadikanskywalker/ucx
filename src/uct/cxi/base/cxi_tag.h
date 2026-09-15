@@ -34,9 +34,18 @@
  * its own; a large fixed threshold is unvalidated and unnecessary here. */
 #define UCT_CXI_TAG_OVF_MIN_FREE      256u
 
-/* Hard ceiling on TAG_MAX_OUTSTANDING: buffer_id (the slot-correlation
- * field) is uint16_t. */
-#define UCT_CXI_TAG_MAX_OUTSTANDING_MAX  65535u
+/* buffer_id (the slot-correlation field) is uint16_t -- these two bounds
+ * split that 16-bit space into two disjoint ranges: real priority-LE slot
+ * ids [0, max_outstanding), and one reserved SEARCH_AND_DELETE buffer_id
+ * per overflow ring buffer, [UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE,
+ * UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + num_bufs). num_bufs itself is
+ * capped at UCT_CXI_TAG_OVF_NUM_BUFS_MAX so the split point is a fixed
+ * compile-time constant regardless of the actual configured ring size --
+ * see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE below for why this range
+ * exists at all. */
+#define UCT_CXI_TAG_OVF_NUM_BUFS_MAX      1024u
+#define UCT_CXI_TAG_MAX_OUTSTANDING_MAX   \
+        (65535u - UCT_CXI_TAG_OVF_NUM_BUFS_MAX)
 
 /* Advertised rndv.max_hdr -- comfortably above sizeof(ucp_tag_offload_
  * unexp_rndv_hdr_t) (17 bytes), which UCP asserts on unconditionally once
@@ -45,37 +54,72 @@
  * real transport limit -- just needs to satisfy that assert with margin. */
 #define UCT_CXI_TAG_RNDV_MAX_HDR      256u
 
-/* Sentinel buffer_id for our own SEARCH_AND_DELETE command, always one
- * past the maximum possible valid priority-LE slot -- lets
- * tag_handle_match() tell its own delete-confirmation event apart from a
- * genuine delayed match. Currently unused: SEARCH_AND_DELETE emission is
- * disabled (see the #else branch of tag_handle_ovf_arrival() in
- * cxi_tag.c) pending a decision on unexpected-message handling. Kept for
- * when that code path is re-enabled. */
-#define UCT_CXI_TAG_SEARCH_DELETE_SENTINEL  0xFFFFu
+/* Base of the reserved buffer_id range used for our own SEARCH_AND_DELETE
+ * commands -- one entry per overflow ring buffer (buf_idx), not one per
+ * outstanding command or per arrival. uct_cxi_iface_tag_handle_ovf_
+ * arrival() sets sd.buffer_id = BASE + buf_idx when it issues the command
+ * for an arrival into that buffer; the confirmation's own buffer_id then
+ * directly *is* buf_idx (minus BASE) -- no separate tracking table,
+ * free-list, or ordering assumption needed.
+ *
+ * Why buffer_id and not match_bits (the tag): match_bits is not a safe
+ * correlation key on its own -- the same tag can legitimately be
+ * outstanding on multiple concurrent messages between a peer pair (normal
+ * MPI/UCX usage), so two different arrivals could share it. buffer_id is a
+ * field we assign ourselves, so it has no such collision risk.
+ *
+ * Why per-buffer-generation and not per-arrival: ovf_refcnt itself is
+ * tracked per buf_idx, not per arrival (see cxi_iface.h's doc comment on
+ * it) -- multiple arrivals into the same generation all just need to
+ * decrement the *same* counter, so a shared per-buf_idx id is sufficient;
+ * nothing needs to distinguish which specific arrival within a generation
+ * a given confirmation belongs to.
+ *
+ * Why this exists at all (why the previous single shared sentinel wasn't
+ * enough): with sd.use_once=1 (see tag_handle_ovf_arrival()'s own comment
+ * on why that flag is now set), a "not found" outcome is confirmed via
+ * C_EVENT_SEARCH alone, and that event's own event->tgt_long.start is
+ * always 0 -- not a real address (empirically confirmed on real hardware,
+ * test_cxi_tag_ovf.raw_event_order_and_manual_search_delete: 8/8 runs, a
+ * "won" confirmation on the same command shape always carries a real,
+ * correct start, a "lost" one always shows exactly 0x0). buf_idx cannot be
+ * recovered from that event's own fields at all, so it has to be encoded
+ * directly into the one field the command lets us choose ourselves. */
+#define UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE  UCT_CXI_TAG_MAX_OUTSTANDING_MAX
 
 /* uct_cxi_tag_ctx_priv_t::rndv_flags bits 1-3 -- per-event bookkeeping for
  * a rendezvous receive (pre-shifted to land directly in rndv_flags).
  *
- * The design plan originally required all three of Put/Put_Overflow,
- * Rendezvous, and Reply before completing, per libfabric's
- * rdzv_recv_req_event() (cxip_msg_hpc.c:307-320): "After three events, a
- * rendezvous receive is complete... Put, Rendezvous, Reply -- or Put
- * Overflow, Rendezvous, Reply." That's true for libfabric's own design,
- * which always attaches a non-zero eager prefix to the rendezvous Put. It
- * does NOT hold here: confirmed on real hardware (a permanent hang, root-
- * caused via debug logging) that our rendezvous Put -- which always
- * carries eager_length=0 (see uct_cxi_ep_tag_rndv_zcopy) -- never
- * generates its own C_EVENT_PUT/C_EVENT_PUT_OVERFLOW at all; only
- * Rendezvous and Reply ever fire. Requiring SEEN_PUT made completion
- * permanently unreachable. UCT_CXI_RNDV_SEEN_PUT is kept only as passive
- * bookkeeping (harmless if such an event were ever observed) and is no
- * longer part of the completion gate -- see UCT_CXI_RNDV_SEEN_REQUIRED. */
+ * All three of Put/Put_Overflow, Rendezvous, and Reply are required before
+ * completing, matching libfabric's rdzv_recv_req_event()
+ * (cxip_msg_hpc.c:307-320): "After three events, a rendezvous receive is
+ * complete... Put, Rendezvous, Reply -- or Put Overflow, Rendezvous,
+ * Reply."
+ *
+ * This was previously relaxed to just SEEN_RNDV|SEEN_REPLY, on an earlier
+ * hardware finding that our rendezvous Put -- always eager_length=0 (see
+ * uct_ep_tag_rndv_zcopy) -- supposedly never generates its own
+ * C_EVENT_PUT/C_EVENT_PUT_OVERFLOW at all, making SEEN_PUT permanently
+ * unreachable. Direct empirical re-testing (test_cxi_tag_rndv.
+ * direct_match_small and delayed_match_get_issued, both with
+ * UCX_LOG_LEVEL=debug) contradicts that: both direct-match and delayed-
+ * match rendezvous receives reliably generate a real Put/Put_Overflow
+ * event ("[DIRECT-MATCH-RNDV]"/"[OVF-MATCHED-RNDV]" in the debug log),
+ * consistent with libfabric's own reliance on zero-byte Puts as a fence/
+ * signal mechanism elsewhere in its design -- there is no fundamental
+ * reason eager_length=0 would suppress the event. The earlier "permanent
+ * hang" was very likely caused by something else already fixed since (the
+ * O(1) match_bits redesign or the CXI_MATCH_ID_ANY fix are the most likely
+ * candidates), not by SEEN_PUT being unreachable. Reverted back to
+ * requiring all three -- re-validated via full test_cxi_tag_rndv
+ * regression, not just these two tests, specifically watching for any
+ * reintroduced hang. */
 enum {
     UCT_CXI_RNDV_SEEN_PUT   = UCS_BIT(1), /* C_EVENT_PUT or C_EVENT_PUT_OVERFLOW */
     UCT_CXI_RNDV_SEEN_RNDV  = UCS_BIT(2), /* C_EVENT_RENDEZVOUS */
     UCT_CXI_RNDV_SEEN_REPLY = UCS_BIT(3), /* C_EVENT_REPLY (get_issued 0 or 1) */
-    UCT_CXI_RNDV_SEEN_REQUIRED = UCT_CXI_RNDV_SEEN_RNDV | UCT_CXI_RNDV_SEEN_REPLY
+    UCT_CXI_RNDV_SEEN_REQUIRED = UCT_CXI_RNDV_SEEN_PUT | UCT_CXI_RNDV_SEEN_RNDV |
+                                 UCT_CXI_RNDV_SEEN_REPLY
 };
 
 /*
@@ -84,17 +128,6 @@ enum {
  */
 typedef struct uct_cxi_tag_ctx_priv {
     uint16_t slot;            /* Index into iface->tag.ctx[]/free_list[] */
-    uint8_t  cancel_force;    /* Set by tag_recv_cancel(force=1). The
-                             * priority-LE APPEND sets event_unlink_
-                             * disable=1 (matches libfabric's own
-                             * _cxip_recv_req()), so the automatic
-                             * use_once-on-match unlink never generates an
-                             * event -- tag_handle_match() owns that case
-                             * entirely on its own. Every C_EVENT_UNLINK
-                             * that reaches uct_cxi_iface_tag_handle_unlink()
-                             * is therefore unambiguously a real explicit
-                             * cancel confirmation; this flag only controls
-                             * whether completed_cb is invoked for it. */
     uint8_t  rndv_flags;      /* Packed to fit UCT_TAG_PRIV_LEN=32 bytes:
                              * bit 0     = is_rndv, latched from the first
                              *             event seen on this slot (either
@@ -145,6 +178,18 @@ typedef struct uct_cxi_tag_ctx_priv {
                              * (data_len - mlen) -- the posted buffer's own
                              * length is the only thing that bounds a
                              * software-issued Get, never rlength alone. */
+    uint64_t recv_addr;       /* CPU pointer (iov[0].buffer at tag_recv_zcopy
+                             * time), not an IOVA -- needed only for the
+                             * explicit software copy on a delayed eager
+                             * match (C_EVENT_PUT_OVERFLOW): Portals4 never
+                             * retroactively re-targets an already-placed
+                             * Put's DMA into a later-posted LE, so hardware
+                             * has not moved the bytes here itself; see
+                             * uct_cxi_iface_tag_handle_eager_match(). Unused
+                             * for a direct match (C_EVENT_PUT) or for
+                             * rendezvous (the Get's own local_addr always
+                             * targets the real destination fresh, computed
+                             * at pull time, regardless of match timing). */
 } uct_cxi_tag_ctx_priv_t;
 
 /* uct_cxi_tag_ctx_priv_t::rndv_flags bit layout (bits 1-3 are
@@ -320,7 +365,7 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self);
  * decide which branch to take) -- not something either handler below
  * re-derives:
  *   - tag_handle_eager_match: plain eager, completes on this one event.
- *   - tag_handle_rndv_match: rendezvous. See UCT_CXI_RNDV_SEEN_* above --
+ *   - tag_handle_rdzv_match: rendezvous. See UCT_CXI_RNDV_SEEN_* above --
  *     a rendezvous receive accumulates all three events (Put/Put_Overflow,
  *     Rendezvous, Reply) before completed_cb fires; this handler is the
  *     entry point for the first two, uct_cxi_iface_tag_handle_rdzv_reply
@@ -332,9 +377,33 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self);
  */
 void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                           const union c_event *event);
+/* Dispatched directly from cxi_iface.c's progress loop for a
+ * C_EVENT_PUT_OVERFLOW whose buffer_id falls in the reserved SEARCH_
+ * AND_DELETE range (see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE's doc
+ * comment), before ever choosing between eager and rendezvous match
+ * handling. Never rendezvous-flagged (SEARCH_AND_DELETE is only ever
+ * issued for eager unexpected arrivals). With sd.use_once=1, this event
+ * type only ever fires for the "found and deleted" outcome (C_RC_OK) --
+ * the "not found" outcome is a separate event type, C_EVENT_SEARCH, see
+ * uct_cxi_iface_tag_handle_search_delete_not_found() below. */
+void uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
+                                                    const union c_event *event);
+/* Dispatched directly from cxi_iface.c's progress loop for a
+ * C_EVENT_SEARCH whose buffer_id falls in the reserved SEARCH_AND_DELETE
+ * range -- with sd.use_once=1, this is the complete, self-contained "not
+ * found" outcome (hardware's own search-on-append already claimed this
+ * arrival through the ordinary priority-LE path instead): releases
+ * ovf_refcnt for the buf_idx encoded in the event's own buffer_id
+ * directly, no copy, no eager_cb. Unlike tag_handle_search_delete_
+ * confirm() above, this event's own event->tgt_long.start is always 0 --
+ * not a real address -- confirmed on real hardware
+ * (test_cxi_tag_ovf.raw_event_order_and_manual_search_delete); buffer_id
+ * is the only usable field. */
+void uct_cxi_iface_tag_handle_search_delete_not_found(
+        uct_cxi_iface_t *iface, const union c_event *event);
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event);
-void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
+void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
                                          const union c_event *event);
 void uct_cxi_iface_tag_handle_unlink(uct_cxi_iface_t *iface,
                                       const union c_event *event);

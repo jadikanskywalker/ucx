@@ -475,4 +475,147 @@ UCS_TEST_P(test_cxi_tag, cancel_force)
 }
 
 
+/* -------------------------------------------------------------------------
+ * Forced race: SEARCH_AND_DELETE vs. a real APPEND's search-on-append
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * Deliberately forces the actual race this whole SEARCH_AND_DELETE design
+ * exists to arbitrate: a message's arrival into the overflow ring and a
+ * matching uct_iface_tag_recv_zcopy()'s priority-LE APPEND, issued back to
+ * back with no progress calls or delay in between -- close enough in real
+ * time that which one Cassini processes first is not something this test
+ * controls or knows in advance. Cassini's own mutual exclusion between a
+ * real APPEND's search-on-append and our targeted SEARCH_AND_DELETE must
+ * guarantee exactly one side ever wins against the same unexpected entry --
+ * never both (the double-completion crash, job 100716) and never neither
+ * (a silently dropped message). Alternates which of the two is issued
+ * first across iterations, since real winner is up to Cassini's own
+ * relative timing regardless of program order -- this only controls which
+ * program-level interleaving is attempted, not the actual hardware race.
+ */
+UCS_TEST_P(test_cxi_tag, forced_race_search_delete_vs_priority_append)
+{
+    static const size_t ITERS   = 100;
+    static const size_t PAY_LEN = 32;
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    size_t priority_wins      = 0;
+    size_t search_delete_wins = 0;
+
+    for (size_t i = 0; i < ITERS; i++) {
+        uct_tag_t tag  = 0xF00D000000000000ULL | i;
+        uint8_t   fill = static_cast<uint8_t>(i);
+
+        std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+        uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+
+        uct_cxi_tag_recv_ctx rctx;
+        init_recv_ctx(rctx);
+
+        uct_iov_t iov;
+        iov.buffer = rx_buf.data();
+        iov.length = PAY_LEN;
+        iov.memh   = rx_memh;
+        iov.stride = 0;
+        iov.count  = 1;
+
+        std::vector<uint8_t> tx_buf(PAY_LEN, fill);
+
+        m_unexp.fired = false;
+
+        if (i & 1) {
+            /* Send first, post the receive immediately after -- races the
+             * message's physical arrival against the APPEND. */
+            ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, tag, tx_buf.data(),
+                                                 PAY_LEN));
+            ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
+                                                   UCS_MASK(64), &iov, 1,
+                                                   &rctx.super));
+        } else {
+            /* The other program-order interleaving -- the real winner is
+             * still up to Cassini's own relative timing, not this order. */
+            ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
+                                                   UCS_MASK(64), &iov, 1,
+                                                   &rctx.super));
+            ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, tag, tx_buf.data(),
+                                                 PAY_LEN));
+        }
+
+        /* Exactly one of these two must eventually become true. */
+        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+        while (!rctx.completed && !m_unexp.fired &&
+              (ucs_get_time() < deadline)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        ASSERT_TRUE(rctx.completed || m_unexp.fired)
+                << "iteration " << i << ": message vanished -- neither the "
+                   "priority-LE match nor the unexpected path ever fired";
+
+        if (rctx.completed) {
+            priority_wins++;
+            EXPECT_EQ(UCS_OK, rctx.status);
+            EXPECT_EQ(tag, rctx.stag);
+            EXPECT_EQ(PAY_LEN, rctx.length);
+            for (size_t b = 0; b < PAY_LEN; b++) {
+                EXPECT_EQ(fill, rx_buf[b])
+                        << "iteration " << i << " byte " << b;
+            }
+
+            /* The receive completed via a real priority-LE match -- confirm
+             * SEARCH_AND_DELETE did NOT also independently deliver this
+             * same message a second time (the actual double-completion
+             * bug). A short, bounded extra drain is enough: any spurious
+             * eager_cb would already be sitting in the EQ by now, this
+             * message's own processing is long done. */
+            ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.2);
+            while (ucs_get_time() < settle) {
+                uct_iface_progress(sender().iface());
+                uct_iface_progress(receiver().iface());
+            }
+            EXPECT_FALSE(m_unexp.fired)
+                    << "iteration " << i << ": message delivered TWICE -- "
+                       "both the priority-LE match and SEARCH_AND_DELETE "
+                       "independently succeeded";
+        } else {
+            search_delete_wins++;
+            EXPECT_EQ(tag, m_unexp.tag);
+            ASSERT_EQ(PAY_LEN, m_unexp.data.size());
+            for (size_t b = 0; b < PAY_LEN; b++) {
+                EXPECT_EQ(fill, m_unexp.data[b])
+                        << "iteration " << i << " byte " << b;
+            }
+
+            /* SEARCH_AND_DELETE won -- the priority LE this iteration
+             * posted is still live (nothing else resolves it in this
+             * outcome, see the design plan). Force-cancel to reclaim the
+             * slot before the next iteration, matching cancel_force's own
+             * precedent; completed_cb must never fire for a force-cancel. */
+            ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
+                                                    &rctx.super, 1));
+            ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.2);
+            while (ucs_get_time() < settle) {
+                uct_iface_progress(sender().iface());
+                uct_iface_progress(receiver().iface());
+            }
+            EXPECT_FALSE(rctx.completed)
+                    << "iteration " << i << ": force-cancelled receive's "
+                       "completed_cb fired anyway";
+        }
+
+        dereg(receiver(), rx_memh);
+    }
+
+    UCS_TEST_MESSAGE << "priority_wins=" << priority_wins
+                     << " search_delete_wins=" << search_delete_wins
+                     << " / " << ITERS << " iterations";
+
+    flush_ep(sender(), ep);
+}
+
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag, cxi)

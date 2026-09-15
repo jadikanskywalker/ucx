@@ -324,15 +324,68 @@ typedef struct uct_cxi_iface {
         unsigned              free_count;  /**< Valid entries in free_list     */
         unsigned              max_outstanding;
 
+        /* Per-slot force-cancel bookkeeping -- deliberately NOT stored in
+         * the ctx's own priv (uct_cxi_tag_ctx_priv_t used to have its own
+         * cancel_force field there; removed once every reader moved to
+         * this array instead, since a field no event handler may ever
+         * read again has no reason to keep existing). force=1 means UCP
+         * "assumes the cancel is... successful" the
+         * instant it calls tag_recv_cancel() (uct.h's own doc comment)
+         * and is free to recycle the ucp_request_t ctx/priv live in for a
+         * completely different receive before our async C_EVENT_UNLINK
+         * confirmation (or a real match landing on the same slot in the
+         * meantime) ever arrives -- confirmed on real hardware
+         * (cxi_tag.c:1511's own assertion firing with a *different*,
+         * live receive's own priv->slot value once UCP reused the
+         * memory). Any handler touching a slot must check cancel_ctx[slot]
+         * .force first, before dereferencing ctx/priv for anything -- if
+         * set, reclaim using only this struct's own fields, never ctx.
+         *
+         * rndv_seen exists because a force-cancelled *rendezvous* receive
+         * can still have up to 3 more real hardware events arrive for its
+         * slot (Put/Put_Overflow, Rendezvous, Reply -- see
+         * UCT_CXI_RNDV_SEEN_* in cxi_tag.h), all of which must be drained
+         * before the slot number is safe to reuse (the underlying LE/pull
+         * is still physically in flight in hardware until then --
+         * reclaiming the slot number early risks a second, unrelated
+         * receive sharing the same buffer_id while the old one's
+         * remaining events are still arriving). Since priv->rndv_flags
+         * (where this accumulation normally lives) is exactly the unsafe-
+         * to-touch memory this struct exists to avoid, tag_recv_cancel()
+         * snapshots whatever's accumulated so far into rndv_seen at the
+         * moment force-cancel is requested (still safe: read
+         * synchronously, before UCP can have reused anything), and every
+         * later event for this slot accumulates into it instead of priv
+         * from then on. Unused (stays 0) for a plain eager receive. */
+        struct {
+            uint8_t force;
+            uint8_t rndv_seen;
+        } *cancel_ctx; /**< [max_outstanding] */
+
         /* Overflow ring: same shape as am.rx_base/am.rx_mh (contiguous
-         * alloc, one registration, buffer_id-indexed, manage_local), but
-         * real overflow-list semantics (unexpected_hdr_disable=0). Data
-         * is copied out and handed to eager_cb/rndv_cb immediately and
-         * unconditionally -- never retained waiting for a future post. */
+         * alloc, one registration, buffer_id-indexed, manage_local), real
+         * overflow-list semantics (unexpected_hdr_disable=0). Each
+         * message's data stays in place until whichever event resolves it
+         * (a real priority-LE delayed match, or our own SEARCH_AND_DELETE)
+         * -- see ovf_refcnt below for why a buffer generation can't be
+         * reposted just because its last arrival set auto_unlinked. */
         uint8_t              *rx_base;
         uct_cxi_mem_handle_t  rx_mh;
         unsigned              num_bufs;
         size_t                buf_size;
+
+        /* Per-buffer-generation reference count -- mirrors libfabric's own
+         * cxip_ptelist_buf refcount/consumed design (cxip_ptelist_buf.c).
+         * Incremented on every C_EVENT_PUT into this buffer (arrival);
+         * decremented on whatever later resolves that specific message
+         * (uct_cxi_iface_tag_ovf_release()). A buffer generation's
+         * auto_unlinked flag (set on its last arrival) only records that a
+         * repost is *pending* (ovf_repost_pending) -- the actual repost is
+         * deferred until refcnt drains to 0, so an unresolved earlier
+         * message in the same generation can never have its memory reused
+         * out from under it. */
+        uint32_t             *ovf_refcnt;         /**< [num_bufs] */
+        uint8_t              *ovf_repost_pending; /**< [num_bufs] */
 
         ucs_mpool_t           unexp_pool;  /**< Copy-out buffers for unexpected
                                                 messages handed to eager_cb/rndv_cb */

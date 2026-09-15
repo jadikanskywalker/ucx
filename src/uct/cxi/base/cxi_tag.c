@@ -169,9 +169,16 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     self->tag.rndv_cb   = params->rndv_cb;
     self->tag.rndv_arg  = params->rndv_arg;
 
+    /* num_bufs must be clamped before max_outstanding is computed --
+     * UCT_CXI_TAG_MAX_OUTSTANDING_MAX already reserves the buffer_id range
+     * SEARCH_AND_DELETE needs (one id per overflow buffer, capped at
+     * UCT_CXI_TAG_OVF_NUM_BUFS_MAX) below the hardware's real 65535
+     * ceiling -- see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE's doc comment
+     * in cxi_tag.h for why that range exists. */
+    self->tag.num_bufs        = ucs_min(config->tag_ovf_num_bufs,
+                                        UCT_CXI_TAG_OVF_NUM_BUFS_MAX);
     self->tag.max_outstanding = ucs_min(config->tag_max_outstanding,
                                         UCT_CXI_TAG_MAX_OUTSTANDING_MAX);
-    self->tag.num_bufs        = config->tag_ovf_num_bufs;
     self->tag.buf_size        = ucs_max(config->tag_ovf_buf_size,
                                         config->tag_eager_max);
 
@@ -193,6 +200,14 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     }
     self->tag.free_count = self->tag.max_outstanding;
 
+    self->tag.cancel_ctx = ucs_calloc(self->tag.max_outstanding,
+                                      sizeof(*self->tag.cancel_ctx),
+                                      "cxi-tag-cancel-ctx");
+    if (self->tag.cancel_ctx == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_free_list;
+    }
+
     /* Unexpected-message copy-out pool: plain host memory (see
      * uct_cxi_tag_unexp_mpool_ops), sized to hold one full eager message. */
     {
@@ -207,7 +222,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         mp_params.name            = "cxi-tag-unexp";
         status = ucs_mpool_init(&mp_params, &self->tag.unexp_pool);
         if (status != UCS_OK) {
-            goto err_free_free_list;
+            goto err_free_cancel_ctx;
         }
     }
 
@@ -251,6 +266,23 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
             self->tag.rx_base = NULL;
             goto err_cleanup_unexp_pool;
         }
+    }
+
+    /* One ref-count/repost-pending slot per overflow buffer generation --
+     * see cxi_iface.h's doc comment on ovf_refcnt. */
+    self->tag.ovf_refcnt = ucs_calloc(self->tag.num_bufs,
+                                      sizeof(*self->tag.ovf_refcnt),
+                                      "cxi-tag-ovf-refcnt");
+    if (self->tag.ovf_refcnt == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_unmap_rx;
+    }
+    self->tag.ovf_repost_pending = ucs_calloc(
+            self->tag.num_bufs, sizeof(*self->tag.ovf_repost_pending),
+            "cxi-tag-ovf-repost-pending");
+    if (self->tag.ovf_repost_pending == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_ovf_refcnt;
     }
 
     {
@@ -325,6 +357,11 @@ err_unmap_pte:
 err_destroy_pte:
     cxil_destroy_pte(self->tag.pte);
     self->tag.pte = NULL;
+    ucs_free(self->tag.ovf_repost_pending);
+    self->tag.ovf_repost_pending = NULL;
+err_free_ovf_refcnt:
+    ucs_free(self->tag.ovf_refcnt);
+    self->tag.ovf_refcnt = NULL;
 err_unmap_rx:
     uct_cxi_do_unmap(&self->tag.rx_mh);
     ucs_free(self->tag.rx_base);
@@ -332,6 +369,9 @@ err_unmap_rx:
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
 err_cleanup_unexp_pool:
     ucs_mpool_cleanup(&self->tag.unexp_pool, 1);
+err_free_cancel_ctx:
+    ucs_free(self->tag.cancel_ctx);
+    self->tag.cancel_ctx = NULL;
 err_free_free_list:
     ucs_free(self->tag.free_list);
     self->tag.free_list = NULL;
@@ -363,9 +403,12 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
     }
     uct_cxi_do_unmap(&self->tag.rx_mh);
     ucs_free(self->tag.rx_base);
+    ucs_free(self->tag.ovf_repost_pending);
+    ucs_free(self->tag.ovf_refcnt);
 
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
     ucs_mpool_cleanup(&self->tag.unexp_pool, 1);
+    ucs_free(self->tag.cancel_ctx);
     ucs_free(self->tag.free_list);
     ucs_free(self->tag.ctx);
 }
@@ -570,132 +613,321 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self)
  */
 
 /*
+ * uct_cxi_iface_tag_ovf_buf_idx / uct_cxi_iface_tag_ovf_data -- shared
+ * address-range math for locating which overflow ring buffer an event's
+ * event->tgt_long.start falls within, and the actual data pointer inside
+ * it. Used both for a fresh arrival (buf_idx already known directly from
+ * buffer_id there) and, more importantly, for a *later* confirmation event
+ * (SEARCH_AND_DELETE completion, or a real delayed match) that only
+ * carries the address, not which ring slot it originated from.
+ */
+static inline int
+uct_cxi_iface_tag_ovf_buf_idx(uct_cxi_iface_t *iface, uint64_t start)
+{
+    uint64_t base_iova = iface->tag.rx_mh.iova_offset +
+                         (uint64_t)(uintptr_t)iface->tag.rx_base;
+
+    return (int)((start - base_iova) / iface->tag.buf_size);
+}
+
+static inline void *
+uct_cxi_iface_tag_ovf_data(uct_cxi_iface_t *iface, int buf_idx,
+                           uint64_t start)
+{
+    uint8_t *buf_va   = iface->tag.rx_base +
+                        (size_t)buf_idx * iface->tag.buf_size;
+    uint64_t buf_iova = iface->tag.rx_mh.iova_offset +
+                        (uint64_t)(uintptr_t)buf_va;
+
+    return buf_va + (size_t)(start - buf_iova);
+}
+
+/*
+ * uct_cxi_iface_tag_ovf_release -- drop one reference on an overflow
+ * buffer generation (see cxi_iface.h's doc comment on ovf_refcnt). Call
+ * exactly once per arrival into that generation, whenever that specific
+ * message's own SEARCH_AND_DELETE resolves it -- tag_handle_search_
+ * delete_confirm() (found) or tag_handle_search_delete_not_found() (not
+ * found), always exactly one of the two with sd.use_once=1 -- or an
+ * explicit decision up front to never resolve it via SEARCH_AND_DELETE at
+ * all (the rendezvous-arrival drop path below, and the emit-failure path,
+ * both release immediately instead). tag_handle_eager_match() (a real
+ * hardware delayed match) never releases this -- see its own doc comment:
+ * that event's relative ordering against this arrival's own SEARCH_AND_
+ * DELETE confirmation is not guaranteed (confirmed on real hardware,
+ * test_cxi_tag.forced_race_search_delete_vs_priority_append), so it must
+ * never be the thing this accounting depends on. Reposts the generation
+ * once the last outstanding reference drains, but only if it was actually
+ * marked auto_unlinked -- an ordinary still-linked generation has nothing
+ * to repost.
+ */
+static void
+uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
+{
+    ucs_assertv(iface->tag.ovf_refcnt[buf_idx] > 0, "buf_idx=%d", buf_idx);
+    if ((--iface->tag.ovf_refcnt[buf_idx] == 0) &&
+        iface->tag.ovf_repost_pending[buf_idx]) {
+        iface->tag.ovf_repost_pending[buf_idx] = 0;
+        uct_cxi_iface_post_tag_ovf_le(iface, buf_idx, 1);
+    }
+}
+
+/*
+ * uct_cxi_iface_tag_handle_search_delete_confirm -- the "found and
+ * deleted" confirmation for our own SEARCH_AND_DELETE: a
+ * C_EVENT_PUT_OVERFLOW on the tag PTE whose buffer_id falls in the
+ * reserved SEARCH_AND_DELETE range (see UCT_CXI_TAG_SEARCH_DELETE_
+ * BUFIDX_BASE's doc comment in cxi_tag.h). Dispatched directly from
+ * cxi_iface.c's progress loop -- checked once, before ever choosing
+ * between eager and rendezvous match handling, rather than duplicated
+ * inside both (or relying on uct_cxi_iface_tag_match_lookup()'s ordinary
+ * bounds check to coincidentally also catch it, which said nothing about
+ * *why* it's safe to drop and left tag_handle_rdzv_match() with no
+ * explicit handling of this case at all -- SEARCH_AND_DELETE is only ever
+ * issued for eager unexpected arrivals, so this event is never
+ * rendezvous-flagged and tag_handle_rdzv_match() should never need to
+ * know it exists).
+ *
+ * With sd.use_once=1 (see tag_handle_ovf_arrival()'s own comment on that
+ * flag), this event type only ever fires for the "found and deleted"
+ * outcome -- confirmed on real hardware (cxi_event_rc()==C_RC_OK on every
+ * observed run, test_cxi_tag_ovf.raw_event_order_and_manual_search_
+ * delete). The "not found" outcome is a structurally different event
+ * type entirely (C_EVENT_SEARCH, handled by tag_handle_search_delete_
+ * not_found() below), not a different rc on this same event -- so unlike
+ * the pre-use_once design, there is no second outcome to branch on here;
+ * a non-OK rc on this event type would be a genuine surprise, logged
+ * defensively but not otherwise expected to occur.
+ *
+ * buf_idx comes directly from the event's own buffer_id (buffer_id -
+ * BUFIDX_BASE), not from event->tgt_long.start -- start is still needed
+ * separately, for its real purpose: locating the actual bytes to copy
+ * within the overflow buffer (SEARCH_AND_DELETE only removes the list
+ * *entry*, it has no destination-address field of its own to move data
+ * with -- confirmed against every libfabric SEARCH/SEARCH_AND_DELETE call
+ * site). This is the only event that will ever fire for this specific
+ * arrival (real hardware search-on-append can never also independently
+ * claim an entry our own use_once=1 SEARCH_AND_DELETE already found and
+ * deleted), so this is also where the arrival's own overflow-buffer
+ * reference is released.
+ */
+void
+uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
+                                               const union c_event *event)
+{
+    int      buf_idx = (int)event->tgt_long.buffer_id -
+                       UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE;
+    uint32_t len      = event->tgt_long.mlength;
+    uint64_t tag      = event->tgt_long.match_bits;
+    uint64_t imm      = event->tgt_long.header_data;
+    void    *data;
+    void    *elem;
+    void    *context = NULL;
+
+    if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
+        /* Not expected to be reachable with use_once=1 -- see this
+         * function's own doc comment. Still release rather than leak if
+         * it ever is; there is no companion event to fall back on for
+         * this buf_idx otherwise. */
+        ucs_error("cxi TAG [SEARCH-DELETE-UNEXPECTED-RC] tag=0x%lx rc=%d "
+                 "buf_idx=%d -- C_EVENT_PUT_OVERFLOW with use_once=1 "
+                 "reported a non-OK rc, which real-hardware testing never "
+                 "observed; releasing anyway", (unsigned long)tag,
+                 cxi_event_rc(event), buf_idx);
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        return;
+    }
+
+    /* Copy out before releasing the reference below -- releasing first
+     * can trigger a repost (uct_cxi_iface_post_tag_ovf_le()), making this
+     * exact memory eligible for the NIC to overwrite with a new arrival
+     * before we've read it. */
+    data = uct_cxi_iface_tag_ovf_data(iface, buf_idx, event->tgt_long.start);
+    elem = (len > 0) ? ucs_mpool_get(&iface->tag.unexp_pool) : NULL;
+    if (ucs_unlikely((elem == NULL) && (len > 0))) {
+        ucs_error("cxi TAG overflow: unexp_pool exhausted, dropping "
+                 "unexpected message tag=0x%lx len=%u",
+                 (unsigned long)tag, len);
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        return;
+    }
+    if (len > 0) {
+        memcpy(elem, data, len);
+    }
+    uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+
+    ucs_info("cxi TAG [SEARCH-DELETE-MATCH] tag=0x%lx len=%u buf_idx=%d",
+             (unsigned long)tag, len, buf_idx);
+
+    /* No UCT_CB_PARAM_FLAG_DESC offered -- eager_cb must copy out
+     * synchronously if it wants to keep the data, matching this same
+     * transport's existing AM convention. We reclaim our own buffer right
+     * away regardless of the returned status. */
+    (void)iface->tag.eager_cb(iface->tag.eager_arg, elem, len,
+                              UCT_CB_PARAM_FLAG_FIRST, tag, imm, &context);
+    if (elem != NULL) {
+        ucs_mpool_put(elem);
+    }
+}
+
+/*
+ * uct_cxi_iface_tag_handle_search_delete_not_found -- the "not found"
+ * outcome for our own SEARCH_AND_DELETE: a C_EVENT_SEARCH on the tag PTE
+ * whose buffer_id falls in the reserved SEARCH_AND_DELETE range. With
+ * sd.use_once=1, this is the complete, self-contained signal that
+ * hardware's own search-on-append already claimed this arrival through
+ * the ordinary priority-LE path instead (tag_handle_eager_match() is the
+ * one handling the real match and its data -- a separate, independent
+ * event, possibly processed before or after this one; ovf_refcnt release
+ * never depends on that ordering here, only on this event's own arrival,
+ * which is always causally after tag_handle_ovf_arrival()'s own increment
+ * since we only ever emit this arrival's SEARCH_AND_DELETE from inside
+ * that same function call).
+ *
+ * event->tgt_long.start is always 0 on this event type -- not a real
+ * address -- confirmed on real hardware, 8/8 runs across two nodes and
+ * four devices each (test_cxi_tag_ovf.raw_event_order_and_manual_search_
+ * delete), so buf_idx must come from buffer_id, exactly like the "found"
+ * confirmation above. No copy, no eager_cb -- there is nothing to copy;
+ * the data belongs to whichever destination the real match already
+ * copied it into.
+ */
+void
+uct_cxi_iface_tag_handle_search_delete_not_found(uct_cxi_iface_t *iface,
+                                                 const union c_event *event)
+{
+    int buf_idx = (int)event->tgt_long.buffer_id -
+                  UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE;
+
+    ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND] buf_idx=%d rc=%d "
+             "match_bits=0x%lx -- hardware's own search-on-append already "
+             "won this race, releasing", buf_idx, cxi_event_rc(event),
+             (unsigned long)event->tgt_long.match_bits);
+    uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+}
+
+/*
  * uct_cxi_iface_tag_handle_ovf_arrival -- an unexpected message landed in
- * the overflow ring (C_EVENT_PUT, ptl_list==C_PTL_LIST_OVERFLOW). Copy out
- * immediately, tell Cassini we've consumed it (SEARCH_AND_DELETE), and
- * hand off to UCP's own SW tag-matching via eager_cb/rndv_cb -- no
- * tag_consumed_cb/completed_cb/rndv_cb on this path, those only exist on a
- * uct_tag_context_t from an already-posted tag_recv_zcopy, which by
- * definition doesn't exist for an unexpected message.
+ * the overflow ring (C_EVENT_PUT, ptl_list==C_PTL_LIST_OVERFLOW). Takes a
+ * reference on the buffer generation (see cxi_iface.h's ovf_refcnt doc
+ * comment) and issues a targeted SEARCH_AND_DELETE against the unexpected
+ * list -- no copy, no eager_cb here: this event alone can never tell
+ * whether hardware's own search-on-append will independently win the same
+ * race (a real priority LE could already be in flight on the same command
+ * queue), so ownership isn't known until the SEARCH_AND_DELETE's own
+ * confirmation (tag_handle_search_delete_confirm() or tag_handle_search_
+ * delete_not_found(), depending on outcome) resolves it. This is what
+ * actually fixes the double-completion crash this increment exists for
+ * (job 100716, ucp_request.inl:307): the old code handed off to eager_cb
+ * immediately and unconditionally right here.
  */
 void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                           const union c_event *event)
 {
-    int                  buf_idx  = (int)event->tgt_long.buffer_id;
+    int      buf_idx = (int)event->tgt_long.buffer_id;
+    uint64_t tag      = event->tgt_long.match_bits;
+    struct c_target_cmd sd = {};
+    int      ret;
+
+    iface->tag.ovf_refcnt[buf_idx]++;
+    if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+        /* EQ delivery is ordered, so this Put is guaranteed to be the
+         * last one for this buffer generation -- see file header. Record
+         * that a repost is owed once every message in this generation
+         * (this one included) has actually been resolved; do not repost
+         * yet -- an earlier, still-unresolved message in the same
+         * generation would have its memory reused out from under it. */
+        iface->tag.ovf_repost_pending[buf_idx] = 1;
+    }
 
     /* An unexpected *rendezvous* arrival (event->tgt_long.rendezvous==1)
      * is explicitly out of scope for this increment -- see the design
      * plan's "Part 2/3" discussion -- and stays on the drop path
      * unconditionally: its eager-attached prefix is always 0 bytes
      * (eager_length=0 on every rendezvous Put this transport sends, see
-     * uct_ep_tag_rndv_zcopy), so routing it through the eager_cb path
-     * below would silently report a 0-byte message to UCP instead of the
-     * real transfer -- worse than dropping it. Plain unexpected eager
-     * arrivals (rendezvous==0) go through the real path below, restored
-     * from the interim ignore-stub: without ever calling eager_cb here,
-     * worker->tm.offload.thresh can never leave SIZE_MAX (it's only set
-     * from inside ucp_tag_offload_iface_activate(), itself only reachable
-     * from an unexpected-arrival callback), so UCP can never activate
-     * hardware tag offload for *any* message, confirmed on real hardware
-     * as a permanent hang (the very first unexpected arrival in any
-     * exchange -- typical send-before-recv-posted ping-pong startup --
-     * was silently eaten, and UCP's software tag-matching waited forever
-     * for a message that had already arrived and been discarded). */
+     * uct_ep_tag_rndv_zcopy), so routing it through eager_cb would
+     * silently report a 0-byte message to UCP instead of the real
+     * transfer -- worse than dropping it. It is never SEARCH_AND_DELETE'd
+     * (out of scope), so nothing will ever generate a confirmation to
+     * release this reference -- release it immediately instead of leaking
+     * this generation's refcnt (and thus its repost) forever. */
     if (event->tgt_long.rendezvous) {
         ucs_debug("cxi TAG [OVF-ARRIVAL-IGNORED] buf_idx=%d tag=0x%lx "
                  "mlength=%u -- unexpected rendezvous arrival, out of "
                  "scope for this increment, dropping", buf_idx,
-                 (unsigned long)event->tgt_long.match_bits,
-                 (unsigned)event->tgt_long.mlength);
-
-        if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-            uct_cxi_iface_post_tag_ovf_le(iface, buf_idx, 1);
-        }
+                 (unsigned long)tag, (unsigned)event->tgt_long.mlength);
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
         return;
     }
-    {
-    uint8_t             *buf_va   = iface->tag.rx_base +
-                                    (size_t)buf_idx * iface->tag.buf_size;
-    uint64_t             buf_iova = iface->tag.rx_mh.iova_offset +
-                                    (uint64_t)(uintptr_t)buf_va;
-    uint32_t             len      = event->tgt_long.mlength;
-    uint64_t             tag      = event->tgt_long.match_bits;
-    uint64_t             imm      = event->tgt_long.header_data;
-    void                *data     = buf_va +
-                                    (size_t)(event->tgt_long.start - buf_iova);
-    // struct c_target_cmd  sd       = {};
-    void                *elem;
-    void                *context  = NULL;
-    // int                  ret;
 
-    ucs_debug("cxi TAG [OVF-ARRIVAL] buf_idx=%d tag=0x%lx mlength=%u "
-             "rlength=%u start=0x%lx auto_unlinked=%u",
-             buf_idx, tag, len, (unsigned)event->tgt_long.rlength,
+    ucs_info("cxi TAG [OVF-ARRIVAL] buf_idx=%d tag=0x%lx mlength=%u "
+             "rlength=%u start=0x%lx auto_unlinked=%u", buf_idx,
+             (unsigned long)tag, (unsigned)event->tgt_long.mlength,
+             (unsigned)event->tgt_long.rlength,
              (unsigned long)event->tgt_long.start,
              (unsigned)event->tgt_long.auto_unlinked);
 
-    /* Zero-byte unexpected Puts can't happen for tag (no analogous
-     * fabric-level probe traffic targets this PTE), but guard anyway. */
-    elem = (len > 0) ? ucs_mpool_get(&iface->tag.unexp_pool) : NULL;
-    if (ucs_unlikely((elem == NULL) && (len > 0))) {
-        ucs_error("cxi TAG overflow: unexp_pool exhausted, dropping "
-                 "unexpected message tag=0x%lx len=%u", tag, len);
-    } else if (len > 0) {
-        memcpy(elem, data, len);
-    }
+    /* Targets C_PTL_LIST_UNEXPECTED, not OVERFLOW -- confirmed against
+     * every libfabric SEARCH/SEARCH_AND_DELETE call site, all of which
+     * target UNEXPECTED exclusively; OVERFLOW is just the receive-buffer
+     * list, UNEXPECTED is the actual search-on-append-visible tracking
+     * list. match_id must be CXI_MATCH_ID_ANY, not zero-init, to be a real
+     * wildcard (a genuine, previously-hit bug: zero-init only matches one
+     * specific bogus initiator identity). length must be set too -- left
+     * at its zero-init default, real hardware reported C_RC_NO_SPACE
+     * (confirmed via debug logging, not a "not found" result at all): a
+     * SEARCH command's length describes the region being searched, and 0
+     * is a degenerate empty region, not "unbounded". Both of libfabric's
+     * own SEARCH_AND_DELETE call sites (cxip_ux_onload(),
+     * cxip_claim_ux_onload()) explicitly set this to -1U ("any address"
+     * together with start's own zero-init default), never leave it at 0.
+     *
+     * use_once=1: found via libfabric's own cxip_claim_ux_onload()
+     * (cxip_msg_hpc.c, "Delete first match") -- the actual analogue of
+     * this exact use case (a targeted single-tag SEARCH_AND_DELETE, not a
+     * wildcard onload). Without it, every SEARCH_AND_DELETE produces a
+     * companion C_EVENT_SEARCH terminator in addition to the real outcome
+     * -- confirmed on real hardware to disappear entirely with use_once=1
+     * (test_cxi_tag_ovf.raw_event_order_and_manual_search_delete): a
+     * "found and deleted" outcome now produces exactly one event
+     * (C_EVENT_PUT_OVERFLOW, C_RC_OK), and a "not found" outcome produces
+     * exactly one event too, just a different type (C_EVENT_SEARCH,
+     * C_RC_NO_MATCH) -- never both for the same command. That turns what
+     * was an unbounded, ordering-dependent correlation problem (which
+     * arrival does a bare terminator belong to?) into a fixed, always-
+     * exactly-one-event outcome per command.
+     *
+     * buffer_id encodes buf_idx directly (BUFIDX_BASE + buf_idx) rather
+     * than a single shared sentinel -- see UCT_CXI_TAG_SEARCH_DELETE_
+     * BUFIDX_BASE's own doc comment in cxi_tag.h for why: the "not found"
+     * event's own event->tgt_long.start is always 0, not a real address,
+     * so buf_idx cannot be recovered from the confirmation event's other
+     * fields and has to be encoded into the one field we control. */
+    sd.command.opcode = C_CMD_TGT_SEARCH_AND_DELETE;
+    sd.ptl_list       = C_PTL_LIST_UNEXPECTED;
+    sd.ptlte_index    = iface->tag.pte->ptn;
+    sd.match_bits     = tag;
+    sd.ignore_bits    = 0;
+    sd.match_id       = CXI_MATCH_ID_ANY;
+    sd.length         = -1U;
+    sd.use_once       = 1;
+    sd.buffer_id      = (uint16_t)(UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE +
+                                   buf_idx);
 
-    // /* Tell Cassini we've consumed this -- clears the internal
-    //  * unexpected-header record so a LATER-posted priority LE's automatic
-    //  * search-on-append can never find and re-deliver it. Issued
-    //  * unconditionally, even on unexp_pool exhaustion above, since leaving
-    //  * a stale record around risks a future match reading memory we may
-    //  * have already reused.
-    //  *
-    //  * Validated fix, kept for reference/revert (see design plan's "Part
-    //  * 2 addendum"): targets C_PTL_LIST_UNEXPECTED, not OVERFLOW --
-    //  * libfabric's own SEARCH/SEARCH_AND_DELETE call sites (cxip_msg_hpc.c,
-    //  * cxip_msg.c) target this exclusively; OVERFLOW is just the
-    //  * receive-buffer list, UNEXPECTED is the actual
-    //  * search-on-append-visible tracking list. match_id must be
-    //  * CXI_MATCH_ID_ANY, not zero-init, to be a real wildcard. buffer_id
-    //  * is set to a sentinel distinguishable from any real priority-LE slot
-    //  * (always < max_outstanding <= 65535) so tag_handle_match() can
-    //  * recognize and skip this command's own found+deleted completion
-    //  * event rather than treating it as a genuine delayed match. */
-    // sd.command.opcode = C_CMD_TGT_SEARCH_AND_DELETE;
-    // sd.ptl_list       = C_PTL_LIST_UNEXPECTED;
-    // sd.ptlte_index    = iface->tag.pte->ptn;
-    // sd.match_bits     = tag;
-    // sd.ignore_bits    = 0;
-    // sd.match_id       = CXI_MATCH_ID_ANY;
-    // sd.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_SENTINEL;
-    // ret = cxi_cq_emit_target(iface->tgt.cmdq, &sd);
-    // if (ucs_unlikely(ret != 0)) {
-    //     ucs_warn("cxi TAG SEARCH_AND_DELETE emit failed: %d", ret);
-    // } else {
-    //     cxi_cq_ring(iface->tgt.cmdq);
-    // }
-
-    if ((elem != NULL) || (len == 0)) {
-        /* No UCT_CB_PARAM_FLAG_DESC offered -- eager_cb must copy out
-         * synchronously if it wants to keep the data, matching this same
-         * transport's existing AM convention (uct_iface_invoke_am(...,
-         * flags=0) below). We reclaim our own buffer right away
-         * regardless of the returned status. */
-        (void)iface->tag.eager_cb(iface->tag.eager_arg, elem, len,
-                                  UCT_CB_PARAM_FLAG_FIRST, tag, imm,
-                                  &context);
-        if (elem != NULL) {
-            ucs_mpool_put(elem);
-        }
+    ret = cxi_cq_emit_target(iface->tgt.cmdq, &sd);
+    if (ucs_unlikely(ret != 0)) {
+        /* Command-queue exhaustion -- rare, and there is no safe way to
+         * confirm exclusive ownership without the SEARCH_AND_DELETE
+         * actually landing, so the message is dropped rather than handed
+         * off racily. Matches this function's own unexp_pool-exhaustion
+         * precedent elsewhere in this file: rare-resource-pressure data
+         * loss, not a new failure mode. */
+        ucs_error("cxi TAG SEARCH_AND_DELETE emit failed: %d -- dropping "
+                 "unexpected message tag=0x%lx", ret, (unsigned long)tag);
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        return;
     }
-
-    if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-        /* EQ delivery is ordered, so this Put is guaranteed to be the
-         * last one for this buffer generation -- see file header. */
-        uct_cxi_iface_post_tag_ovf_le(iface, buf_idx, 1);
-    }
-    }
+    cxi_cq_ring(iface->tgt.cmdq);
 }
 
 /*
@@ -811,36 +1043,25 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
 
 /*
  * uct_cxi_iface_tag_match_lookup -- shared prefix for every tag-PTE match
- * handler (eager, rendezvous): the sentinel check and slot/ctx lookup are
- * identical regardless of which kind of match this turns out to be, so
- * they live here once rather than in each handler. Classifying
- * eager-vs-rendezvous (event->tgt_long.rendezvous) and dispatching to the
- * right handler is the caller's job -- iface_progress() in cxi_iface.c --
- * not this function's or the handlers' own; see the handlers' doc
- * comments.
+ * handler (eager, rendezvous): the slot/ctx lookup is identical regardless
+ * of which kind of match this turns out to be, so it lives here once
+ * rather than in each handler. Classifying eager-vs-rendezvous
+ * (event->tgt_long.rendezvous) and dispatching to the right handler is the
+ * caller's job -- iface_progress() in cxi_iface.c -- not this function's
+ * or the handlers' own; see the handlers' doc comments. A
+ * SEARCH_AND_DELETE confirmation (buffer_id==UCT_CXI_TAG_SEARCH_DELETE_
+ * SENTINEL) never reaches here at all -- iface_progress() routes it to
+ * uct_cxi_iface_tag_handle_search_delete_confirm() before either match
+ * handler, let alone this shared lookup, is ever called.
  *
- * Returns NULL (nothing further to do) for a SEARCH_AND_DELETE echo or a
- * stale/already-resolved slot; otherwise returns the matched ctx with
- * *slot_p set.
+ * Returns NULL (nothing further to do) for a stale/already-resolved slot;
+ * otherwise returns the matched ctx with *slot_p set.
  */
 static uct_tag_context_t *
 uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
                                const union c_event *event, int *slot_p)
 {
     int slot = (int)event->tgt_long.buffer_id;
-
-    if (ucs_unlikely(event->tgt_long.buffer_id ==
-                     UCT_CXI_TAG_SEARCH_DELETE_SENTINEL)) {
-        /* Our own SEARCH_AND_DELETE's found+deleted completion, not a
-         * genuine priority-LE match -- see the sentinel's comment in
-         * cxi_tag.h. Also caught by the bounds check below (65535 is
-         * always >= max_outstanding), but logged distinctly here for
-         * clarity while we're actively verifying this. */
-        ucs_debug("cxi TAG [SEARCH-DELETE-ECHO] tag=0x%lx -- our own "
-                 "SEARCH_AND_DELETE confirmation, not a real match",
-                 (unsigned long)event->tgt_long.match_bits);
-        return NULL;
-    }
 
     if ((slot < 0) || (slot >= (int)iface->tag.max_outstanding) ||
         (iface->tag.ctx[slot] == NULL)) {
@@ -860,55 +1081,105 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
 /*
  * uct_cxi_iface_tag_handle_eager_match -- a plain eager match, either
  * direct (C_EVENT_PUT, ptl_list==PRIORITY) or via delayed correlation
- * (C_EVENT_PUT_OVERFLOW). Unchanged from Phase A: both tag_consumed_cb and
- * completed_cb fire on this single event -- Cassini's direct match
- * delivers "matched" and "data placed" together, unlike a two-CQE model,
- * so the consumed-before-completed ordering UCP requires falls out
- * trivially. inline_data is always NULL: this is the true zero-copy case,
- * data already sits in the caller's own registered buffer. Never called
- * for a rendezvous-flagged event -- see iface_progress()'s own dispatch.
+ * (C_EVENT_PUT_OVERFLOW). Never called for a rendezvous-flagged event --
+ * see iface_progress()'s own dispatch.
  *
- * Checks priv->cancel_force before touching any callback -- see the design
- * plan's Part 2 addendum. A force-cancel (tag_recv_cancel(force=1)) does
- * not free our slot itself (only tag_handle_unlink()/this function do, on
- * whichever event arrives first); it only sets the flag and lets the race
- * play out. Per the UCT contract (uct.h), force=1 means UCP already
- * treated the cancel as successful and may have freed/recycled the
- * ucp_request_t ctx lives in by the time this event arrives -- so if the
- * flag is set, the slot must still be reclaimed (the LE is consumed
- * either way), but ctx's callbacks must never be touched again.
+ * A direct match is the true zero-copy case: the priority LE was already
+ * posted before the Put arrived, so hardware's own DMA already placed the
+ * data in the caller's registered buffer -- inline_data stays NULL,
+ * nothing more to move. A delayed match (C_EVENT_PUT_OVERFLOW) is NOT the
+ * same: this data physically landed in the overflow ring before this
+ * priority LE ever existed, and Portals4 never retroactively re-targets
+ * an already-placed Put's DMA into a later-posted LE -- confirmed on real
+ * hardware (test_cxi_tag.delayed_match_data_copy, every byte came back as
+ * the pre-fill sentinel before this fix) and via libfabric's own
+ * cxip_ux_send() (cxip_msg_hpc.c:593-640), which does the identical
+ * explicit memcpy. So an explicit software copy from the overflow buffer
+ * into priv->recv_addr is required here, unconditionally, whenever this
+ * event type fires -- this is what "unified overflow-buffer lifecycle"
+ * means: uct_cxi_iface_tag_handle_search_delete_confirm() below does the
+ * exact same copy, just into an eager_cb scratch buffer instead of a
+ * posted receive's own buffer, for the case where no receive was posted
+ * at all.
+ *
+ * Never called for a SEARCH_AND_DELETE confirmation (buffer_id in the
+ * reserved SEARCH_AND_DELETE range, see UCT_CXI_TAG_SEARCH_DELETE_
+ * BUFIDX_BASE in cxi_tag.h) either -- that shares this event type and
+ * dispatch path but has no uct_tag_context_t behind it at all, so
+ * iface_progress() routes it to uct_cxi_iface_tag_handle_search_delete_
+ * confirm() directly, before ever choosing between this function and
+ * tag_handle_rdzv_match().
+ *
+ * Does the copy for a delayed match, but deliberately never touches
+ * ovf_refcnt -- this event's relative ordering against this same
+ * arrival's own SEARCH_AND_DELETE confirmation/not-found event is not
+ * guaranteed (confirmed on real hardware under genuine concurrent
+ * racing, test_cxi_tag.forced_race_search_delete_vs_priority_append: the
+ * delayed-match notification can be delivered before the arrival's own
+ * raw overflow-landing event, which is what actually issues that
+ * SEARCH_AND_DELETE in the first place). Release always happens through
+ * that arrival's own SEARCH_AND_DELETE outcome instead (tag_handle_
+ * search_delete_confirm() or tag_handle_search_delete_not_found()) --
+ * see uct_cxi_iface_tag_ovf_release()'s own doc comment for why that's
+ * the only ordering-safe choice.
+ *
+ * Checks iface->tag.cancel_ctx[slot].force before touching ctx/priv at
+ * all -- see cancel_ctx's own doc comment in cxi_iface.h. Per the UCT
+ * contract (uct.h), force=1 means UCP already treated the cancel as
+ * successful the instant it called tag_recv_cancel(), and may have
+ * recycled the ucp_request_t ctx/priv live in for a completely different
+ * receive by the time this event arrives -- confirmed on real hardware
+ * (a cxi_tag.c:1511 assertion firing with a *different*, live receive's
+ * own priv->slot value). If the flag is set, the slot is reclaimed (the
+ * LE is consumed either way) without ever reading ctx, and no callback or
+ * copy happens (the copy would only ever be read by the callback anyway).
  */
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event)
 {
     int                      slot;
-    uct_tag_context_t      *ctx = uct_cxi_iface_tag_match_lookup(iface, event,
-                                                                 &slot);
+    uct_tag_context_t      *ctx;
     uct_cxi_tag_ctx_priv_t *priv;
     uint64_t                 stag;
     uint64_t                 imm;
     uint32_t                 mlength;
     ucs_status_t             status;
+    int                      buf_idx;
 
+    ctx = uct_cxi_iface_tag_match_lookup(iface, event, &slot);
     if (ctx == NULL) {
+        return;
+    }
+
+    iface->tag.ctx[slot] = NULL;
+    iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+
+    if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
+        iface->tag.cancel_ctx[slot].force = 0;
+        ucs_debug("cxi TAG [MATCH-RACED-CANCEL] slot=%d -- force-cancelled, "
+                 "dropping match silently", slot);
         return;
     }
 
     priv = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
 
-    ucs_debug("cxi TAG [%s] slot=%d tag=0x%lx mlength=%u",
+    ucs_info("cxi EAGER TAG [%s] slot=%d tag=0x%lx mlength=%u",
              (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) ?
                      "OVF-MATCHED" : "DIRECT-MATCH",
              slot, (unsigned long)event->tgt_long.match_bits,
              (unsigned)event->tgt_long.mlength);
 
-    iface->tag.ctx[slot] = NULL;
-    iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
-
-    if (ucs_unlikely(priv->cancel_force)) {
-        ucs_debug("cxi TAG [MATCH-RACED-CANCEL] slot=%d -- force-cancelled, "
-                 "dropping match silently", slot);
-        return;
+    if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
+        /* Delayed match: copy out of the overflow buffer. No ovf_refcnt
+         * release here -- see this function's own doc comment and
+         * uct_cxi_iface_tag_ovf_release()'s. */
+        buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface, event->tgt_long.start);
+        if (event->tgt_long.mlength > 0) {
+            void *data = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
+                                                    event->tgt_long.start);
+            memcpy((void *)(uintptr_t)priv->recv_addr, data,
+                  event->tgt_long.mlength);
+        }
     }
 
     stag    = event->tgt_long.match_bits;
@@ -922,7 +1193,7 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
 }
 
 /*
- * uct_cxi_iface_tag_handle_rndv_match -- a rendezvous match: either
+ * uct_cxi_iface_tag_handle_rdzv_match -- a rendezvous match: either
  * C_EVENT_PUT/C_EVENT_PUT_OVERFLOW with event->tgt_long.rendezvous==1 (the
  * eager-attached prefix landing, part of a larger transfer, not a
  * complete delivery on its own), or C_EVENT_RENDEZVOUS itself (announces
@@ -940,14 +1211,19 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
  * three seen regardless: it only signals "don't also match this in
  * software", unrelated to whether the pull has completed.
  *
- * Checks priv->cancel_force at both callback points, same reasoning as
- * uct_cxi_iface_tag_handle_eager_match() -- see its doc comment and the
- * design plan's Part 2 addendum. A force-cancel can be observed already
- * set on the very first event this slot ever sees (it races the hardware
- * independently of anything here), so both the early tag_consumed_cb and
- * the eventual completed_cb must check it, not just the latter.
+ * Checks iface->tag.cancel_ctx[slot].force before touching ctx/priv at
+ * all -- see cancel_ctx's own doc comment in cxi_iface.h. Unlike the
+ * eager case, a force-cancelled rendezvous slot can still have up to 2
+ * more of these events arrive after the flag is set (this receive
+ * accumulates across up to 3 events total: Put/Put_Overflow, Rendezvous,
+ * Reply), so this function keeps accumulating into iface->tag.
+ * cancel_ctx[slot].rndv_seen (snapshotted from priv->rndv_flags at cancel
+ * time) instead of priv, and only reclaims the slot once that reaches
+ * UCT_CXI_RNDV_SEEN_REQUIRED -- reclaiming any earlier would let a new
+ * receive reuse the same buffer_id while this one's remaining events are
+ * still in flight.
  */
-void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
+void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
                                          const union c_event *event)
 {
     int                     slot;
@@ -963,12 +1239,49 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
         return;
     }
 
+    seen_bit = (event->hdr.event_type == C_EVENT_RENDEZVOUS) ?
+            UCT_CXI_RNDV_SEEN_RNDV : UCT_CXI_RNDV_SEEN_PUT;
+
+    if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
+        if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
+            !event->tgt_long.get_issued) {
+            /* UCP already assumes this receive's buffer is free to reuse,
+             * so issuing our own pull now would DMA-write into memory we
+             * no longer have any claim to -- abandon it. No Get means no
+             * Reply will ever arrive, so mark it "seen" here purely to
+             * stop it gating reclaim below -- but the Put/Put_Overflow
+             * event for this same transfer may still be pending (these 3
+             * events can arrive in any order, confirmed on real hardware,
+             * see this function's own doc comment), so the slot is NOT
+             * freed unconditionally here: it falls through to the same
+             * accumulate-and-check below, reclaiming now if Put has
+             * already been seen, or whenever it later arrives otherwise. */
+            ucs_debug("cxi TAG [RNDV-GET-SKIPPED-CANCEL] slot=%d -- "
+                     "force-cancelled before software Get issue, "
+                     "abandoning pull", slot);
+            iface->tag.cancel_ctx[slot].rndv_seen |= UCT_CXI_RNDV_SEEN_REPLY;
+        }
+
+        iface->tag.cancel_ctx[slot].rndv_seen |= seen_bit;
+        if ((iface->tag.cancel_ctx[slot].rndv_seen &
+             UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
+            iface->tag.ctx[slot] = NULL;
+            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+            iface->tag.cancel_ctx[slot].force = 0;
+        }
+        /* Not yet all required bits seen: nothing more here -- wait for
+         * whichever of {Put/Put_Overflow, Reply} is still outstanding.
+         * Reply only remains outstanding when get_issued==1, arriving via
+         * tag_handle_rdzv_reply()/uct_cxi_rdzv_get_comp -> tag_rdzv_
+         * reply_done(), which carries this same cancel_ctx check. */
+        return;
+    }
+
     priv = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
     ucs_assertv(priv->slot == (uint16_t)slot, "priv->slot=%u slot=%d",
                priv->slot, slot);
 
     if (event->hdr.event_type == C_EVENT_RENDEZVOUS) {
-        seen_bit = UCT_CXI_RNDV_SEEN_RNDV;
         ucs_debug("cxi TAG [RENDEZVOUS] slot=%d tag=0x%lx mlength=%u "
                  "rlength=%u get_issued=%u remote_offset=0x%lx",
                  slot, (unsigned long)event->tgt_long.match_bits,
@@ -977,7 +1290,6 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
                  (unsigned)event->tgt_long.get_issued,
                  (unsigned long)event->tgt_long.remote_offset);
     } else {
-        seen_bit = UCT_CXI_RNDV_SEEN_PUT;
         ucs_debug("cxi TAG [%s-RNDV] slot=%d tag=0x%lx mlength=%u rlength=%u",
                  (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) ?
                          "OVF-MATCHED" : "DIRECT-MATCH",
@@ -989,16 +1301,24 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
     if (priv->rndv_flags == 0) {
         /* First of the three events seen for this slot -- fire
          * tag_consumed_cb immediately: it only concerns software
-         * double-matching, not pull completion. Skipped under
-         * cancel_force: ctx may already be freed/recycled by UCP (see
-         * this function's doc comment). */
+         * double-matching, not pull completion. */
         priv->rndv_flags |= UCT_CXI_RNDV_FLAG_IS_RNDV;
-        if (!priv->cancel_force) {
-            ctx->tag_consumed_cb(ctx);
-        }
+        ctx->tag_consumed_cb(ctx);
     }
 
-    priv->stag        = event->tgt_long.match_bits;
+    /* match_bits is only the real tag on C_EVENT_PUT/PUT_OVERFLOW.
+     * C_EVENT_RENDEZVOUS's own match_bits is hardware-internal rendezvous
+     * bookkeeping instead (confirmed on real hardware: masking to the low
+     * 8 bits recovers the sender's own rdzv op id, exactly like the
+     * source-side C_EVENT_GET's match_bits does -- see
+     * uct_cxi_iface_tag_handle_rdzv_get's doc comment) -- capturing it here
+     * would silently corrupt the tag reported to completed_cb whenever
+     * C_EVENT_RENDEZVOUS happens to be processed after the Put-side event
+     * (order is not guaranteed; only luck of ordering made every prior
+     * test pass). */
+    if (seen_bit == UCT_CXI_RNDV_SEEN_PUT) {
+        priv->stag = event->tgt_long.match_bits;
+    }
     priv->length      = event->tgt_long.rlength;
     priv->rndv_flags |= seen_bit;
     if (event->tgt_long.rlength > priv->posted_len) {
@@ -1012,42 +1332,50 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
 
     if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
         !event->tgt_long.get_issued) {
-        if (ucs_unlikely(priv->cancel_force)) {
-            /* UCP already assumes this receive's buffer is free to reuse
-             * (force-cancel contract, see this function's doc comment) --
-             * issuing our own pull now would DMA-write into memory we no
-             * longer have any claim to. Abandon instead: with no Get ever
-             * issued, no Reply will ever arrive to drive the ordinary
-             * completion path below, so nothing else will free this slot
-             * -- do it here. */
-            ucs_debug("cxi TAG [RNDV-GET-SKIPPED-CANCEL] slot=%d -- "
-                     "force-cancelled before software Get issue, "
-                     "abandoning pull", slot);
-            iface->tag.ctx[slot] = NULL;
-            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
-            return;
-        }
         status = uct_cxi_iface_issue_rdzv_get(iface, event, (uint16_t)slot,
                                               priv->posted_len);
         if (ucs_unlikely(status != UCS_OK)) {
             /* Resource exhaustion issuing the pull -- nothing sane to do
-             * but drop the receive; matches how other allocation
+             * but fail the receive now; matches how other allocation
              * failures on this hot path are handled elsewhere in this
-             * transport (e.g. desc_pool exhaustion). No Get means no
-             * Reply, so (like the cancel_force case above) nothing else
-             * will ever free this slot or complete this request -- do
-             * both here rather than leaking the slot and hanging UCP's
-             * caller forever. completed_cb accepts any ucs_status_t
-             * (confirmed via ucp_tag_offload_completed(), which forwards
-             * status verbatim with no allowlist), so propagating the
-             * real failure status is safe and accurate, not just the
-             * three statuses uct.h's doc comment enumerates as typical. */
+             * transport (e.g. desc_pool exhaustion). completed_cb accepts
+             * any ucs_status_t (confirmed via ucp_tag_offload_completed(),
+             * which forwards status verbatim with no allowlist), so
+             * propagating the real failure status is safe and accurate,
+             * not just the three statuses uct.h's doc comment enumerates
+             * as typical, and it's safe to call exactly once, right now,
+             * regardless of event ordering.
+             *
+             * The slot NUMBER is a separate question, though: no Get
+             * means no Reply will ever arrive, but the Put/Put_Overflow
+             * event for this same transfer may still be pending (any
+             * order -- see this function's own doc comment), and once
+             * completed_cb returns UCP may recycle this ctx for a
+             * different receive at any time (same hazard as force=1, see
+             * cancel_ctx's own doc comment in cxi_iface.h) -- so ctx/priv
+             * must not be read again after this point either. Switch this
+             * slot over to the same cancel_ctx-driven accumulation
+             * force-cancel uses: seed rndv_seen from whatever priv->
+             * rndv_flags already holds (read here for the last time,
+             * already includes this event's own seen_bit) plus Reply
+             * marked "seen" since none will ever come, and reclaim now if
+             * that's already everything required, or later when the
+             * remaining event drains. */
             ucs_error("cxi TAG failed to issue software rdzv Get, "
-                     "slot=%d: dropping receive", slot);
-            iface->tag.ctx[slot] = NULL;
-            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+                     "slot=%d: completing with error, deferring slot "
+                     "reclaim until all in-flight events for it drain",
+                     slot);
             ctx->completed_cb(ctx, event->tgt_long.match_bits, 0, 0, NULL,
                               status);
+            iface->tag.cancel_ctx[slot].rndv_seen = priv->rndv_flags |
+                                                    UCT_CXI_RNDV_SEEN_REPLY;
+            iface->tag.cancel_ctx[slot].force = 1;
+            if ((iface->tag.cancel_ctx[slot].rndv_seen &
+                 UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
+                iface->tag.ctx[slot] = NULL;
+                iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+                iface->tag.cancel_ctx[slot].force = 0;
+            }
             return;
         }
         /* get_issued==1: nothing further here -- the NIC auto-issued the
@@ -1062,12 +1390,6 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
 
     iface->tag.ctx[slot] = NULL;
     iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
-
-    if (ucs_unlikely(priv->cancel_force)) {
-        ucs_debug("cxi TAG [RNDV-RACED-CANCEL] slot=%d -- force-cancelled, "
-                 "dropping completion silently", slot);
-        return;
-    }
 
     stag   = priv->stag;
     /* Delivered length is capped at the posted buffer's own capacity on
@@ -1091,6 +1413,15 @@ void uct_cxi_iface_tag_handle_rndv_match(uct_cxi_iface_t *iface,
  * slot and fires completed_cb if that was the last of the three events
  * (Put/Put_Overflow, Rendezvous, Reply) needed -- see tag_handle_match's
  * own doc comment for the full three-event model.
+ *
+ * Checks iface->tag.cancel_ctx[slot].force before touching ctx/priv at
+ * all -- same reasoning as tag_handle_rdzv_match(), which this function
+ * mirrors for the Reply event specifically (the only one of the three
+ * that doesn't route through that function directly). get_issued==1 is
+ * the only way to reach a Reply on a force-cancelled slot at all (the
+ * get_issued==0 case abandons the pull and reclaims the slot immediately
+ * in tag_handle_rdzv_match(), so no Reply ever follows it) -- so the
+ * abandon-the-pull branch there has no equivalent needed here.
  */
 static void
 uct_cxi_iface_tag_rdzv_reply_done(uct_cxi_iface_t *iface, int slot,
@@ -1108,6 +1439,17 @@ uct_cxi_iface_tag_rdzv_reply_done(uct_cxi_iface_t *iface, int slot,
          * disposition as tag_handle_match's own bounds check. */
         ucs_debug("cxi TAG [RDZV-REPLY-STALE] slot=%d already resolved, "
                  "dropping", slot);
+        return;
+    }
+
+    if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
+        iface->tag.cancel_ctx[slot].rndv_seen |= UCT_CXI_RNDV_SEEN_REPLY;
+        if ((iface->tag.cancel_ctx[slot].rndv_seen &
+             UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
+            iface->tag.ctx[slot] = NULL;
+            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+            iface->tag.cancel_ctx[slot].force = 0;
+        }
         return;
     }
 
@@ -1203,6 +1545,16 @@ void uct_cxi_rdzv_get_comp(uct_cxi_send_op_t *op, ucs_status_t status)
  *     return_code==C_RC_OK) -- the real case this handler exists for, and
  *     now unambiguous: every priority-list C_EVENT_UNLINK that reaches
  *     here is a real explicit-cancel confirmation.
+ *
+ * This event winning outright (as opposed to C_RC_ENTRY_NOT_FOUND above)
+ * means the LE was removed before any match ever happened -- a complete,
+ * terminal disposition regardless of whether the receive would have been
+ * eager or rendezvous, so a force-cancelled slot reaching here is always
+ * reclaimed immediately, with no rndv_seen accumulation needed (contrast
+ * tag_handle_rdzv_match()/tag_rdzv_reply_done(), which handle the case
+ * where a match happened first instead). Checks iface->tag.
+ * cancel_ctx[slot].force before touching ctx/priv at all -- see
+ * cancel_ctx's own doc comment in cxi_iface.h.
  */
 void uct_cxi_iface_tag_handle_unlink(uct_cxi_iface_t *iface,
                                      const union c_event *event)
@@ -1233,6 +1585,13 @@ void uct_cxi_iface_tag_handle_unlink(uct_cxi_iface_t *iface,
         return;
     }
 
+    if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
+        iface->tag.ctx[slot] = NULL;
+        iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+        iface->tag.cancel_ctx[slot].force = 0;
+        return;
+    }
+
     ctx  = iface->tag.ctx[slot];
     priv = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
     ucs_assertv(priv->slot == (uint16_t)slot, "priv->slot=%u slot=%d",
@@ -1241,9 +1600,7 @@ void uct_cxi_iface_tag_handle_unlink(uct_cxi_iface_t *iface,
     iface->tag.ctx[slot] = NULL;
     iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
 
-    if (!priv->cancel_force) {
-        ctx->completed_cb(ctx, 0, 0, 0, NULL, UCS_ERR_CANCELED);
-    }
+    ctx->completed_cb(ctx, 0, 0, 0, NULL, UCS_ERR_CANCELED);
 }
 
 
@@ -1710,6 +2067,11 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
 
     UCT_CHECK_IOV_SIZE(iovcnt, 1ul, "tag_recv_zcopy");
 
+    /* Exactly fills UCT_TAG_PRIV_LEN with recv_addr added -- catch it
+     * here, not as a silent out-of-bounds write into
+     * uct_tag_context_t::priv, if either grows again. */
+    UCS_STATIC_ASSERT(sizeof(uct_cxi_tag_ctx_priv_t) <= UCT_TAG_PRIV_LEN);
+
     if (ucs_unlikely(iface->tag.free_count == 0)) {
         return UCS_ERR_EXCEEDS_LIMIT;
     }
@@ -1719,9 +2081,9 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
 
     priv                    = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
     priv->slot              = slot;
-    priv->cancel_force      = 0;
     priv->rndv_flags        = 0;
     priv->posted_len        = (uint32_t)iov[0].length;
+    priv->recv_addr         = (uint64_t)(uintptr_t)iov[0].buffer;
     iface->tag.ctx[slot] = ctx;
 
     le.command.opcode        = C_CMD_TGT_APPEND;
@@ -1769,7 +2131,7 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
         return UCS_ERR_NO_RESOURCE;
     }
     cxi_cq_ring(iface->tgt.cmdq);
-    ucs_debug("cxi TAG [PRI-LE-POST] slot=%u tag=0x%lx tag_mask=0x%lx",
+    ucs_info("cxi TAG [PRI-LE-POST] slot=%u tag=0x%lx tag_mask=0x%lx",
              (unsigned)slot, tag, tag_mask);
     return UCS_OK;
 }
@@ -1782,7 +2144,20 @@ ucs_status_t uct_cxi_iface_tag_recv_cancel(uct_iface_h tl_iface,
     struct c_target_cmd     cmd   = {};
     int                     ret;
 
-    priv->cancel_force = force ? 1 : 0;
+    if (force) {
+        /* priv is read here for the last time -- synchronously, while
+         * ctx is still guaranteed to be OUR caller's own valid, in-flight
+         * request (uct.h's own doc comment: force=1 means UCP "assumes
+         * the cancel is... successful" the instant this call is made, so
+         * it may recycle ctx/priv for a completely different receive any
+         * time after this function returns). Snapshot whatever
+         * rendezvous accumulation exists so far into iface-owned memory
+         * -- see cancel_ctx's own doc comment in cxi_iface.h for why
+         * neither ctx nor priv may be touched again for this slot from
+         * here on, by this function or any event handler. */
+        iface->tag.cancel_ctx[priv->slot].rndv_seen = priv->rndv_flags;
+        iface->tag.cancel_ctx[priv->slot].force     = 1;
+    }
 
     cmd.command.opcode = C_CMD_TGT_UNLINK;
     cmd.ptl_list       = C_PTL_LIST_PRIORITY;

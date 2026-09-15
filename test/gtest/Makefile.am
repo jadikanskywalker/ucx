@@ -281,6 +281,7 @@ gtest_SOURCES += \
     uct/cxi/test_cxi_amo.cc \
     uct/cxi/test_cxi_pending.cc \
     uct/cxi/test_cxi_tag.cc \
+    uct/cxi/test_cxi_tag_ovf.cc \
     uct/cxi/test_cxi_tag_rndv.cc
 gtest_LDADD += \
     $(top_builddir)/src/uct/cxi/libuct_cxi.la \

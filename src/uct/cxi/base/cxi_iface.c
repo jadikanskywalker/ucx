@@ -184,7 +184,9 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
 
     {"TAG_OVERFLOW_NUM_BUFS", "4",
      "Number of overflow-list buffers rotated for unexpected tagged\n"
-     "messages (no priority LE posted for them yet).",
+     "messages (no priority LE posted for them yet). Hard ceiling\n"
+     "UCT_CXI_TAG_OVF_NUM_BUFS_MAX (cxi_tag.h) -- one hardware buffer_id\n"
+     "is reserved per buffer for SEARCH_AND_DELETE correlation.",
      ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_num_bufs),
      UCS_CONFIG_TYPE_UINT},
 
@@ -202,8 +204,9 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
 
     {"TAG_MAX_OUTSTANDING", "512",
      "Maximum number of simultaneously-posted priority-list receive LEs.\n"
-     "Hard ceiling 65535 (the hardware buffer_id correlation field is\n"
-     "16 bits).",
+     "Hard ceiling UCT_CXI_TAG_MAX_OUTSTANDING_MAX (the hardware buffer_id\n"
+     "correlation field is 16 bits, and a range at the top of that space\n"
+     "is reserved for SEARCH_AND_DELETE, see cxi_tag.h).",
      ucs_offsetof(uct_cxi_iface_config_t, tag_max_outstanding),
      UCS_CONFIG_TYPE_UINT},
 
@@ -1586,9 +1589,9 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             /* Direct-matched rendezvous Put (Phase B) -- always on the
              * priority list (an unexpected rendezvous arrival stays
              * C_EVENT_PUT/ptl_list==OVERFLOW, handled by the branch
-             * below). Joins tag_handle_rndv_match's 3-event completion
+             * below). Joins tag_handle_rdzv_match's 3-event completion
              * accounting -- see its doc comment. */
-            uct_cxi_iface_tag_handle_rndv_match(iface, event);
+            uct_cxi_iface_tag_handle_rdzv_match(iface, event);
         } else if ((event->hdr.event_type == C_EVENT_GET) &&
                    (iface->rdzv.pte != NULL) &&
                    (event->tgt_long.ptlte_index == iface->rdzv.pte->ptn)) {
@@ -1608,7 +1611,7 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             if (event->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) {
                 uct_cxi_iface_tag_handle_ovf_arrival(iface, event);
             } else if (event->tgt_long.rendezvous) {
-                uct_cxi_iface_tag_handle_rndv_match(iface, event);
+                uct_cxi_iface_tag_handle_rdzv_match(iface, event);
             } else {
                 uct_cxi_iface_tag_handle_eager_match(iface, event);
             }
@@ -1752,16 +1755,43 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
         } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
                    (iface->tag.pte != NULL) &&
                    (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-            /* Delayed correlation: this priority LE was posted after the
-             * matching message had already landed in the overflow ring --
-             * same disposition as a direct match, see cxi_tag.c. Route by
-             * event->tgt_long.rendezvous the same way the direct-match
-             * C_EVENT_PUT branch above does. */
-            if (event->tgt_long.rendezvous) {
-                uct_cxi_iface_tag_handle_rndv_match(iface, event);
+            /* Two distinct things share this event type and dispatch
+             * branch:
+             *   - our own SEARCH_AND_DELETE's "found and deleted"
+             *     confirmation (buffer_id in the reserved SEARCH_AND_
+             *     DELETE range, see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE
+             *     in cxi_tag.h) -- checked first and unconditionally,
+             *     since it never has a uct_tag_context_t behind it at all
+             *     and is never rendezvous-flagged (SEARCH_AND_DELETE is
+             *     only ever issued for eager unexpected arrivals) --
+             *     neither match handler below needs to know this case
+             *     exists. With sd.use_once=1, this event type only ever
+             *     fires for the "found" outcome; "not found" is a
+             *     different event type entirely, handled below.
+             *   - delayed correlation for a real match: this priority LE
+             *     was posted after the matching message had already
+             *     landed in the overflow ring -- same disposition as a
+             *     direct match, see cxi_tag.c. Routed by
+             *     event->tgt_long.rendezvous, same as the direct-match
+             *     C_EVENT_PUT branch above. */
+            if (event->tgt_long.buffer_id >=
+                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
+                uct_cxi_iface_tag_handle_search_delete_confirm(iface, event);
+            } else if (event->tgt_long.rendezvous) {
+                uct_cxi_iface_tag_handle_rdzv_match(iface, event);
             } else {
                 uct_cxi_iface_tag_handle_eager_match(iface, event);
             }
+        } else if ((event->hdr.event_type == C_EVENT_SEARCH) &&
+                   (iface->tag.pte != NULL) &&
+                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
+                   (event->tgt_long.buffer_id >=
+                    UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE)) {
+            /* Our own SEARCH_AND_DELETE's "not found" outcome -- see
+             * uct_cxi_iface_tag_handle_search_delete_not_found()'s own
+             * doc comment for why this is a real, load-bearing event
+             * (not a no-op companion) once sd.use_once=1 is set. */
+            uct_cxi_iface_tag_handle_search_delete_not_found(iface, event);
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                      "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",

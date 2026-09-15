@@ -84,6 +84,7 @@ mkdir -p "$OUT" "$UCX/tmp/out"
 cat > "$OUT/wrap.sh" << EOF
 #!/bin/bash
 
+export UCX_TM_THRESH=0
 export UCX_LOG_LEVEL="$LOG_LEVEL"
 OUT_DIR="$OUT"
 IP_FILE="\$OUT_DIR/ip"

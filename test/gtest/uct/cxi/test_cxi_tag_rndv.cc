@@ -426,7 +426,7 @@ UCS_TEST_P(test_cxi_tag_rndv, rndv_request_unsupported)
  * *initial* C_EVENT_PUT/PUT_OVERFLOW arrival (always a 0-byte eager
  * prefix for this transport's rendezvous Puts, see uct_ep_tag_rndv_zcopy),
  * not the later C_EVENT_RENDEZVOUS/C_EVENT_REPLY events, which are routed
- * to tag_handle_rndv_match() regardless of arrival timing, and whose
+ * to tag_handle_rdzv_match() regardless of arrival timing, and whose
  * completion gate only requires those two (not the dropped Put) -- so this
  * *might* already complete correctly today. Whether it does, and whether
  * the eventual Get was NIC-auto-issued or not, is exactly what this test
