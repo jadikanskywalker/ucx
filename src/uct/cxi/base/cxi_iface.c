@@ -1807,9 +1807,14 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                    (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
                    (event->tgt_long.buffer_id >=
                     UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE)) {
-            /* Our own SEARCH_AND_DELETE's "not found" outcome (eager or
-             * rendezvous -- one handler covers both ranges). */
-            uct_cxi_iface_tag_handle_search_delete_not_found(iface, event);
+            int is_rndv = event->tgt_long.buffer_id >=
+                UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
+            int buf_idx = (int)event->tgt_long.buffer_id -
+                        (is_rndv ? UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
+                                    UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE);
+            ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND%s] buf_idx=%d rc=%d "
+                     "match_bits=0x%lx", is_rndv ? "-RNDV" : "", buf_idx,
+                     cxi_event_rc(event), (unsigned long)event->tgt_long.match_bits);
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                      "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",

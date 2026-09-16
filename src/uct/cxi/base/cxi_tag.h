@@ -399,14 +399,6 @@ void uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface
  * raw eager bytes. */
 void uct_cxi_iface_tag_handle_search_delete_confirm_rndv(
         uct_cxi_iface_t *iface, const union c_event *event);
-/* Dispatched from cxi_iface.c for a C_EVENT_SEARCH whose buffer_id falls in
- * either SEARCH_AND_DELETE range (eager or rendezvous) -- the "not found"
- * outcome: hardware's own search-on-append already claimed this arrival via
- * the ordinary priority-LE path. Just releases ovf_refcnt; identical either
- * way, so one handler covers both ranges (event->tgt_long.start is always 0
- * on this event type, so buf_idx comes from buffer_id alone). */
-void uct_cxi_iface_tag_handle_search_delete_not_found(
-        uct_cxi_iface_t *iface, const union c_event *event);
 
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event);

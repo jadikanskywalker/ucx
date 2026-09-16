@@ -839,41 +839,6 @@ uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
 }
 
 /*
- * uct_cxi_iface_tag_handle_search_delete_not_found -- "not found" for our
- * own SEARCH_AND_DELETE (eager or rendezvous -- buffer_id tells us which
- * range, and the disposition is identical either way): hardware's own
- * search-on-append already claimed this arrival via the ordinary
- * priority-LE path instead. event->tgt_long.start is always 0 on this
- * event type (confirmed on real hardware), so buf_idx comes from
- * buffer_id, not from address math. Nothing to copy or report -- the real
- * match already delivered the data through its own, independent path.
- *
- * Deliberately does NOT call uct_cxi_iface_tag_ovf_release() -- this event
- * never reads this arrival's overflow-buffer memory, so it must not decide
- * when that memory becomes safe to repost either. The real delayed-match
- * handler that wins this race (tag_handle_eager_match() or
- * tag_handle_rdzv_match()) always fires for this same arrival exactly once
- * (use_once=1 guarantees this "not found" outcome only occurs when a real
- * priority LE independently claimed it) and releases the reference itself,
- * after it finishes reading. See uct_cxi_iface_tag_ovf_release()'s own doc
- * comment for the bug this fixes.
- */
-void
-uct_cxi_iface_tag_handle_search_delete_not_found(uct_cxi_iface_t *iface,
-                                                 const union c_event *event)
-{
-    int is_rndv = event->tgt_long.buffer_id >=
-                  UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
-    int buf_idx = (int)event->tgt_long.buffer_id -
-                  (is_rndv ? UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
-                             UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE);
-
-    ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND%s] buf_idx=%d rc=%d "
-             "match_bits=0x%lx", is_rndv ? "-RNDV" : "", buf_idx,
-             cxi_event_rc(event), (unsigned long)event->tgt_long.match_bits);
-}
-
-/*
  * uct_cxi_iface_rndv_unexp_pending_push -- park a genuinely-unexpected
  * rendezvous SEARCH_AND_DELETE confirmation that arrived before its
  * initiator's one-time header announce was processed (see uct_cxi_rndv_
