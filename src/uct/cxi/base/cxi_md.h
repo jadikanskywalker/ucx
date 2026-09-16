@@ -97,9 +97,26 @@ typedef struct uct_cxi_rcache_region {
  * cannot resolve the target's VA directly — IOVAs are per-LNI and private
  * to the target's IOMMU namespace — so the target must include IOVA info.
  */
+/*
+ * is_rndv/rendezvous_id: a second flavor of this packed rkey, for the
+ * unexpected-rendezvous path only (cxi_tag.c's tag_handle_search_delete_
+ * confirm_rndv(), uct_cxi_ep_get_zcopy/bcopy's is_rndv branch in cxi_rma.c).
+ * There's no real memory key to pack here -- the receiver synthesizes this
+ * on the stack from hardware event fields, since the Get it drives targets
+ * this transport's own rendezvous source PTE, not a registered buffer. It
+ * still rides through uct_tag_unexp_rndv_cb_t's rkey_buf and back out
+ * through UCP's generic rkey_unpack()/get_zcopy() unchanged (rkey_unpack()
+ * already does a verbatim struct copy). iova/lac are unused when is_rndv is
+ * set; mkey_pack() always sets is_rndv=0 explicitly (the buffer isn't
+ * necessarily zeroed).
+ */
 typedef struct uct_cxi_rkey {
-    uint64_t iova; /**< iova_offset = cxi_md->iova - base_VA (see above) */
-    uint8_t  lac;  /**< Logical Address Context (memory access class)     */
+    uint64_t iova;          /**< iova_offset = cxi_md->iova - base_VA (see above) */
+    uint8_t  lac;           /**< Logical Address Context (memory access class)     */
+    uint8_t  is_rndv;       /**< 0 = ordinary RMA rkey (iova/lac valid); 1 =
+                                 rendezvous-flavored (rendezvous_id valid) */
+    uint8_t  rendezvous_id; /**< Sender's uct_cxi_rdzv_op_t::id -- valid only
+                                 when is_rndv is set */
 } UCS_S_PACKED uct_cxi_rkey_t;
 
 

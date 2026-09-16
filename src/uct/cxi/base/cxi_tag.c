@@ -208,6 +208,10 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         goto err_free_free_list;
     }
 
+    /* Per-peer unexpected-rndv header cache -- see uct_cxi_rndv_peer_hdr_t
+     * in cxi_iface.h. Growable, starts empty; never fails to init. */
+    kh_init_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
+
     /* Unexpected-message copy-out pool: plain host memory (see
      * uct_cxi_tag_unexp_mpool_ops), sized to hold one full eager message. */
     {
@@ -222,7 +226,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         mp_params.name            = "cxi-tag-unexp";
         status = ucs_mpool_init(&mp_params, &self->tag.unexp_pool);
         if (status != UCS_OK) {
-            goto err_free_cancel_ctx;
+            goto err_free_rndv_peer_cache;
         }
     }
 
@@ -369,6 +373,8 @@ err_unmap_rx:
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
 err_cleanup_unexp_pool:
     ucs_mpool_cleanup(&self->tag.unexp_pool, 1);
+err_free_rndv_peer_cache:
+    kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
 err_free_cancel_ctx:
     ucs_free(self->tag.cancel_ctx);
     self->tag.cancel_ctx = NULL;
@@ -408,6 +414,7 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
 
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
     ucs_mpool_cleanup(&self->tag.unexp_pool, 1);
+    kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     ucs_free(self->tag.cancel_ctx);
     ucs_free(self->tag.free_list);
     ucs_free(self->tag.ctx);
@@ -645,21 +652,27 @@ uct_cxi_iface_tag_ovf_data(uct_cxi_iface_t *iface, int buf_idx,
 /*
  * uct_cxi_iface_tag_ovf_release -- drop one reference on an overflow
  * buffer generation (see cxi_iface.h's doc comment on ovf_refcnt). Call
- * exactly once per arrival into that generation, whenever that specific
- * message's own SEARCH_AND_DELETE resolves it -- tag_handle_search_
- * delete_confirm() (found) or tag_handle_search_delete_not_found() (not
- * found), always exactly one of the two with sd.use_once=1 -- or an
- * explicit decision up front to never resolve it via SEARCH_AND_DELETE at
- * all (the rendezvous-arrival drop path below, and the emit-failure path,
- * both release immediately instead). tag_handle_eager_match() (a real
- * hardware delayed match) never releases this -- see its own doc comment:
- * that event's relative ordering against this arrival's own SEARCH_AND_
- * DELETE confirmation is not guaranteed (confirmed on real hardware,
- * test_cxi_tag.forced_race_search_delete_vs_priority_append), so it must
- * never be the thing this accounting depends on. Reposts the generation
- * once the last outstanding reference drains, but only if it was actually
- * marked auto_unlinked -- an ordinary still-linked generation has nothing
- * to repost.
+ * only when the event resolving a given arrival has that arrival's own
+ * mlength>0 (mirroring tag_handle_ovf_arrival()'s increment condition --
+ * an mlength==0 arrival never took a reference to begin with), from
+ * whichever handler is the actual, sole reader of that arrival's own
+ * overflow-buffer memory: tag_handle_search_delete_confirm_eager()/_rndv()
+ * when our own SEARCH_AND_DELETE finds and deletes it (it does the copy,
+ * so it releases); tag_handle_eager_match()/tag_handle_rdzv_match() when a
+ * real priority-LE delayed match wins instead (same reasoning, they do the
+ * copy) -- including their force-cancel branches, which release directly
+ * since the normal copy-then-release path never runs once cancelled.
+ * Never tag_handle_search_delete_not_found() -- that event carries no
+ * data-read obligation of its own (nothing there ever touches
+ * overflow-buffer memory), so it must never gate reposting.
+ *
+ * Relies on this arrival's own raw C_EVENT_PUT always being delivered
+ * before whatever event later resolves it (a real delayed match, or our
+ * own SEARCH_AND_DELETE outcome) -- i.e. the increment here always
+ * precedes the corresponding decrement. This transport already depends on
+ * that same EQ-ordering guarantee elsewhere, so it is assumed rather than
+ * defended against a second time; the assert below is the safety net if
+ * it's ever violated.
  */
 static void
 uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
@@ -673,7 +686,7 @@ uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
 }
 
 /*
- * uct_cxi_iface_tag_handle_search_delete_confirm -- the "found and
+ * uct_cxi_iface_tag_handle_search_delete_confirm_eager -- the "found and
  * deleted" confirmation for our own SEARCH_AND_DELETE: a
  * C_EVENT_PUT_OVERFLOW on the tag PTE whose buffer_id falls in the
  * reserved SEARCH_AND_DELETE range (see UCT_CXI_TAG_SEARCH_DELETE_
@@ -712,7 +725,7 @@ uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
  * reference is released.
  */
 void
-uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
+uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
                                                const union c_event *event)
 {
     int      buf_idx = (int)event->tgt_long.buffer_id -
@@ -728,13 +741,18 @@ uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
         /* Not expected to be reachable with use_once=1 -- see this
          * function's own doc comment. Still release rather than leak if
          * it ever is; there is no companion event to fall back on for
-         * this buf_idx otherwise. */
+         * this buf_idx otherwise. Guarded on len>0 like every other release
+         * here -- a reference was only ever taken for this arrival if its
+         * own mlength was >0 (see ovf_refcnt's doc comment in cxi_iface.h),
+         * and len is that same mlength. */
         ucs_error("cxi TAG [SEARCH-DELETE-UNEXPECTED-RC] tag=0x%lx rc=%d "
                  "buf_idx=%d -- C_EVENT_PUT_OVERFLOW with use_once=1 "
                  "reported a non-OK rc, which real-hardware testing never "
                  "observed; releasing anyway", (unsigned long)tag,
                  cxi_event_rc(event), buf_idx);
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        if (len > 0) {
+            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        }
         return;
     }
 
@@ -753,8 +771,8 @@ uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
     }
     if (len > 0) {
         memcpy(elem, data, len);
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
     }
-    uct_cxi_iface_tag_ovf_release(iface, buf_idx);
 
     ucs_info("cxi TAG [SEARCH-DELETE-MATCH] tag=0x%lx len=%u buf_idx=%d",
              (unsigned long)tag, len, buf_idx);
@@ -771,51 +789,152 @@ uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
 }
 
 /*
- * uct_cxi_iface_tag_handle_search_delete_not_found -- the "not found"
- * outcome for our own SEARCH_AND_DELETE: a C_EVENT_SEARCH on the tag PTE
- * whose buffer_id falls in the reserved SEARCH_AND_DELETE range. With
- * sd.use_once=1, this is the complete, self-contained signal that
- * hardware's own search-on-append already claimed this arrival through
- * the ordinary priority-LE path instead (tag_handle_eager_match() is the
- * one handling the real match and its data -- a separate, independent
- * event, possibly processed before or after this one; ovf_refcnt release
- * never depends on that ordering here, only on this event's own arrival,
- * which is always causally after tag_handle_ovf_arrival()'s own increment
- * since we only ever emit this arrival's SEARCH_AND_DELETE from inside
- * that same function call).
+ * uct_cxi_iface_tag_handle_search_delete_not_found -- "not found" for our
+ * own SEARCH_AND_DELETE (eager or rendezvous -- buffer_id tells us which
+ * range, and the disposition is identical either way): hardware's own
+ * search-on-append already claimed this arrival via the ordinary
+ * priority-LE path instead. event->tgt_long.start is always 0 on this
+ * event type (confirmed on real hardware), so buf_idx comes from
+ * buffer_id, not from address math. Nothing to copy or report -- the real
+ * match already delivered the data through its own, independent path.
  *
- * event->tgt_long.start is always 0 on this event type -- not a real
- * address -- confirmed on real hardware, 8/8 runs across two nodes and
- * four devices each (test_cxi_tag_ovf.raw_event_order_and_manual_search_
- * delete), so buf_idx must come from buffer_id, exactly like the "found"
- * confirmation above. No copy, no eager_cb -- there is nothing to copy;
- * the data belongs to whichever destination the real match already
- * copied it into.
+ * Deliberately does NOT call uct_cxi_iface_tag_ovf_release() -- this event
+ * never reads this arrival's overflow-buffer memory, so it must not decide
+ * when that memory becomes safe to repost either. The real delayed-match
+ * handler that wins this race (tag_handle_eager_match() or
+ * tag_handle_rdzv_match()) always fires for this same arrival exactly once
+ * (use_once=1 guarantees this "not found" outcome only occurs when a real
+ * priority LE independently claimed it) and releases the reference itself,
+ * after it finishes reading. See uct_cxi_iface_tag_ovf_release()'s own doc
+ * comment for the bug this fixes.
  */
 void
 uct_cxi_iface_tag_handle_search_delete_not_found(uct_cxi_iface_t *iface,
                                                  const union c_event *event)
 {
+    int is_rndv = event->tgt_long.buffer_id >=
+                  UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
     int buf_idx = (int)event->tgt_long.buffer_id -
-                  UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE;
+                  (is_rndv ? UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
+                             UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE);
 
-    ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND] buf_idx=%d rc=%d "
-             "match_bits=0x%lx -- hardware's own search-on-append already "
-             "won this race, releasing", buf_idx, cxi_event_rc(event),
-             (unsigned long)event->tgt_long.match_bits);
-    uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+    ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND%s] buf_idx=%d rc=%d "
+             "match_bits=0x%lx", is_rndv ? "-RNDV" : "", buf_idx,
+             cxi_event_rc(event), (unsigned long)event->tgt_long.match_bits);
+}
+
+/*
+ * uct_cxi_iface_tag_handle_search_delete_confirm_rndv -- rendezvous
+ * counterpart of tag_handle_search_delete_confirm_eager() above (buffer_id in the
+ * disjoint RNDV range). No payload to copy -- a rendezvous message's data
+ * is pulled later by UCP's own generic Get, not delivered inline. This just
+ * hands rndv_cb what that Get needs:
+ *   - header/header_length: the real eager-attached bytes for a "warm"
+ *     arrival (mlength>0, cached here for any later "slim" one), or the
+ *     cached prefix + this arrival's own header_data (req_id) for a "slim"
+ *     one -- see uct_ep_tag_rndv_zcopy's warm/slim design.
+ *   - remote_addr = event->tgt_long.remote_offset directly (the sender's
+ *     real source-buffer offset, not an RMA-style rkey-relative value).
+ *   - rkey_buf: a stack uct_cxi_rkey_t with is_rndv=1 and rendezvous_id --
+ *     enough for UCP's later uct_ep_get_zcopy/bcopy call to reach this
+ *     transport's rendezvous source PTE via the same uct_ep, whose
+ *     rem_nid/rem_pid already identify the peer. No real memory key exists
+ *     to pack for this case.
+ */
+void
+uct_cxi_iface_tag_handle_search_delete_confirm_rndv(uct_cxi_iface_t *iface,
+                                                    const union c_event *event)
+{
+    int      buf_idx = (int)event->tgt_long.buffer_id -
+                       UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
+    uint32_t mlength   = event->tgt_long.mlength;
+    uint64_t tag       = event->tgt_long.match_bits;
+    uint32_t initiator = event->tgt_long.initiator.initiator.process;
+    uct_cxi_rndv_hdr_wire_t hdr;
+    uct_cxi_rkey_t rkey = {};
+    khiter_t k;
+
+    if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
+        /* See tag_handle_search_delete_confirm_eager()'s own doc comment --
+         * not expected to be reachable with use_once=1, but release rather
+         * than leak if it ever is. Guarded on mlength>0: a reference was
+         * only ever taken for this arrival if its own mlength was >0. */
+        ucs_error("cxi TAG [SEARCH-DELETE-RNDV-UNEXPECTED-RC] tag=0x%lx "
+                 "rc=%d buf_idx=%d", (unsigned long)tag,
+                 cxi_event_rc(event), buf_idx);
+        if (mlength > 0) {
+            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        }
+        return;
+    }
+
+    if (ucs_unlikely(mlength > 0)) {
+        /* Warm: the real header is sitting in the overflow buffer -- read
+         * it and cache {ep_id, md_index} for a later slim arrival. */
+        void *data = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
+                                                event->tgt_long.start);
+        int   ret;
+
+        memcpy(&hdr, data, ucs_min(mlength, sizeof(hdr)));
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+
+        k = kh_put(uct_cxi_rndv_peer_hash, &iface->tag.rndv_peer_cache,
+                  initiator, &ret);
+        if (ucs_likely(ret != UCS_KH_PUT_FAILED)) {
+            kh_value(&iface->tag.rndv_peer_cache, k) =
+                    (uct_cxi_rndv_peer_hdr_t){hdr.ep_id, hdr.md_index};
+        }
+    } else {
+        /* Slim: reconstruct from this peer's cached {ep_id, md_index} plus
+         * this arrival's own header_data (req_id). A cache miss should be
+         * structurally impossible (the sender only goes slim after
+         * confirming a completed round-trip) -- treat it as a hard error
+         * rather than invent a header. */
+        k = kh_get(uct_cxi_rndv_peer_hash, &iface->tag.rndv_peer_cache,
+                  initiator);
+        if (ucs_unlikely(k == kh_end(&iface->tag.rndv_peer_cache))) {
+            /* No release here -- mlength==0 (slim), so no reference was
+             * ever taken for this arrival to begin with. */
+            ucs_error("cxi TAG [SEARCH-DELETE-RNDV-NO-CACHE] tag=0x%lx "
+                     "initiator=0x%x buf_idx=%d", (unsigned long)tag,
+                     initiator, buf_idx);
+            return;
+        }
+        hdr.ep_id    = kh_value(&iface->tag.rndv_peer_cache, k).ep_id;
+        hdr.md_index = kh_value(&iface->tag.rndv_peer_cache, k).md_index;
+        hdr.req_id   = event->tgt_long.header_data;
+    }
+
+    rkey.is_rndv       = 1;
+    rkey.rendezvous_id = event->tgt_long.rendezvous_id;
+
+    ucs_info("cxi TAG [SEARCH-DELETE-RNDV-MATCH] tag=0x%lx buf_idx=%d "
+             "rlength=%u warm=%d rendezvous_id=%u", (unsigned long)tag,
+             buf_idx, (unsigned)event->tgt_long.rlength, mlength > 0,
+             (unsigned)rkey.rendezvous_id);
+
+    /* flags=0 -- matches the reference HW-tag-offload transport
+     * (uct_rc_mlx5_handle_unexp_rndv(), rc_mlx5_common.c), which passes a
+     * literal 0 here; this transport never fragments a rendezvous
+     * unexpected-arrival report across multiple callback invocations, so
+     * there is no FIRST/LAST-style flag to set. */
+    (void)iface->tag.rndv_cb(iface->tag.rndv_arg, 0, tag, &hdr, sizeof(hdr),
+                             event->tgt_long.remote_offset,
+                             event->tgt_long.rlength, &rkey);
 }
 
 /*
  * uct_cxi_iface_tag_handle_ovf_arrival -- an unexpected message landed in
  * the overflow ring (C_EVENT_PUT, ptl_list==C_PTL_LIST_OVERFLOW). Takes a
- * reference on the buffer generation (see cxi_iface.h's ovf_refcnt doc
- * comment) and issues a targeted SEARCH_AND_DELETE against the unexpected
- * list -- no copy, no eager_cb here: this event alone can never tell
- * whether hardware's own search-on-append will independently win the same
- * race (a real priority LE could already be in flight on the same command
- * queue), so ownership isn't known until the SEARCH_AND_DELETE's own
- * confirmation (tag_handle_search_delete_confirm() or tag_handle_search_
+ * reference on the buffer generation when mlength>0 (see cxi_iface.h's
+ * ovf_refcnt doc comment -- an mlength==0 arrival has no payload sitting in
+ * this buffer for anything to read later, so nothing needs protecting) and
+ * issues a targeted SEARCH_AND_DELETE against the unexpected list -- no
+ * copy, no eager_cb here: this event alone can never tell whether
+ * hardware's own search-on-append will independently win the same race (a
+ * real priority LE could already be in flight on the same command queue),
+ * so ownership isn't known until the SEARCH_AND_DELETE's own confirmation
+ * (tag_handle_search_delete_confirm_eager() or tag_handle_search_
  * delete_not_found(), depending on outcome) resolves it. This is what
  * actually fixes the double-completion crash this increment exists for
  * (job 100716, ucp_request.inl:307): the old code handed off to eager_cb
@@ -829,7 +948,9 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     struct c_target_cmd sd = {};
     int      ret;
 
-    iface->tag.ovf_refcnt[buf_idx]++;
+    if (event->tgt_long.mlength > 0) {
+        iface->tag.ovf_refcnt[buf_idx]++;
+    }
     if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
         /* EQ delivery is ordered, so this Put is guaranteed to be the
          * last one for this buffer generation -- see file header. Record
@@ -838,26 +959,6 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
          * yet -- an earlier, still-unresolved message in the same
          * generation would have its memory reused out from under it. */
         iface->tag.ovf_repost_pending[buf_idx] = 1;
-    }
-
-    /* An unexpected *rendezvous* arrival (event->tgt_long.rendezvous==1)
-     * is explicitly out of scope for this increment -- see the design
-     * plan's "Part 2/3" discussion -- and stays on the drop path
-     * unconditionally: its eager-attached prefix is always 0 bytes
-     * (eager_length=0 on every rendezvous Put this transport sends, see
-     * uct_ep_tag_rndv_zcopy), so routing it through eager_cb would
-     * silently report a 0-byte message to UCP instead of the real
-     * transfer -- worse than dropping it. It is never SEARCH_AND_DELETE'd
-     * (out of scope), so nothing will ever generate a confirmation to
-     * release this reference -- release it immediately instead of leaking
-     * this generation's refcnt (and thus its repost) forever. */
-    if (event->tgt_long.rendezvous) {
-        ucs_debug("cxi TAG [OVF-ARRIVAL-IGNORED] buf_idx=%d tag=0x%lx "
-                 "mlength=%u -- unexpected rendezvous arrival, out of "
-                 "scope for this increment, dropping", buf_idx,
-                 (unsigned long)tag, (unsigned)event->tgt_long.mlength);
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
-        return;
     }
 
     ucs_info("cxi TAG [OVF-ARRIVAL] buf_idx=%d tag=0x%lx mlength=%u "
@@ -902,7 +1003,17 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
      * BUFIDX_BASE's own doc comment in cxi_tag.h for why: the "not found"
      * event's own event->tgt_long.start is always 0, not a real address,
      * so buf_idx cannot be recovered from the confirmation event's other
-     * fields and has to be encoded into the one field we control. */
+     * fields and has to be encoded into the one field we control.
+     *
+     * A rendezvous-flagged arrival (event->tgt_long.rendezvous==1) uses
+     * the disjoint RNDV_BUFIDX_BASE range instead of the plain eager one
+     * -- see that macro's own doc comment in cxi_tag.h -- so cxi_iface.c's
+     * dispatch loop can route the resulting confirmation to
+     * tag_handle_search_delete_confirm_rndv() (which calls rndv_cb, not
+     * eager_cb) rather than the eager handler. This is the one place
+     * eager and rendezvous unexpected arrivals diverge at all: everything
+     * else about the SEARCH_AND_DELETE mechanics (ref-counting, use_once,
+     * match_id/length wildcarding) is identical between the two. */
     sd.command.opcode = C_CMD_TGT_SEARCH_AND_DELETE;
     sd.ptl_list       = C_PTL_LIST_UNEXPECTED;
     sd.ptlte_index    = iface->tag.pte->ptn;
@@ -911,7 +1022,9 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     sd.match_id       = CXI_MATCH_ID_ANY;
     sd.length         = -1U;
     sd.use_once       = 1;
-    sd.buffer_id      = (uint16_t)(UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE +
+    sd.buffer_id      = (uint16_t)((event->tgt_long.rendezvous ?
+                                    UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
+                                    UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) +
                                    buf_idx);
 
     ret = cxi_cq_emit_target(iface->tgt.cmdq, &sd);
@@ -924,7 +1037,9 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
          * loss, not a new failure mode. */
         ucs_error("cxi TAG SEARCH_AND_DELETE emit failed: %d -- dropping "
                  "unexpected message tag=0x%lx", ret, (unsigned long)tag);
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        if (event->tgt_long.mlength > 0) {
+            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        }
         return;
     }
     cxi_cq_ring(iface->tgt.cmdq);
@@ -999,15 +1114,17 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
     cxi_build_dfa(sender_nid, sender_pid, md->pid_bits,
                  md->cxi_dev->info.rdzv_get_idx, &dfa, &idx_ext);
 
-    local_addr  = event->tgt_long.start + event->tgt_long.mlength;
+    /* Always fetches the full [0, rlength) range, never skipping past
+     * mlength: unlike libfabric, any eager-attached bytes here are UCP's
+     * unexpected-rndv header, not payload (see uct_ep_tag_rndv_zcopy's
+     * warm/slim design), so they must always be overwritten. A no-op for
+     * the common "slim" case (mlength always 0). */
+    local_addr  = event->tgt_long.start;
     /* Clamp to the posted buffer's own capacity, not just rlength -- a
-     * rendezvous Put always carries eager_length=0 here, so rlength alone
-     * says nothing about whether this receive is actually truncated.
-     * Mirrors libfabric's issue_rdzv_get(): data_len = MIN(ulen, rlength),
-     * request_len = data_len - mlen (floored at 0). */
+     * truncated receive must never DMA-write past its own posted buffer.
+     * Mirrors libfabric's issue_rdzv_get(): data_len = MIN(ulen, rlength). */
     data_len    = ucs_min(posted_len, event->tgt_long.rlength);
-    request_len = (data_len > event->tgt_long.mlength) ?
-            (data_len - event->tgt_long.mlength) : 0;
+    request_len = data_len;
 
     {
         struct c_full_dma_cmd cmd = {};
@@ -1042,6 +1159,75 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
 }
 
 /*
+ * uct_cxi_iface_issue_rdzv_hdr_get -- corrective Get for a "warm" arrival
+ * (mlength>0) whose pull was NIC-auto-issued (get_issued==1), which already
+ * fetched [mlength, rlength) before software saw this event -- that can't
+ * be undone, so this issues a second, small Get for [0, mlength) to
+ * overwrite the eager-attached header bytes with the real payload. Same
+ * DFA/PTE targeting as uct_cxi_iface_issue_rdzv_get() above; completion
+ * feeds UCT_CXI_RNDV_SEEN_HDR_GET instead of SEEN_REPLY.
+ */
+static ucs_status_t
+uct_cxi_iface_issue_rdzv_hdr_get(uct_cxi_iface_t *iface,
+                                 const union c_event *event, uint16_t slot)
+{
+    uct_cxi_md_t              *md = uct_cxi_iface_md(iface);
+    uint32_t                   init_dfa;
+    uint32_t                   sender_nid;
+    uint32_t                   sender_pid;
+    union c_fab_addr           dfa;
+    uint8_t                    idx_ext;
+    uct_cxi_rdzv_hdr_get_op_t *rop;
+    int                        ret;
+
+    rop = (uct_cxi_rdzv_hdr_get_op_t *)ucs_mpool_get(
+            &iface->tag.rdzv_get_op_pool);
+    if (ucs_unlikely(rop == NULL)) {
+        ucs_error("cxi TAG rdzv_get_op_pool exhausted (hdr get), slot=%u",
+                 slot);
+        return UCS_ERR_NO_RESOURCE;
+    }
+    rop->op.ep      = NULL;
+    rop->op.comp    = NULL;
+    rop->op.handler = uct_cxi_rdzv_hdr_get_comp;
+    rop->iface      = iface;
+    rop->slot       = slot;
+
+    init_dfa   = event->tgt_long.initiator.initiator.process;
+    sender_nid = cxi_dfa_nid(init_dfa);
+    sender_pid = cxi_dfa_pid(init_dfa, md->pid_bits);
+    cxi_build_dfa(sender_nid, sender_pid, md->pid_bits,
+                 md->cxi_dev->info.rdzv_get_idx, &dfa, &idx_ext);
+
+    {
+        struct c_full_dma_cmd cmd = {};
+        cmd.command.opcode     = C_CMD_GET;
+        cmd.index_ext          = idx_ext;
+        cmd.lac                = 0;
+        cmd.event_send_disable = 1;
+        cmd.restricted         = 0;
+        cmd.eq                 = iface->evtq->eqn;
+        cmd.dfa                = dfa;
+        cmd.remote_offset      = event->tgt_long.remote_offset;
+        cmd.local_addr         = event->tgt_long.start;
+        cmd.request_len        = event->tgt_long.mlength;
+        cmd.match_bits         = event->tgt_long.rendezvous_id;
+        cmd.user_ptr           = (uint64_t)(uintptr_t)rop;
+
+        ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
+    }
+    if (ucs_unlikely(ret != 0)) {
+        ucs_mpool_put(rop);
+        ucs_error("cxi TAG rdzv hdr Get emit failed: %d slot=%u", ret, slot);
+        return UCS_ERR_NO_RESOURCE;
+    }
+    cxi_cq_ring(iface->tx.cmdq);
+    ucs_debug("cxi TAG [RDZV-HDR-GET-SW] slot=%u len=%u", slot,
+             (unsigned)event->tgt_long.mlength);
+    return UCS_OK;
+}
+
+/*
  * uct_cxi_iface_tag_match_lookup -- shared prefix for every tag-PTE match
  * handler (eager, rendezvous): the slot/ctx lookup is identical regardless
  * of which kind of match this turns out to be, so it lives here once
@@ -1051,7 +1237,7 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
  * or the handlers' own; see the handlers' doc comments. A
  * SEARCH_AND_DELETE confirmation (buffer_id==UCT_CXI_TAG_SEARCH_DELETE_
  * SENTINEL) never reaches here at all -- iface_progress() routes it to
- * uct_cxi_iface_tag_handle_search_delete_confirm() before either match
+ * uct_cxi_iface_tag_handle_search_delete_confirm_eager() before either match
  * handler, let alone this shared lookup, is ever called.
  *
  * Returns NULL (nothing further to do) for a stale/already-resolved slot;
@@ -1097,7 +1283,7 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
  * explicit memcpy. So an explicit software copy from the overflow buffer
  * into priv->recv_addr is required here, unconditionally, whenever this
  * event type fires -- this is what "unified overflow-buffer lifecycle"
- * means: uct_cxi_iface_tag_handle_search_delete_confirm() below does the
+ * means: uct_cxi_iface_tag_handle_search_delete_confirm_eager() below does the
  * exact same copy, just into an eager_cb scratch buffer instead of a
  * posted receive's own buffer, for the case where no receive was posted
  * at all.
@@ -1110,18 +1296,12 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
  * confirm() directly, before ever choosing between this function and
  * tag_handle_rdzv_match().
  *
- * Does the copy for a delayed match, but deliberately never touches
- * ovf_refcnt -- this event's relative ordering against this same
- * arrival's own SEARCH_AND_DELETE confirmation/not-found event is not
- * guaranteed (confirmed on real hardware under genuine concurrent
- * racing, test_cxi_tag.forced_race_search_delete_vs_priority_append: the
- * delayed-match notification can be delivered before the arrival's own
- * raw overflow-landing event, which is what actually issues that
- * SEARCH_AND_DELETE in the first place). Release always happens through
- * that arrival's own SEARCH_AND_DELETE outcome instead (tag_handle_
- * search_delete_confirm() or tag_handle_search_delete_not_found()) --
- * see uct_cxi_iface_tag_ovf_release()'s own doc comment for why that's
- * the only ordering-safe choice.
+ * Does the copy for a delayed match, then releases the overflow-buffer
+ * reference itself -- this handler is the only reader of this arrival's
+ * overflow-buffer memory in this outcome (tag_handle_search_delete_
+ * not_found() fires for the same arrival too, but never touches that
+ * memory, so it must not be the thing reposting depends on -- see
+ * uct_cxi_iface_tag_ovf_release()'s own doc comment).
  *
  * Checks iface->tag.cancel_ctx[slot].force before touching ctx/priv at
  * all -- see cancel_ctx's own doc comment in cxi_iface.h. Per the UCT
@@ -1132,7 +1312,10 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
  * (a cxi_tag.c:1511 assertion firing with a *different*, live receive's
  * own priv->slot value). If the flag is set, the slot is reclaimed (the
  * LE is consumed either way) without ever reading ctx, and no callback or
- * copy happens (the copy would only ever be read by the callback anyway).
+ * copy happens (the copy would only ever be read by the callback anyway) --
+ * but a still-held overflow-buffer reference (a warm PUT_OVERFLOW) is
+ * released regardless, since the normal path below that would otherwise do
+ * it never runs on this branch.
  */
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event)
@@ -1156,6 +1339,17 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
 
     if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
         iface->tag.cancel_ctx[slot].force = 0;
+        if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
+            (event->tgt_long.mlength > 0)) {
+            /* Force-cancelled: the normal path below (which would
+             * otherwise do this release after its copy) never runs, but
+             * the reference taken at arrival still needs releasing or this
+             * buffer generation can never repost. No copy needed -- ctx is
+             * never read on this branch. */
+            buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface,
+                                                    event->tgt_long.start);
+            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        }
         ucs_debug("cxi TAG [MATCH-RACED-CANCEL] slot=%d -- force-cancelled, "
                  "dropping match silently", slot);
         return;
@@ -1169,17 +1363,21 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
              slot, (unsigned long)event->tgt_long.match_bits,
              (unsigned)event->tgt_long.mlength);
 
-    if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
-        /* Delayed match: copy out of the overflow buffer. No ovf_refcnt
-         * release here -- see this function's own doc comment and
-         * uct_cxi_iface_tag_ovf_release()'s. */
+    if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
+        (event->tgt_long.mlength > 0)) {
+        /* Delayed match: copy out of the overflow buffer, then release --
+         * see this function's own doc comment and uct_cxi_iface_tag_ovf_
+         * release()'s. Gated on mlength>0 like the arrival side's own
+         * increment (cxi_iface.h's ovf_refcnt doc comment): an mlength==0
+         * delayed match never took a reference to begin with. */
+        void *data;
+
         buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface, event->tgt_long.start);
-        if (event->tgt_long.mlength > 0) {
-            void *data = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
-                                                    event->tgt_long.start);
-            memcpy((void *)(uintptr_t)priv->recv_addr, data,
-                  event->tgt_long.mlength);
-        }
+        data    = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
+                                             event->tgt_long.start);
+        memcpy((void *)(uintptr_t)priv->recv_addr, data,
+              event->tgt_long.mlength);
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
     }
 
     stag    = event->tgt_long.match_bits;
@@ -1193,35 +1391,67 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
 }
 
 /*
+ * uct_cxi_iface_tag_rdzv_cancel_seen -- OR seen_bit into a force-cancelled
+ * slot's accumulated cancel_ctx state and reclaim it once
+ * UCT_CXI_RNDV_SEEN_REQUIRED is satisfied. Shared by every place that
+ * accumulates events for a slot after tag_recv_cancel(force=1) -- see
+ * cancel_ctx's own doc comment in cxi_iface.h for why the slot can't be
+ * reclaimed just because force was requested: other events for the same
+ * transfer may still be in flight.
+ */
+static inline void
+uct_cxi_iface_tag_rdzv_cancel_seen(uct_cxi_iface_t *iface, int slot,
+                                   uint8_t seen_bit)
+{
+    uint8_t seen = (iface->tag.cancel_ctx[slot].rndv_seen |= seen_bit);
+
+    if ((seen & UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
+        iface->tag.ctx[slot] = NULL;
+        iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
+        iface->tag.cancel_ctx[slot].force = 0;
+    }
+}
+
+/*
+ * uct_cxi_iface_tag_rdzv_fail -- fail a rendezvous receive right away and
+ * hand its slot to cancel_ctx-driven deferred reclaim, exactly as if it had
+ * been force-cancelled: other required events (an independent Get, or a
+ * not-yet-arrived Put/Rendezvous) may still be in flight and must drain
+ * before the slot can be reused. Used for both Get-issuance failures and
+ * Get-completion failures.
+ */
+static void
+uct_cxi_iface_tag_rdzv_fail(uct_cxi_iface_t *iface, uct_tag_context_t *ctx,
+                            int slot, uint8_t seen_bit, ucs_status_t status)
+{
+    uct_cxi_tag_ctx_priv_t *priv = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
+
+    ctx->completed_cb(ctx, priv->stag, 0, 0, NULL, status);
+    iface->tag.cancel_ctx[slot].rndv_seen = priv->rndv_flags;
+    iface->tag.cancel_ctx[slot].force     = 1;
+    uct_cxi_iface_tag_rdzv_cancel_seen(iface, slot, seen_bit);
+}
+
+/*
  * uct_cxi_iface_tag_handle_rdzv_match -- a rendezvous match: either
- * C_EVENT_PUT/C_EVENT_PUT_OVERFLOW with event->tgt_long.rendezvous==1 (the
- * eager-attached prefix landing, part of a larger transfer, not a
- * complete delivery on its own), or C_EVENT_RENDEZVOUS itself (announces
- * the pull -- see uct_cxi_iface_issue_rdzv_get above for the get_issued==0
- * software-Get-issue path). Never called for a plain eager event -- see
- * iface_progress()'s own dispatch.
+ * C_EVENT_PUT/C_EVENT_PUT_OVERFLOW with event->tgt_long.rendezvous==1, or
+ * C_EVENT_RENDEZVOUS itself (announces the pull -- see
+ * uct_cxi_iface_issue_rdzv_get above for the get_issued==0 case). A
+ * receive completes once all of UCT_CXI_RNDV_SEEN_REQUIRED has arrived --
+ * Put/Put_Overflow and Rendezvous can arrive in either order (confirmed on
+ * real hardware; matches libfabric's rdzv_recv_req_event()); Reply/HDR_GET
+ * are only ever resolved once C_EVENT_RENDEZVOUS itself has been processed
+ * (see that branch below), so they can't race it. HDR_GET is marked "seen"
+ * without a real Get whenever one isn't needed -- see its own comment.
+ * tag_consumed_cb fires on the first event regardless: it only signals
+ * "don't also match this in software".
  *
- * Per the design plan's Part 1 point 5, a rendezvous receive is only
- * complete once three events have all been seen -- Put/Put_Overflow,
- * Rendezvous, and Reply (the last delivered via
- * uct_cxi_iface_tag_handle_rdzv_reply for a NIC-auto-issued Get, or via
- * uct_cxi_rdzv_get_comp's ordinary op->handler path for a software-issued
- * one) -- confirmed via libfabric's own rdzv_recv_req_event() comment,
- * arriving in any order. tag_consumed_cb fires on the *first* of the
- * three seen regardless: it only signals "don't also match this in
- * software", unrelated to whether the pull has completed.
- *
- * Checks iface->tag.cancel_ctx[slot].force before touching ctx/priv at
- * all -- see cancel_ctx's own doc comment in cxi_iface.h. Unlike the
- * eager case, a force-cancelled rendezvous slot can still have up to 2
- * more of these events arrive after the flag is set (this receive
- * accumulates across up to 3 events total: Put/Put_Overflow, Rendezvous,
- * Reply), so this function keeps accumulating into iface->tag.
- * cancel_ctx[slot].rndv_seen (snapshotted from priv->rndv_flags at cancel
- * time) instead of priv, and only reclaims the slot once that reaches
- * UCT_CXI_RNDV_SEEN_REQUIRED -- reclaiming any earlier would let a new
- * receive reuse the same buffer_id while this one's remaining events are
- * still in flight.
+ * Checks cancel_ctx[slot].force before touching ctx/priv -- see its doc
+ * comment in cxi_iface.h. A force-cancelled slot keeps accumulating via
+ * uct_cxi_iface_tag_rdzv_cancel_seen() instead of priv until reclaimed --
+ * including, on that branch, releasing any overflow-buffer reference this
+ * arrival holds (a warm PUT_OVERFLOW), since the normal path below that
+ * would otherwise do it never runs.
  */
 void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
                                          const union c_event *event)
@@ -1243,43 +1473,49 @@ void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
             UCT_CXI_RNDV_SEEN_RNDV : UCT_CXI_RNDV_SEEN_PUT;
 
     if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
-        if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
-            !event->tgt_long.get_issued) {
-            /* UCP already assumes this receive's buffer is free to reuse,
-             * so issuing our own pull now would DMA-write into memory we
-             * no longer have any claim to -- abandon it. No Get means no
-             * Reply will ever arrive, so mark it "seen" here purely to
-             * stop it gating reclaim below -- but the Put/Put_Overflow
-             * event for this same transfer may still be pending (these 3
-             * events can arrive in any order, confirmed on real hardware,
-             * see this function's own doc comment), so the slot is NOT
-             * freed unconditionally here: it falls through to the same
-             * accumulate-and-check below, reclaiming now if Put has
-             * already been seen, or whenever it later arrives otherwise. */
-            ucs_debug("cxi TAG [RNDV-GET-SKIPPED-CANCEL] slot=%d -- "
-                     "force-cancelled before software Get issue, "
-                     "abandoning pull", slot);
-            iface->tag.cancel_ctx[slot].rndv_seen |= UCT_CXI_RNDV_SEEN_REPLY;
+        if (event->hdr.event_type == C_EVENT_RENDEZVOUS) {
+            /* The buffer is already gone (UCP's contract for force=1) --
+             * never issue a new Get into it. The corrective header Get (if
+             * one would otherwise have been needed) is always abandoned
+             * here; the main pull's Reply is abandoned too when
+             * get_issued==0 (no Get was ever issued for it at all), but
+             * left pending when get_issued==1 -- hardware's own auto-Get
+             * is already in flight regardless of cancellation and will
+             * complete normally via uct_cxi_iface_tag_handle_rdzv_reply(),
+             * which routes back through this same force-cancel
+             * accumulation. */
+            ucs_debug("cxi TAG [RNDV-CANCEL] slot=%d get_issued=%u", slot,
+                     (unsigned)event->tgt_long.get_issued);
+            iface->tag.cancel_ctx[slot].rndv_seen |= UCT_CXI_RNDV_SEEN_HDR_GET;
+            if (!event->tgt_long.get_issued) {
+                iface->tag.cancel_ctx[slot].rndv_seen |= UCT_CXI_RNDV_SEEN_REPLY;
+            }
+        } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
+                  (event->tgt_long.mlength > 0)) {
+            /* Force-cancelled: the normal path below (which would
+             * otherwise release this after caching the header) never runs,
+             * but the reference taken at arrival still needs releasing or
+             * this buffer generation can never repost. No copy needed --
+             * priv is never read on this branch. */
+            int buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface,
+                                                        event->tgt_long.start);
+            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
         }
-
-        iface->tag.cancel_ctx[slot].rndv_seen |= seen_bit;
-        if ((iface->tag.cancel_ctx[slot].rndv_seen &
-             UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
-            iface->tag.ctx[slot] = NULL;
-            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
-            iface->tag.cancel_ctx[slot].force = 0;
-        }
-        /* Not yet all required bits seen: nothing more here -- wait for
-         * whichever of {Put/Put_Overflow, Reply} is still outstanding.
-         * Reply only remains outstanding when get_issued==1, arriving via
-         * tag_handle_rdzv_reply()/uct_cxi_rdzv_get_comp -> tag_rdzv_
-         * reply_done(), which carries this same cancel_ctx check. */
+        uct_cxi_iface_tag_rdzv_cancel_seen(iface, slot, seen_bit);
         return;
     }
 
     priv = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
     ucs_assertv(priv->slot == (uint16_t)slot, "priv->slot=%u slot=%d",
                priv->slot, slot);
+
+    if (priv->rndv_flags == 0) {
+        /* First of the three events seen for this slot -- fire
+         * tag_consumed_cb immediately: it only concerns software
+         * double-matching, not pull completion. */
+        priv->rndv_flags |= UCT_CXI_RNDV_FLAG_IS_RNDV;
+        ctx->tag_consumed_cb(ctx);
+    }
 
     if (event->hdr.event_type == C_EVENT_RENDEZVOUS) {
         ucs_debug("cxi TAG [RENDEZVOUS] slot=%d tag=0x%lx mlength=%u "
@@ -1296,96 +1532,115 @@ void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
                  slot, (unsigned long)event->tgt_long.match_bits,
                  (unsigned)event->tgt_long.mlength,
                  (unsigned)event->tgt_long.rlength);
-    }
-
-    if (priv->rndv_flags == 0) {
-        /* First of the three events seen for this slot -- fire
-         * tag_consumed_cb immediately: it only concerns software
-         * double-matching, not pull completion. */
-        priv->rndv_flags |= UCT_CXI_RNDV_FLAG_IS_RNDV;
-        ctx->tag_consumed_cb(ctx);
-    }
-
-    /* match_bits is only the real tag on C_EVENT_PUT/PUT_OVERFLOW.
-     * C_EVENT_RENDEZVOUS's own match_bits is hardware-internal rendezvous
-     * bookkeeping instead (confirmed on real hardware: masking to the low
-     * 8 bits recovers the sender's own rdzv op id, exactly like the
-     * source-side C_EVENT_GET's match_bits does -- see
-     * uct_cxi_iface_tag_handle_rdzv_get's doc comment) -- capturing it here
-     * would silently corrupt the tag reported to completed_cb whenever
-     * C_EVENT_RENDEZVOUS happens to be processed after the Put-side event
-     * (order is not guaranteed; only luck of ordering made every prior
-     * test pass). */
-    if (seen_bit == UCT_CXI_RNDV_SEEN_PUT) {
+        /* match_bits is only the real tag on C_EVENT_PUT/PUT_OVERFLOW.
+        * C_EVENT_RENDEZVOUS's own match_bits is hardware-internal rendezvous
+        * bookkeeping instead (confirmed on real hardware: masking to the low
+        * 8 bits recovers the sender's own rdzv op id, exactly like the
+        * source-side C_EVENT_GET's match_bits does -- see
+        * uct_cxi_iface_tag_handle_rdzv_get's doc comment) -- capturing it here
+        * would silently corrupt the tag reported to completed_cb whenever
+        * C_EVENT_RENDEZVOUS happens to be processed after the Put-side event
+        * (order is not guaranteed; only luck of ordering made every prior
+        * test pass). */
         priv->stag = event->tgt_long.match_bits;
     }
     priv->length      = event->tgt_long.rlength;
     priv->rndv_flags |= seen_bit;
     if (event->tgt_long.rlength > priv->posted_len) {
-        /* Real truncation is against the posted buffer's own capacity, not
-         * mlength -- a rendezvous Put always carries eager_length=0 here,
-         * so mlength is 0 throughout and "rlength > mlength" would be true
-         * for nearly every non-empty message, truncated or not. See
-         * posted_len's own comment in cxi_tag.h. */
+        /* Real truncation is against the posted buffer's own capacity --
+         * for a "slim" arrival (the common case) mlength is 0, so
+         * "rlength > mlength" would be true for nearly every non-empty
+         * message, truncated or not. See posted_len's own comment in
+         * cxi_tag.h. */
         priv->rndv_flags |= UCT_CXI_RNDV_FLAG_TRUNCATED;
     }
 
-    if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
-        !event->tgt_long.get_issued) {
-        status = uct_cxi_iface_issue_rdzv_get(iface, event, (uint16_t)slot,
-                                              priv->posted_len);
-        if (ucs_unlikely(status != UCS_OK)) {
-            /* Resource exhaustion issuing the pull -- nothing sane to do
-             * but fail the receive now; matches how other allocation
-             * failures on this hot path are handled elsewhere in this
-             * transport (e.g. desc_pool exhaustion). completed_cb accepts
-             * any ucs_status_t (confirmed via ucp_tag_offload_completed(),
-             * which forwards status verbatim with no allowlist), so
-             * propagating the real failure status is safe and accurate,
-             * not just the three statuses uct.h's doc comment enumerates
-             * as typical, and it's safe to call exactly once, right now,
-             * regardless of event ordering.
-             *
-             * The slot NUMBER is a separate question, though: no Get
-             * means no Reply will ever arrive, but the Put/Put_Overflow
-             * event for this same transfer may still be pending (any
-             * order -- see this function's own doc comment), and once
-             * completed_cb returns UCP may recycle this ctx for a
-             * different receive at any time (same hazard as force=1, see
-             * cancel_ctx's own doc comment in cxi_iface.h) -- so ctx/priv
-             * must not be read again after this point either. Switch this
-             * slot over to the same cancel_ctx-driven accumulation
-             * force-cancel uses: seed rndv_seen from whatever priv->
-             * rndv_flags already holds (read here for the last time,
-             * already includes this event's own seen_bit) plus Reply
-             * marked "seen" since none will ever come, and reclaim now if
-             * that's already everything required, or later when the
-             * remaining event drains. */
-            ucs_error("cxi TAG failed to issue software rdzv Get, "
-                     "slot=%d: completing with error, deferring slot "
-                     "reclaim until all in-flight events for it drain",
-                     slot);
-            ctx->completed_cb(ctx, event->tgt_long.match_bits, 0, 0, NULL,
-                              status);
-            iface->tag.cancel_ctx[slot].rndv_seen = priv->rndv_flags |
-                                                    UCT_CXI_RNDV_SEEN_REPLY;
-            iface->tag.cancel_ctx[slot].force = 1;
-            if ((iface->tag.cancel_ctx[slot].rndv_seen &
-                 UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
-                iface->tag.ctx[slot] = NULL;
-                iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
-                iface->tag.cancel_ctx[slot].force = 0;
+    if (event->hdr.event_type == C_EVENT_RENDEZVOUS) {
+        if (ucs_unlikely(!event->tgt_long.get_issued)) {
+            status = uct_cxi_iface_issue_rdzv_get(iface, event, (uint16_t)slot,
+                                                priv->posted_len);
+            if (ucs_unlikely(status != UCS_OK)) {
+                /* Resource exhaustion issuing the pull -- fail now (no Get
+                * means no Reply will ever arrive) and defer slot reclaim,
+                * since the Put/Put_Overflow event may still be pending.
+                * There is no separate corrective Get for get_issued==0
+                * either way (the single pull always covers the full
+                * range), so abandon both. */
+                ucs_error("cxi TAG failed to issue rdzv Get, slot=%d", slot);
+                uct_cxi_iface_tag_rdzv_fail(iface, ctx, slot,
+                        UCT_CXI_RNDV_SEEN_REPLY | UCT_CXI_RNDV_SEEN_HDR_GET,
+                        status);
+                return;
             }
-            return;
+            /* The single full-range pull already covers [0, rlength) --
+             * there is no separate corrective Get for get_issued==0. */
+            priv->rndv_flags |= UCT_CXI_RNDV_SEEN_HDR_GET;
+        } else if (ucs_unlikely(event->tgt_long.mlength > 0)) {
+            /* get_issued==1, warm: the NIC's own auto-issued pull already
+             * skipped [0, mlength) -- fetch it explicitly. SEEN_HDR_GET is
+             * left unset here; uct_cxi_rdzv_hdr_get_comp() sets it once
+             * this Get actually completes. */
+            status = uct_cxi_iface_issue_rdzv_hdr_get(iface, event,
+                                                      (uint16_t)slot);
+            if (ucs_unlikely(status != UCS_OK)) {
+                ucs_error("cxi TAG failed to issue rdzv hdr Get, slot=%d",
+                         slot);
+                uct_cxi_iface_tag_rdzv_fail(iface, ctx, slot,
+                                           UCT_CXI_RNDV_SEEN_HDR_GET, status);
+                return;
+            }
+        } else {
+            /* get_issued==1, slim: nothing to correct. */
+            priv->rndv_flags |= UCT_CXI_RNDV_SEEN_HDR_GET;
         }
-        /* get_issued==1: nothing further here -- the NIC auto-issued the
-         * pull; its completion arrives via
-         * uct_cxi_iface_tag_handle_rdzv_reply(), not this path. */
+    } else if (ucs_unlikely(event->tgt_long.mlength > 0)) {
+        /* Warm Put/Put_Overflow: cache the real header for this peer (see
+         * uct_ep_tag_rndv_zcopy's warm/slim design). Whether a corrective
+         * Get will actually be needed depends on get_issued too, which only
+         * C_EVENT_RENDEZVOUS carries -- that decision is made below, in the
+         * C_EVENT_RENDEZVOUS branch, regardless of arrival order.
+         *
+         * PUT_OVERFLOW here also releases the overflow-buffer reference
+         * this arrival took (mlength>0, so tag_handle_ovf_arrival() did
+         * take one) after reading hdr_src -- this handler, not
+         * tag_handle_search_delete_not_found(), is the actual reader of
+         * that memory when a real priority LE wins the race. See
+         * uct_cxi_iface_tag_ovf_release()'s and tag_handle_eager_match()'s
+         * doc comments for the same rule and the bug this fixes
+         * (forced_race_search_delete_vs_priority_append). */
+        uint32_t initiator = event->tgt_long.initiator.initiator.process;
+        const void *hdr_src;
+        uct_cxi_rndv_hdr_wire_t hdr;
+        khiter_t k;
+        int ret;
+        int buf_idx = -1;
+
+        if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
+            buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface,
+                                                    event->tgt_long.start);
+            hdr_src = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
+                                                 event->tgt_long.start);
+        } else {
+            hdr_src = (const void *)(uintptr_t)priv->recv_addr;
+        }
+
+        memcpy(&hdr, hdr_src, ucs_min(event->tgt_long.mlength, sizeof(hdr)));
+
+        if (buf_idx >= 0) {
+            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+        }
+
+        k = kh_put(uct_cxi_rndv_peer_hash, &iface->tag.rndv_peer_cache,
+                  initiator, &ret);
+        if (ucs_likely(ret != UCS_KH_PUT_FAILED)) {
+            kh_value(&iface->tag.rndv_peer_cache, k) =
+                    (uct_cxi_rndv_peer_hdr_t){hdr.ep_id, hdr.md_index};
+        }
     }
 
     if ((priv->rndv_flags & UCT_CXI_RNDV_SEEN_REQUIRED) !=
         UCT_CXI_RNDV_SEEN_REQUIRED) {
-        return; /* Still waiting for Rendezvous and/or Reply. */
+        return; /* Still waiting for another required event. */
     }
 
     iface->tag.ctx[slot] = NULL;
@@ -1397,6 +1652,8 @@ void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
      * gtest). priv->length otherwise (non-truncated) never exceeds
      * posted_len, so this min is a no-op in that case. */
     length = ucs_min(priv->length, priv->posted_len);
+    /* A failed Get completes immediately via uct_cxi_iface_tag_rdzv_fail()
+     * instead of reaching here, so only truncation is left to check. */
     status = (priv->rndv_flags & UCT_CXI_RNDV_FLAG_TRUNCATED) ?
             UCS_ERR_MESSAGE_TRUNCATED : UCS_OK;
 
@@ -1406,26 +1663,16 @@ void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
 }
 
 /*
- * uct_cxi_iface_tag_rdzv_reply_done -- shared completion-accounting for a
- * rendezvous Get's C_EVENT_REPLY, common to both the NIC-auto-issued path
- * (uct_cxi_iface_tag_handle_rdzv_reply) and the software-issued path
- * (uct_cxi_rdzv_get_comp). Marks UCT_CXI_RNDV_SEEN_REPLY for the given
- * slot and fires completed_cb if that was the last of the three events
- * (Put/Put_Overflow, Rendezvous, Reply) needed -- see tag_handle_match's
- * own doc comment for the full three-event model.
- *
- * Checks iface->tag.cancel_ctx[slot].force before touching ctx/priv at
- * all -- same reasoning as tag_handle_rdzv_match(), which this function
- * mirrors for the Reply event specifically (the only one of the three
- * that doesn't route through that function directly). get_issued==1 is
- * the only way to reach a Reply on a force-cancelled slot at all (the
- * get_issued==0 case abandons the pull and reclaims the slot immediately
- * in tag_handle_rdzv_match(), so no Reply ever follows it) -- so the
- * abandon-the-pull branch there has no equivalent needed here.
+ * uct_cxi_iface_tag_rdzv_reply_done -- completion for one of a rendezvous
+ * receive's (up to two) Gets: the main pull's Reply (seen_bit=SEEN_REPLY,
+ * via uct_cxi_iface_tag_handle_rdzv_reply or uct_cxi_rdzv_get_comp) or the
+ * corrective header Get (seen_bit=SEEN_HDR_GET, via
+ * uct_cxi_rdzv_hdr_get_comp). Marks seen_bit and fires completed_cb once
+ * UCT_CXI_RNDV_SEEN_REQUIRED is satisfied.
  */
 static void
 uct_cxi_iface_tag_rdzv_reply_done(uct_cxi_iface_t *iface, int slot,
-                                  ucs_status_t get_status)
+                                  uint8_t seen_bit, ucs_status_t get_status)
 {
     uct_tag_context_t     *ctx;
     uct_cxi_tag_ctx_priv_t *priv;
@@ -1443,13 +1690,7 @@ uct_cxi_iface_tag_rdzv_reply_done(uct_cxi_iface_t *iface, int slot,
     }
 
     if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
-        iface->tag.cancel_ctx[slot].rndv_seen |= UCT_CXI_RNDV_SEEN_REPLY;
-        if ((iface->tag.cancel_ctx[slot].rndv_seen &
-             UCT_CXI_RNDV_SEEN_REQUIRED) == UCT_CXI_RNDV_SEEN_REQUIRED) {
-            iface->tag.ctx[slot] = NULL;
-            iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
-            iface->tag.cancel_ctx[slot].force = 0;
-        }
+        uct_cxi_iface_tag_rdzv_cancel_seen(iface, slot, seen_bit);
         return;
     }
 
@@ -1460,25 +1701,25 @@ uct_cxi_iface_tag_rdzv_reply_done(uct_cxi_iface_t *iface, int slot,
     ucs_assertv(priv->rndv_flags & UCT_CXI_RNDV_FLAG_IS_RNDV,
                "slot=%d rndv_flags=0x%x", slot, priv->rndv_flags);
 
-    priv->rndv_flags |= UCT_CXI_RNDV_SEEN_REPLY;
-
     if (ucs_unlikely(get_status != UCS_OK)) {
-        /* A failed pull overrides any truncation status -- there is no
-         * partial-success notion here, the destination buffer's contents
-         * beyond the eager-attached prefix are simply undefined. */
-        priv->rndv_flags &= ~UCT_CXI_RNDV_FLAG_TRUNCATED;
+        /* Fail now rather than accumulate -- there's no partial-success
+         * notion for a failed pull, and this reports the real status
+         * exactly once instead of trying to merge it with a second,
+         * independent Get that might still be outstanding. */
+        uct_cxi_iface_tag_rdzv_fail(iface, ctx, slot, seen_bit, get_status);
+        return;
     }
 
+    priv->rndv_flags |= seen_bit;
     if ((priv->rndv_flags & UCT_CXI_RNDV_SEEN_REQUIRED) !=
         UCT_CXI_RNDV_SEEN_REQUIRED) {
-        return; /* Still waiting for Rendezvous. */
+        return; /* Still waiting for another required event. */
     }
 
     stag   = priv->stag;
     length = ucs_min(priv->length, priv->posted_len);
-    status = ucs_unlikely(get_status != UCS_OK) ? get_status :
-            (priv->rndv_flags & UCT_CXI_RNDV_FLAG_TRUNCATED) ?
-                    UCS_ERR_MESSAGE_TRUNCATED : UCS_OK;
+    status = (priv->rndv_flags & UCT_CXI_RNDV_FLAG_TRUNCATED) ?
+            UCS_ERR_MESSAGE_TRUNCATED : UCS_OK;
 
     iface->tag.ctx[slot] = NULL;
     iface->tag.free_list[iface->tag.free_count++] = (uint16_t)slot;
@@ -1509,7 +1750,7 @@ void uct_cxi_iface_tag_handle_rdzv_reply(uct_cxi_iface_t *iface,
     ucs_debug("cxi TAG [RDZV-GET-NIC] slot=%u rc=%d", user_ptr->buffer_id,
              cxi_event_rc(event));
     uct_cxi_iface_tag_rdzv_reply_done(iface, (int)user_ptr->buffer_id,
-                                      status);
+                                      UCT_CXI_RNDV_SEEN_REPLY, status);
 }
 
 /*
@@ -1526,7 +1767,26 @@ void uct_cxi_rdzv_get_comp(uct_cxi_send_op_t *op, ucs_status_t status)
     int                     slot  = rop->slot;
 
     ucs_mpool_put(rop);
-    uct_cxi_iface_tag_rdzv_reply_done(iface, slot, status);
+    uct_cxi_iface_tag_rdzv_reply_done(iface, slot, UCT_CXI_RNDV_SEEN_REPLY,
+                                      status);
+}
+
+/*
+ * uct_cxi_rdzv_hdr_get_comp -- uct_cxi_send_op_t::handler for the
+ * corrective header Get issued by uct_cxi_iface_issue_rdzv_hdr_get() for a
+ * warm+matched, get_issued==1 rendezvous receive. Feeds UCT_CXI_RNDV_SEEN_
+ * HDR_GET rather than UCT_CXI_RNDV_SEEN_REPLY -- see UCT_CXI_RNDV_SEEN_
+ * HDR_GET's own comment in cxi_tag.h.
+ */
+void uct_cxi_rdzv_hdr_get_comp(uct_cxi_send_op_t *op, ucs_status_t status)
+{
+    uct_cxi_rdzv_hdr_get_op_t *rop   = (uct_cxi_rdzv_hdr_get_op_t *)op;
+    uct_cxi_iface_t           *iface = rop->iface;
+    int                        slot  = rop->slot;
+
+    ucs_mpool_put(rop);
+    uct_cxi_iface_tag_rdzv_reply_done(iface, slot, UCT_CXI_RNDV_SEEN_HDR_GET,
+                                      status);
 }
 
 /*
@@ -1850,34 +2110,27 @@ void uct_cxi_rdzv_put_ack_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 /*
  * uct_cxi_ep_tag_rndv_zcopy -- expose iov for a native hardware pull.
  *
- * Targets ep->dfa_tag (the *same* PTE eager uses -- Part 1 point 1/2 of
- * the design plan: a rendezvous Put is a distinct opcode,
- * C_CMD_RENDEZVOUS_PUT, not an ordinary Put, but it lands on the same
- * matching PTE). eager_length is deliberately always 0: `header` is only
- * ever meaningful to the receiver for the genuinely-unexpected case (per
- * this op's own UCT API doc, "available to the receiver in case of
- * unexpected rendezvous operation only") which this increment doesn't
- * implement (unexpected arrivals are unconditionally dropped -- see
- * cxi_tag.c's tag_handle_ovf_arrival). Landing header bytes inline would
- * write them into the *front* of the receiver's real destination buffer,
- * corrupting it, for zero benefit given nothing reads them back this
- * increment. remote_offset is set to the iov's own address (mirroring
- * libfabric's local_addr==remote_offset pattern, cxip_msg_hpc.c:4565-4572)
- * so the receiver's later Get (software-issued or NIC-auto-issued) can
- * address straight into it, against the dedicated rendezvous PTE -- a
- * matching PTE (DEFAULT-protocol style), not restricted, see
- * uct_cxi_rdzv_op_t's own doc comment in cxi_tag.h for why.
+ * Targets ep->dfa_tag, the same PTE eager uses (C_CMD_RENDEZVOUS_PUT is a
+ * distinct opcode but lands on the same matching PTE). remote_offset is
+ * the iov's own address, mirroring libfabric's local_addr==remote_offset
+ * pattern, so the receiver's later Get (software- or NIC-issued) can
+ * address straight into it against the dedicated, matching (not
+ * restricted) rendezvous PTE -- see uct_cxi_rdzv_op_t's doc comment.
+ * cmd.rendezvous_id carries this op's own iface->rdzv.ops[] index to the
+ * receiver via its RENDEZVOUS event, which stamps it into its own Get's
+ * match_bits for an O(1) lookup on our C_EVENT_GET instead of a scan.
  *
- * cmd.rendezvous_id carries this op's own id (its index in
- * iface->rdzv.ops[]) to the receiver via its RENDEZVOUS event -- the
- * receiver stamps it into its own Get's match_bits, which comes back to
- * us on our own C_EVENT_GET for an O(1) lookup instead of a scan; see
- * uct_cxi_rdzv_op_t's doc comment for the full round trip.
+ * header/header_length -- see uct_cxi_ep_t::rndv_hdr_state (cxi_ep.h) for
+ * the warm/slim design this implements: UNCONFIRMED sends the full header
+ * inline (eager_length=header_length, rop->is_warm=1, corrected later if
+ * matched -- see UCT_CXI_RNDV_SEEN_HDR_GET); CONFIRMED sends only the
+ * volatile trailing 8 bytes via header_data (eager_length=0, the prior
+ * always-0 behavior), letting the receiver reconstruct the rest from its
+ * per-peer cache.
  *
- * The returned handle is a uct_cxi_rdzv_op_t* (&iface->rdzv.ops[id]),
- * tracked there (rop->valid) until the peer's Get lands
- * (uct_cxi_iface_tag_handle_rdzv_get) and comp fires, or until
- * uct_ep_tag_rndv_cancel() removes it first.
+ * Returns a uct_cxi_rdzv_op_t* (&iface->rdzv.ops[id]), tracked until the
+ * peer's Get lands (uct_cxi_iface_tag_handle_rdzv_get) or
+ * uct_ep_tag_rndv_cancel() removes it.
  */
 ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
                                            const void *header,
@@ -1893,6 +2146,9 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     uint64_t              local_addr;
     uint32_t              id;
     uct_cxi_rdzv_op_t    *rop;
+    int                   is_warm;
+    uint32_t              eager_length;
+    uint64_t              header_data;
     int                   ret;
 
     if (ucs_unlikely(iovcnt != 1ul)) {
@@ -1909,6 +2165,21 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     id  = iface->rdzv.free_ids[--iface->rdzv.free_count];
     rop = &iface->rdzv.ops[id];
 
+    is_warm = (ep->rndv_hdr_state == UCT_CXI_RNDV_HDR_UNCONFIRMED);
+    if (ucs_unlikely(is_warm)) {
+        eager_length = header_length;
+        header_data  = 0; /* full header travels via the eager attach instead */
+    } else {
+        /* Only req_id varies per send (see uct_cxi_rndv_hdr_wire_t) --
+         * header_length is always exactly sizeof(uct_cxi_rndv_hdr_wire_t)
+         * whenever this offload protocol is in use (see UCT_CXI_TAG_RNDV_
+         * MAX_HDR's comment), but guard anyway rather than read past the
+         * caller's buffer. */
+        eager_length = 0;
+        ucs_assert(header_length >= sizeof(uct_cxi_rndv_hdr_wire_t));
+        header_data = ((const uct_cxi_rndv_hdr_wire_t *)header)->req_id;
+    }
+
     local_addr    = memh->iova_offset + (uint64_t)(uintptr_t)iov[0].buffer;
     rop->op.ep      = ep;   /* real ep -- unlike uct_cxi_rdzv_get_op_t, this
                              * op has a genuine owning ep, so the normal
@@ -1924,6 +2195,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     rop->length   = (uint32_t)length;
     rop->id       = (uint8_t)id;
     rop->valid    = 1;
+    rop->is_warm  = (uint8_t)is_warm;
 
     {
         struct c_full_dma_cmd cmd  = {};
@@ -1938,7 +2210,8 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.local_addr              = local_addr;
         cmd.request_len             = (uint32_t)length;
         cmd.remote_offset           = local_addr;
-        cmd.eager_length            = 0;
+        cmd.eager_length            = eager_length;
+        cmd.header_data             = header_data;
         cmd.use_offset_for_get      = 1;
         cmd.rendezvous_id           = (uint8_t)id; /* carried to the
                                             receiver via its RENDEZVOUS
@@ -1959,8 +2232,8 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     ep->outstanding++;
     iface->tx.outstanding++;
     ucs_debug("cxi TAG [RNDV-SEND] ep=%p tag=0x%lx id=%u local_addr=0x%lx "
-             "len=%zu", ep, (unsigned long)tag, id,
-             (unsigned long)local_addr, length);
+             "len=%zu warm=%d", ep, (unsigned long)tag, id,
+             (unsigned long)local_addr, length, is_warm);
     return rop;
 }
 
@@ -2023,6 +2296,15 @@ void uct_cxi_iface_tag_handle_rdzv_get(uct_cxi_iface_t *iface,
     status     = uct_cxi_rc_to_status(cxi_event_rc(event));
     ucs_debug("cxi TAG [RNDV-GOT] id=%u len=%u rc=%d", id, rop->length,
              cxi_event_rc(event));
+
+    /* A warm Get landing proves the receiver processed (and cached) this
+     * op's header -- see uct_cxi_rndv_hdr_state_t (cxi_ep.h). Only the
+     * first such confirmation per ep matters. */
+    if (ucs_unlikely(rop->is_warm)) {
+        rop->op.ep->rndv_hdr_state = UCT_CXI_RNDV_HDR_CONFIRMED;
+        ucs_debug("cxi TAG [RNDV-HDR-CONFIRMED] ep=%p id=%u", rop->op.ep, id);
+    }
+
     if (rop->comp != NULL) {
         uct_invoke_completion(rop->comp, status);
     }

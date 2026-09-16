@@ -34,24 +34,24 @@
  * its own; a large fixed threshold is unvalidated and unnecessary here. */
 #define UCT_CXI_TAG_OVF_MIN_FREE      256u
 
-/* buffer_id (the slot-correlation field) is uint16_t -- these two bounds
- * split that 16-bit space into two disjoint ranges: real priority-LE slot
- * ids [0, max_outstanding), and one reserved SEARCH_AND_DELETE buffer_id
- * per overflow ring buffer, [UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE,
- * UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + num_bufs). num_bufs itself is
- * capped at UCT_CXI_TAG_OVF_NUM_BUFS_MAX so the split point is a fixed
- * compile-time constant regardless of the actual configured ring size --
- * see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE below for why this range
- * exists at all. */
+/* buffer_id (uint16_t) splits into three disjoint ranges: real priority-LE
+ * slot ids [0, max_outstanding); one reserved *eager* SEARCH_AND_DELETE id
+ * per overflow buffer, [BUFIDX_BASE, BUFIDX_BASE + num_bufs); and,
+ * separately, one reserved *rendezvous* id per overflow buffer,
+ * [RNDV_BUFIDX_BASE, + num_bufs) -- eager and rendezvous arrivals share the
+ * same overflow ring but dispatch to different UCP callbacks (eager_cb vs
+ * rndv_cb), so each buf_idx needs two distinct ids. num_bufs is capped at
+ * UCT_CXI_TAG_OVF_NUM_BUFS_MAX so both split points stay fixed constants. */
 #define UCT_CXI_TAG_OVF_NUM_BUFS_MAX      1024u
 #define UCT_CXI_TAG_MAX_OUTSTANDING_MAX   \
-        (65535u - UCT_CXI_TAG_OVF_NUM_BUFS_MAX)
+        (65535u - (2u * UCT_CXI_TAG_OVF_NUM_BUFS_MAX))
 
-/* Advertised rndv.max_hdr -- comfortably above sizeof(ucp_tag_offload_
- * unexp_rndv_hdr_t) (17 bytes), which UCP asserts on unconditionally once
- * tag_lane is selected, even though this increment discards the header
- * entirely (see uct_cxi_ep_tag_rndv_zcopy in cxi_tag.c). Not tied to any
- * real transport limit -- just needs to satisfy that assert with margin. */
+/* Advertised rndv.max_hdr -- must be >= sizeof(ucp_tag_offload_unexp_
+ * rndv_hdr_t) (17 bytes), which UCP sends with every offloaded rendezvous
+ * send and asserts on unconditionally; reporting less would silently
+ * disable the whole offloaded-rendezvous protocol, not just the
+ * unexpected-arrival path this header now supports (see uct_ep_tag_rndv_
+ * zcopy's warm/slim logic). 256 is just comfortable margin. */
 #define UCT_CXI_TAG_RNDV_MAX_HDR      256u
 
 /* Base of the reserved buffer_id range used for our own SEARCH_AND_DELETE
@@ -87,6 +87,13 @@
  * directly into the one field the command lets us choose ourselves. */
 #define UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE  UCT_CXI_TAG_MAX_OUTSTANDING_MAX
 
+/* Rendezvous counterpart of the range above -- see its own doc comment
+ * (UCT_CXI_TAG_OVF_NUM_BUFS_MAX's comment) for why a disjoint range is
+ * needed. Dispatched in cxi_iface.c's progress loop before ever falling
+ * back to the eager SEARCH_AND_DELETE handlers. */
+#define UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE \
+        (UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + UCT_CXI_TAG_OVF_NUM_BUFS_MAX)
+
 /* uct_cxi_tag_ctx_priv_t::rndv_flags bits 1-3 -- per-event bookkeeping for
  * a rendezvous receive (pre-shifted to land directly in rndv_flags).
  *
@@ -115,11 +122,18 @@
  * regression, not just these two tests, specifically watching for any
  * reintroduced hang. */
 enum {
-    UCT_CXI_RNDV_SEEN_PUT   = UCS_BIT(1), /* C_EVENT_PUT or C_EVENT_PUT_OVERFLOW */
-    UCT_CXI_RNDV_SEEN_RNDV  = UCS_BIT(2), /* C_EVENT_RENDEZVOUS */
-    UCT_CXI_RNDV_SEEN_REPLY = UCS_BIT(3), /* C_EVENT_REPLY (get_issued 0 or 1) */
+    UCT_CXI_RNDV_SEEN_PUT     = UCS_BIT(1), /* C_EVENT_PUT or C_EVENT_PUT_OVERFLOW */
+    UCT_CXI_RNDV_SEEN_RNDV    = UCS_BIT(2), /* C_EVENT_RENDEZVOUS */
+    UCT_CXI_RNDV_SEEN_REPLY   = UCS_BIT(3), /* C_EVENT_REPLY (get_issued 0 or 1) */
+    /* The corrective header Get for a warm+get_issued==1 receive (see its
+     * own doc comment below) -- unconditionally required, but the
+     * C_EVENT_RENDEZVOUS handling in tag_handle_rdzv_match() marks it
+     * "seen" immediately, with no real Get ever issued, whenever one isn't
+     * actually needed (get_issued==0, where the single full-range pull
+     * already covers it, or get_issued==1 with a slim/mlength==0 arrival). */
+    UCT_CXI_RNDV_SEEN_HDR_GET = UCS_BIT(4),
     UCT_CXI_RNDV_SEEN_REQUIRED = UCT_CXI_RNDV_SEEN_PUT | UCT_CXI_RNDV_SEEN_RNDV |
-                                 UCT_CXI_RNDV_SEEN_REPLY
+                                 UCT_CXI_RNDV_SEEN_REPLY | UCT_CXI_RNDV_SEEN_HDR_GET
 };
 
 /*
@@ -137,9 +151,9 @@ typedef struct uct_cxi_tag_ctx_priv {
                              *             on the first (only) event as
                              *             before. 1 => hold for
                              *             rndv_seen==SEEN_ALL.
-                             * bits 1-3  = UCT_CXI_RNDV_SEEN_* accumulated so
+                             * bits 1-4  = UCT_CXI_RNDV_SEEN_* accumulated so
                              *             far (only meaningful if bit 0 set).
-                             * bit 4     = truncated (rlength > mlength),
+                             * bit 5     = truncated (rlength > mlength),
                              *             latched from whichever tgt_long
                              *             event arrives (Put/Put_Overflow/
                              *             Rendezvous all carry the same
@@ -192,10 +206,10 @@ typedef struct uct_cxi_tag_ctx_priv {
                              * at pull time, regardless of match timing). */
 } uct_cxi_tag_ctx_priv_t;
 
-/* uct_cxi_tag_ctx_priv_t::rndv_flags bit layout (bits 1-3 are
+/* uct_cxi_tag_ctx_priv_t::rndv_flags bit layout (bits 1-4 are
  * UCT_CXI_RNDV_SEEN_* above). */
 #define UCT_CXI_RNDV_FLAG_IS_RNDV     UCS_BIT(0)
-#define UCT_CXI_RNDV_FLAG_TRUNCATED   UCS_BIT(4)
+#define UCT_CXI_RNDV_FLAG_TRUNCATED   UCS_BIT(5)
 
 /* Hard ceiling on iface->rdzv.max_outstanding: the id has to survive a hop
  * through the original Put's own cmd.rendezvous_id field (struct
@@ -286,6 +300,10 @@ typedef struct uct_cxi_rdzv_op {
     uint8_t           valid;   /* 0 once freed (completed or cancelled) --
                                    guards a stale/duplicate C_EVENT_GET the
                                    same way the old STALE-drop path did */
+    uint8_t           is_warm; /* 1 if this send carried the full header
+                                   (see uct_ep_tag_rndv_zcopy). Its first
+                                   Get landing flips op.ep's rndv_hdr_state
+                                   to CONFIRMED. */
 } uct_cxi_rdzv_op_t;
 
 /*
@@ -306,6 +324,18 @@ typedef struct uct_cxi_rdzv_get_op {
                               * its own way back to the iface. */
     uint16_t          slot; /* priority-LE slot this Get belongs to */
 } uct_cxi_rdzv_get_op_t;
+
+/*
+ * Corrective header Get for a warm+matched rendezvous arrival (see
+ * UCT_CXI_RNDV_SEEN_HDR_GET). Same shape as uct_cxi_rdzv_get_op_t, sharing
+ * its pool, distinguished only by its handler (uct_cxi_rdzv_hdr_get_comp),
+ * which feeds UCT_CXI_RNDV_SEEN_HDR_GET instead of SEEN_REPLY.
+ */
+typedef struct uct_cxi_rdzv_hdr_get_op {
+    uct_cxi_send_op_t op;   /* must be first */
+    uct_cxi_iface_t  *iface;
+    uint16_t          slot;
+} uct_cxi_rdzv_hdr_get_op_t;
 
 /* Cancel is a bare software-tracking removal, no hardware operation at all
  * -- confirmed safe via the UCT API doc (uct_ep_tag_rndv_cancel() disregards
@@ -377,30 +407,29 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self);
  */
 void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                           const union c_event *event);
-/* Dispatched directly from cxi_iface.c's progress loop for a
- * C_EVENT_PUT_OVERFLOW whose buffer_id falls in the reserved SEARCH_
- * AND_DELETE range (see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE's doc
- * comment), before ever choosing between eager and rendezvous match
- * handling. Never rendezvous-flagged (SEARCH_AND_DELETE is only ever
- * issued for eager unexpected arrivals). With sd.use_once=1, this event
- * type only ever fires for the "found and deleted" outcome (C_RC_OK) --
- * the "not found" outcome is a separate event type, C_EVENT_SEARCH, see
+/* Dispatched from cxi_iface.c for a C_EVENT_PUT_OVERFLOW whose buffer_id
+ * falls in the reserved eager SEARCH_AND_DELETE range (see UCT_CXI_TAG_
+ * SEARCH_DELETE_BUFIDX_BASE), before choosing between eager and rendezvous
+ * match handling. With sd.use_once=1, this event only ever fires "found and
+ * deleted" (C_RC_OK) -- "not found" is C_EVENT_SEARCH, see
  * uct_cxi_iface_tag_handle_search_delete_not_found() below. */
-void uct_cxi_iface_tag_handle_search_delete_confirm(uct_cxi_iface_t *iface,
+void uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
                                                     const union c_event *event);
-/* Dispatched directly from cxi_iface.c's progress loop for a
- * C_EVENT_SEARCH whose buffer_id falls in the reserved SEARCH_AND_DELETE
- * range -- with sd.use_once=1, this is the complete, self-contained "not
- * found" outcome (hardware's own search-on-append already claimed this
- * arrival through the ordinary priority-LE path instead): releases
- * ovf_refcnt for the buf_idx encoded in the event's own buffer_id
- * directly, no copy, no eager_cb. Unlike tag_handle_search_delete_
- * confirm() above, this event's own event->tgt_long.start is always 0 --
- * not a real address -- confirmed on real hardware
- * (test_cxi_tag_ovf.raw_event_order_and_manual_search_delete); buffer_id
- * is the only usable field. */
+/* Rendezvous counterpart of the above, for the disjoint RNDV_BUFIDX_BASE
+ * range: calls rndv_cb instead of eager_cb, and reconstructs/caches the
+ * unexpected-rndv header (uct_cxi_rndv_peer_hdr_t) instead of just copying
+ * raw eager bytes. */
+void uct_cxi_iface_tag_handle_search_delete_confirm_rndv(
+        uct_cxi_iface_t *iface, const union c_event *event);
+/* Dispatched from cxi_iface.c for a C_EVENT_SEARCH whose buffer_id falls in
+ * either SEARCH_AND_DELETE range (eager or rendezvous) -- the "not found"
+ * outcome: hardware's own search-on-append already claimed this arrival via
+ * the ordinary priority-LE path. Just releases ovf_refcnt; identical either
+ * way, so one handler covers both ranges (event->tgt_long.start is always 0
+ * on this event type, so buf_idx comes from buffer_id alone). */
 void uct_cxi_iface_tag_handle_search_delete_not_found(
         uct_cxi_iface_t *iface, const union c_event *event);
+
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event);
 void uct_cxi_iface_tag_handle_rdzv_match(uct_cxi_iface_t *iface,
@@ -448,6 +477,33 @@ void uct_cxi_iface_tag_handle_rdzv_get(uct_cxi_iface_t *iface,
  * an RMA get_bcopy caller.
  */
 void uct_cxi_rdzv_get_comp(uct_cxi_send_op_t *op, ucs_status_t status);
+
+/*
+ * uct_cxi_rdzv_hdr_get_comp -- uct_cxi_send_op_t::handler for the corrective
+ * header Get issued for a "warm" rendezvous arrival that turned out matched
+ * (see UCT_CXI_RNDV_SEEN_HDR_GET). Feeds UCT_CXI_RNDV_SEEN_HDR_GET (not
+ * UCT_CXI_RNDV_SEEN_REPLY) into the slot's accumulated rndv_flags.
+ */
+void uct_cxi_rdzv_hdr_get_comp(uct_cxi_send_op_t *op, ucs_status_t status);
+
+/*
+ * Mirrors ucp_tag_offload_unexp_rndv_hdr_t's exact layout (ucp/tag/
+ * offload.h: uint64_t ep_id; uint64_t req_id; uint8_t md_index;), duplicated
+ * here rather than included -- uct must not depend on ucp (see src/
+ * AGENTS.md's layer boundaries). UCS_S_PACKED makes this byte-for-byte
+ * identical to the real header, so the raw bytes UCP hands to/expects from
+ * this transport can be reinterpreted as this struct directly, with named
+ * field access instead of manual offset arithmetic. ep_id and md_index are
+ * constant for the life of a UCP connection; req_id is the only field that
+ * varies per send, which is exactly why it (and only it) travels via
+ * header_data on a "slim" send -- see uct_ep_tag_rndv_zcopy and iface->tag.
+ * rndv_peer_cache (cxi_iface.h) for the full warm/slim design.
+ */
+typedef struct uct_cxi_rndv_hdr_wire {
+    uint64_t ep_id;
+    uint64_t req_id;
+    uint8_t  md_index;
+} UCS_S_PACKED uct_cxi_rndv_hdr_wire_t;
 
 /* UCT tag-matching ops -- installed into uct_cxi_iface_ops in cxi_iface.c.
  * eager_short/bcopy/zcopy and tag_recv_zcopy/cancel are Phase A.

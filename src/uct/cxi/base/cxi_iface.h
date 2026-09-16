@@ -14,6 +14,7 @@
 #include <uct/base/uct_md.h>
 #include <uct/api/uct.h>
 #include <ucs/datastruct/arbiter.h>
+#include <ucs/datastruct/khash.h>
 #include <ucs/datastruct/list.h>
 #include <ucs/datastruct/mpool.h>
 #include <ucs/time/time.h>
@@ -186,6 +187,25 @@ typedef struct uct_cxi_pte_fc {
  * pointer to it is needed here, so a forward declaration avoids a circular
  * include. */
 struct uct_cxi_rdzv_op;
+
+/*
+ * Per-peer cache of the two constant fields of UCP's unexpected-rndv
+ * header (ep_id, md_index) -- its third field, req_id, varies per message
+ * and travels separately (see uct_ep_tag_rndv_zcopy's warm/slim design in
+ * cxi_tag.c). Growable hash keyed by initiator (event->tgt_long.initiator.
+ * initiator.process): the number of distinct peers isn't knowable in
+ * advance, and a fixed-size table would either waste memory or, worse,
+ * evict a still-needed entry under load -- same reasoning as uct_srd_ep_
+ * hash's own per-peer table (uct/ib/efa/srd/srd_iface.h). One entry per
+ * peer that has ever sent a "warm" rendezvous message, for the life of the
+ * iface; never removed (a later warm message from the same peer just
+ * overwrites the existing entry).
+ */
+typedef struct uct_cxi_rndv_peer_hdr {
+    uint64_t ep_id;
+    uint8_t  md_index;
+} uct_cxi_rndv_peer_hdr_t;
+KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
 
 /**
  * CXI interface instance.
@@ -376,15 +396,29 @@ typedef struct uct_cxi_iface {
 
         /* Per-buffer-generation reference count -- mirrors libfabric's own
          * cxip_ptelist_buf refcount/consumed design (cxip_ptelist_buf.c).
-         * Incremented on every C_EVENT_PUT into this buffer (arrival);
-         * decremented on whatever later resolves that specific message
-         * (uct_cxi_iface_tag_ovf_release()). A buffer generation's
-         * auto_unlinked flag (set on its last arrival) only records that a
-         * repost is *pending* (ovf_repost_pending) -- the actual repost is
-         * deferred until refcnt drains to 0, so an unresolved earlier
-         * message in the same generation can never have its memory reused
-         * out from under it. */
-        uint32_t             *ovf_refcnt;         /**< [num_bufs] */
+         * Incremented on a C_EVENT_PUT into this buffer only when
+         * mlength>0 -- an mlength==0 arrival has no payload actually
+         * sitting in the overflow buffer's memory for anything to read
+         * later, so there is nothing to protect and no reference is taken
+         * for it at all. Decremented, symmetrically, only by whichever
+         * event both resolves that specific message AND actually read its
+         * payload (uct_cxi_iface_tag_ovf_release(), called only when that
+         * event's own mlength>0 too). A buffer generation's auto_unlinked
+         * flag (set on its last arrival) only records that a repost is
+         * *pending* (ovf_repost_pending) -- the actual repost is deferred
+         * until refcnt drains to 0, so an unresolved earlier message in the
+         * same generation can never have its memory reused out from under
+         * it.
+         *
+         * Relies on a given arrival's own raw C_EVENT_PUT always being
+         * delivered before whatever event later decrements its reference
+         * (a real priority-LE delayed match, or our own SEARCH_AND_DELETE
+         * outcome) -- this transport already depends on that same
+         * EQ-ordering guarantee elsewhere, so it is assumed here rather
+         * than defended against a second time. uct_cxi_iface_tag_ovf_
+         * release()'s assert is the safety net if that assumption is ever
+         * violated. */
+        uint32_t             *ovf_refcnt;          /**< [num_bufs] */
         uint8_t              *ovf_repost_pending; /**< [num_bufs] */
 
         ucs_mpool_t           unexp_pool;  /**< Copy-out buffers for unexpected
@@ -393,8 +427,15 @@ typedef struct uct_cxi_iface {
         /* uct_cxi_rdzv_get_op_t pool for software-issued (get_issued==0)
          * rendezvous Gets -- see cxi_tag.h. Capped the same as
          * max_outstanding: can never have more outstanding software Gets
-         * than outstanding priority-LE receives. */
+         * than outstanding priority-LE receives. Also backs the corrective
+         * header Get (uct_cxi_rdzv_hdr_get_op_t) for a warm+matched
+         * arrival -- same capacity reasoning, at most one of either kind
+         * outstanding per slot at a time. */
         ucs_mpool_t           rdzv_get_op_pool;
+
+        /* Per-peer unexpected-rndv header cache -- see uct_cxi_rndv_peer_
+         * hdr_t's own doc comment above. */
+        khash_t(uct_cxi_rndv_peer_hash) rndv_peer_cache;
 
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;

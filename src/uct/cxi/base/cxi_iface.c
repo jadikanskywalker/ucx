@@ -944,7 +944,25 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * Step 16: rendezvous source-exposure PTE -- only meaningful (and
      * only opened) if tag offload actually enabled above. See cxi_tag.c
      * and the design plan's Part 1 point 4.
+     *
+     * self->rdzv is zeroed unconditionally here, *before* the tag.enabled
+     * check -- unlike self->tag (memset as the first line of open_tag_pte(),
+     * called unconditionally above), self->rdzv has no call site that always
+     * runs regardless of whether tag offload ends up enabled. Without this,
+     * a build where HW_TM isn't requested (e.g. ucx_info, which never sets
+     * UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB/RNDV_CB) leaves self->rdzv as
+     * uninitialized heap memory (ucs_class_malloc() -> plain ucs_malloc(),
+     * never zeroed) for the iface's entire lifetime -- confirmed on real
+     * hardware as the root cause of a segfault in uct_cxi_iface_close_
+     * rdzv_pte()'s cxil_unmap_pte() call: self->rdzv.enabled read as
+     * garbage-but-truthy (heap reuse from a prior, real rdzv PTE instance),
+     * so self->rdzv.pte_map was a stale, already-freed pointer. Reproduced
+     * against the pre-session baseline commit too -- not a new regression,
+     * just newly exercised by a tool that never happened to request HW_TM.
+     * open_rdzv_pte()'s own internal memset stays in place too, for anyone
+     * calling it directly outside this constructor.
      */
+    memset(&self->rdzv, 0, sizeof(self->rdzv));
     if (self->tag.enabled) {
         status = uct_cxi_iface_open_rdzv_pte(self, lni);
         if (status != UCS_OK) {
@@ -1202,17 +1220,18 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
         iface_attr->cap.tag.eager.max_zcopy = iface->tag.buf_size;
         iface_attr->cap.tag.eager.max_iov   = 1;
 
-        /* Phase B (direct-match only) -- see the design plan's "Current
-         * increment". max_hdr must be >= sizeof(ucp_tag_offload_unexp_
-         * rndv_hdr_t) (17 bytes) unconditionally once tag_lane is
-         * selected -- UCP asserts this (ucp_ep.c's ucs_assertv_always on
-         * rndv.max_hdr) regardless of whether the header is ever
-         * meaningfully used. We accept but discard header_length up to
-         * this max -- see uct_cxi_ep_tag_rndv_zcopy's own comment on why
-         * (header only matters for the genuinely-unexpected case, out of
-         * scope this increment). max_zcopy/max_iov bounded by
-         * c_full_dma_cmd's own request_len (uint32_t) and our own
-         * single-iov restriction. */
+        /* max_hdr must be >= sizeof(ucp_tag_offload_unexp_rndv_hdr_t) (17
+         * bytes) unconditionally once tag_lane is selected -- UCP asserts
+         * this (ucp_ep.c's ucs_assertv_always on rndv.max_hdr) and, more
+         * importantly, always packs exactly that header into every
+         * offloaded rendezvous send regardless of whether it turns out
+         * unexpected -- reporting anything below 17 would silently
+         * disable the whole offloaded-rendezvous protocol, not just the
+         * unexpected-arrival path this header now actually supports (see
+         * uct_ep_tag_rndv_zcopy's warm/slim header logic in cxi_tag.c).
+         * 256 keeps comfortable margin above that real minimum. max_zcopy/
+         * max_iov bounded by c_full_dma_cmd's own request_len (uint32_t)
+         * and our own single-iov restriction. */
         iface_attr->cap.flags              |= UCT_IFACE_FLAG_TAG_RNDV_ZCOPY;
         iface_attr->cap.tag.rndv.max_hdr    = UCT_CXI_TAG_RNDV_MAX_HDR;
         iface_attr->cap.tag.rndv.max_zcopy  = UINT32_MAX;
@@ -1755,28 +1774,19 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
         } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
                    (iface->tag.pte != NULL) &&
                    (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-            /* Two distinct things share this event type and dispatch
-             * branch:
-             *   - our own SEARCH_AND_DELETE's "found and deleted"
-             *     confirmation (buffer_id in the reserved SEARCH_AND_
-             *     DELETE range, see UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE
-             *     in cxi_tag.h) -- checked first and unconditionally,
-             *     since it never has a uct_tag_context_t behind it at all
-             *     and is never rendezvous-flagged (SEARCH_AND_DELETE is
-             *     only ever issued for eager unexpected arrivals) --
-             *     neither match handler below needs to know this case
-             *     exists. With sd.use_once=1, this event type only ever
-             *     fires for the "found" outcome; "not found" is a
-             *     different event type entirely, handled below.
-             *   - delayed correlation for a real match: this priority LE
-             *     was posted after the matching message had already
-             *     landed in the overflow ring -- same disposition as a
-             *     direct match, see cxi_tag.c. Routed by
-             *     event->tgt_long.rendezvous, same as the direct-match
-             *     C_EVENT_PUT branch above. */
+            /* Either our own SEARCH_AND_DELETE's "found" confirmation
+             * (buffer_id in the eager or, checked first since it's
+             * numerically higher, rendezvous range -- see UCT_CXI_TAG_
+             * SEARCH_DELETE_*_BUFIDX_BASE in cxi_tag.h), or delayed
+             * correlation for a real match (same disposition as a direct
+             * match, routed by event->tgt_long.rendezvous). */
             if (event->tgt_long.buffer_id >=
-                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
-                uct_cxi_iface_tag_handle_search_delete_confirm(iface, event);
+                UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE) {
+                uct_cxi_iface_tag_handle_search_delete_confirm_rndv(iface,
+                                                                    event);
+            } else if (event->tgt_long.buffer_id >=
+                       UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
+                uct_cxi_iface_tag_handle_search_delete_confirm_eager(iface, event);
             } else if (event->tgt_long.rendezvous) {
                 uct_cxi_iface_tag_handle_rdzv_match(iface, event);
             } else {
@@ -1787,10 +1797,8 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                    (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
                    (event->tgt_long.buffer_id >=
                     UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE)) {
-            /* Our own SEARCH_AND_DELETE's "not found" outcome -- see
-             * uct_cxi_iface_tag_handle_search_delete_not_found()'s own
-             * doc comment for why this is a real, load-bearing event
-             * (not a no-op companion) once sd.use_once=1 is set. */
+            /* Our own SEARCH_AND_DELETE's "not found" outcome (eager or
+             * rendezvous -- one handler covers both ranges). */
             uct_cxi_iface_tag_handle_search_delete_not_found(iface, event);
         } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
             ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "

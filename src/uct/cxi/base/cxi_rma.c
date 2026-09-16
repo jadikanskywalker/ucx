@@ -357,6 +357,45 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
 }
 
 
+/*
+ * uct_cxi_rndv_get_cmd_fields -- command fields for a rendezvous-flavored
+ * Get (rkey_p->is_rndv), shared by get_zcopy/get_bcopy. Reached when UCP
+ * drives a generic pull for an unexpected-rendezvous arrival, on the same
+ * uct_ep the message arrived on. Unlike ordinary RMA (restricted,
+ * ep->dfa_rma[lac], rkey_p->iova + remote_addr), this targets the sender's
+ * rendezvous source PTE (matching mode, fixed rdzv_get_idx) with
+ * match_bits = the sender's own rdzv op id -- the same correlator
+ * uct_cxi_iface_tag_handle_rdzv_get() already expects, so its completion
+ * path fires unmodified. remote_addr is the sender's real remote_offset
+ * directly, not an rkey-relative RMA offset -- ep->rem_nid/rem_pid already
+ * identify the peer, so no translation is needed.
+ */
+typedef struct uct_cxi_rndv_get_cmd_fields {
+    union c_fab_addr dfa;
+    uint8_t          index_ext;
+    uint64_t         remote_offset;
+    uint64_t         match_bits;
+} uct_cxi_rndv_get_cmd_fields_t;
+
+static uct_cxi_rndv_get_cmd_fields_t
+uct_cxi_rndv_get_cmd_fields(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
+                            const uct_cxi_rkey_t *rkey_p,
+                            uint64_t remote_addr)
+{
+    uct_cxi_md_t                 *md = uct_cxi_iface_md(iface);
+    uct_cxi_rndv_get_cmd_fields_t fields;
+
+    /* Returned by value, not via bit-field-typed out-parameters -- struct
+     * c_full_dma_cmd's dfa/index_ext/remote_offset/match_bits members are
+     * C bit-fields, whose address cannot be taken. */
+    cxi_build_dfa(ep->rem_nid, ep->rem_pid, md->pid_bits,
+                 md->cxi_dev->info.rdzv_get_idx, &fields.dfa,
+                 &fields.index_ext);
+    fields.remote_offset = remote_addr;
+    fields.match_bits    = rkey_p->rendezvous_id;
+    return fields;
+}
+
 /* -------------------------------------------------------------------------
  * ep_get_bcopy
  * -------------------------------------------------------------------------
@@ -405,16 +444,31 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cmd.lac                = desc->lac;
         cmd.event_send_disable = 1;
-        cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
-        cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = desc->iova;
         cmd.request_len        = (uint32_t)length;
         cmd.user_ptr           = (uint64_t)(uintptr_t)desc;
+
+        if (ucs_unlikely(rkey_p->is_rndv)) {
+            /* Unexpected-rendezvous data pull -- see
+             * uct_cxi_rndv_get_cmd_fields()'s own doc comment. */
+            uct_cxi_rndv_get_cmd_fields_t f =
+                    uct_cxi_rndv_get_cmd_fields(ep, iface, rkey_p,
+                                               remote_addr);
+            cmd.lac           = desc->lac;
+            cmd.restricted    = 0;
+            cmd.dfa           = f.dfa;
+            cmd.index_ext     = f.index_ext;
+            cmd.remote_offset = f.remote_offset;
+            cmd.match_bits    = f.match_bits;
+        } else {
+            cmd.index_ext     = ep->dfa_rma_idx_ext[rkey_p->lac];
+            cmd.lac           = desc->lac;
+            cmd.restricted    = 1;
+            cmd.dfa           = ep->dfa_rma[rkey_p->lac];
+            cmd.remote_offset = rkey_p->iova + remote_addr;
+        }
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
     }
@@ -540,17 +594,32 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     {
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
-        cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cmd.lac                = local_mh->cxi_md->lac;
         cmd.event_send_disable = 1;
-        cmd.restricted         = 1;
         cmd.eq                 = iface->evtq->eqn;
-        cmd.dfa                = ep->dfa_rma[rkey_p->lac];
-        cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = local_mh->iova_offset +
                                  (uint64_t)(uintptr_t)iov[0].buffer;
         cmd.request_len        = (uint32_t)uct_iov_get_length(iov);
         cmd.user_ptr           = (uint64_t)(uintptr_t)op;
+
+        if (ucs_unlikely(rkey_p->is_rndv)) {
+            /* Unexpected-rendezvous data pull -- see
+             * uct_cxi_rndv_get_cmd_fields()'s own doc comment. */
+            uct_cxi_rndv_get_cmd_fields_t f =
+                    uct_cxi_rndv_get_cmd_fields(ep, iface, rkey_p,
+                                               remote_addr);
+            cmd.lac           = local_mh->cxi_md->lac;
+            cmd.restricted    = 0;
+            cmd.dfa           = f.dfa;
+            cmd.index_ext     = f.index_ext;
+            cmd.remote_offset = f.remote_offset;
+            cmd.match_bits    = f.match_bits;
+        } else {
+            cmd.index_ext     = ep->dfa_rma_idx_ext[rkey_p->lac];
+            cmd.lac           = local_mh->cxi_md->lac;
+            cmd.restricted    = 1;
+            cmd.dfa           = ep->dfa_rma[rkey_p->lac];
+            cmd.remote_offset = rkey_p->iova + remote_addr;
+        }
 
         ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
     }

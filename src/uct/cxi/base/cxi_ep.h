@@ -39,6 +39,21 @@
                                                         before growing back */
 #define UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED UINT_MAX
 
+/*
+ * Confirmation state for the unexpected-rendezvous header optimization
+ * (cxi_tag.h / uct_ep_tag_rndv_zcopy). UCP's per-send header is fixed-size
+ * but only its last 8 bytes vary per message; sending it in full ("warm")
+ * on every rendezvous Put would eager-attach it into a *matched* receive's
+ * real destination buffer, needing a corrective Get on the hot path.
+ * Instead: every send on a fresh ep goes warm until this ep's first warm
+ * Get lands (proving the receiver cached the header), then flips to
+ * CONFIRMED and later sends go "slim" (only the volatile tail travels).
+ */
+typedef enum {
+    UCT_CXI_RNDV_HDR_UNCONFIRMED = 0, /* sends on this ep go warm */
+    UCT_CXI_RNDV_HDR_CONFIRMED   = 1  /* sends on this ep may go slim */
+} uct_cxi_rndv_hdr_state_t;
+
 
 /**
  * Per-send-op tracking record.
@@ -121,6 +136,10 @@ typedef struct uct_cxi_ep {
                                              backoff in effect. */
     unsigned          consecutive_failures;  /**< For backoff/shrink growth */
     unsigned          consecutive_successes; /**< For backoff/grow reset    */
+    uct_cxi_rndv_hdr_state_t rndv_hdr_state; /**< Unexpected-rndv header
+                                             confirmation state -- see its
+                                             own enum comment above. Starts
+                                             UNCONFIRMED (zero-init). */
 } uct_cxi_ep_t;
 
 /*

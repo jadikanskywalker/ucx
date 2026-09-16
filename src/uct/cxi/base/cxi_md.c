@@ -806,8 +806,11 @@ uct_cxi_md_mkey_pack(uct_md_h mdh, uct_mem_h memh, void *address,
     uct_cxi_mem_handle_t  *mh   = memh;
     uct_cxi_rkey_t        *rkey = mkey_buffer;
 
-    rkey->iova = mh->iova_offset;  /* = cxi_md->iova - base_VA */
-    rkey->lac  = mh->cxi_md->lac;
+    rkey->iova          = mh->iova_offset;  /* = cxi_md->iova - base_VA */
+    rkey->lac           = mh->cxi_md->lac;
+    rkey->is_rndv       = 0; /* mkey_buffer is caller-supplied, not
+                                 necessarily zeroed -- must set explicitly */
+    rkey->rendezvous_id = 0;
 
     ucs_debug("cxi mkey pack iova_offset 0x%"PRIx64" lac %u",
               rkey->iova, (unsigned)rkey->lac);
@@ -1007,8 +1010,10 @@ uct_cxi_md_mkey_pack_ats(uct_md_h mdh, uct_mem_h memh, void *address,
     uct_cxi_mem_handle_t *mh   = memh;
     uct_cxi_rkey_t       *rkey = mkey_buffer;
 
-    rkey->iova = mh->iova_offset;  /* = ats_md->iova */
-    rkey->lac  = mh->cxi_md->lac;
+    rkey->iova          = mh->iova_offset;  /* = ats_md->iova */
+    rkey->lac           = mh->cxi_md->lac;
+    rkey->is_rndv       = 0; /* see uct_cxi_md_mkey_pack()'s own comment */
+    rkey->rendezvous_id = 0;
 
     ucs_debug("cxi ATS mkey pack iova_offset 0x%"PRIx64" lac %u",
               rkey->iova, (unsigned)rkey->lac);
