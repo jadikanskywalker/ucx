@@ -2,24 +2,26 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI UCT hardware tag-matching unit tests -- Phase B (native rendezvous,
- * direct-match only -- see the design plan's "Current increment").
+ * CXI UCT hardware tag-matching unit tests -- native rendezvous.
  *
- * Every test here posts the receiver's priority LE (tag_recv_zcopy) before
- * the sender issues uct_ep_tag_rndv_zcopy, so the transfer always goes
- * through the direct-match path: C_EVENT_PUT or C_EVENT_PUT_OVERFLOW with
+ * Most tests here post the receiver's priority LE (tag_recv_zcopy) before
+ * the sender issues uct_ep_tag_rndv_zcopy, so the transfer goes through the
+ * direct-match path: C_EVENT_PUT or C_EVENT_PUT_OVERFLOW with
  * tgt_long.rendezvous==1, then C_EVENT_RENDEZVOUS, then a C_EVENT_REPLY
  * (either NIC-auto-issued or software-issued -- neither is controllable
  * from here, hardware alone decides get_issued, so tests do not assert on
  * which path fired).
  *
- * Unexpected/overflow rendezvous arrivals (no priority LE posted before the
- * rendezvous Put lands) are explicitly out of scope: the design plan's
- * Part 2/3 (unexpected-message handoff correctness) is deferred, and the
- * current ignore-stub in tag_handle_ovf_arrival() silently drops them --
- * identical to Phase A's eager path. Not tested here beyond confirming (in
- * rndv_cancel_unmatched) that an unmatched rendezvous send can still be
- * cleanly cancelled without corrupting later operations.
+ * Genuinely unexpected rendezvous arrivals (no priority LE ever posted) are
+ * supported via a separate mechanism: rndv_cb receives remote_addr/rkey_buf
+ * for UCP's own later generic uct_ep_get_zcopy/get_bcopy pull, and the
+ * per-send header (ep_id/req_id/md_index) is delivered via req_id riding
+ * header_data on every rendezvous Put plus a one-time-per-ep control-
+ * message announce for ep_id/md_index (see uct_cxi_ep_send_rndv_hdr_
+ * announce, cxi_am.c, and uct_cxi_rndv_unexp_pending_t, cxi_tag.h, for the
+ * announce-vs-Put race this implies). cancel_unmatched below only exercises
+ * the sender-side cancel bookkeeping for this path; dedicated coverage of
+ * rndv_cb's own data/header correctness is tracked separately.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -273,13 +275,35 @@ UCS_TEST_P(test_cxi_tag_rndv, cancel_unmatched)
     siov.stride = 0;
     siov.count  = 1;
 
+    /* header/header_length: uct_ep_tag_rndv_zcopy() always requires a real
+     * 17-byte header buffer now (ep_id/req_id/md_index -- see
+     * uct_cxi_rndv_hdr_wire_t), regardless of whether a receive is ever
+     * posted: req_id travels via header_data on this very Put, and
+     * ep_id/md_index trigger a one-time control-message announce to the
+     * peer on this ep's first rndv send (uct_cxi_ep_send_rndv_hdr_announce).
+     * NULL/0, as this test originally passed (a holdover from when
+     * unexpected rendezvous was unconditionally dropped and the header
+     * argument was therefore irrelevant), would now trip the header_length
+     * assert in uct_ep_tag_rndv_zcopy(). Content doesn't matter here --
+     * this test only exercises sender-side cancel bookkeeping and never
+     * inspects the reconstructed header. */
+    static const size_t HDR_LEN = sizeof(uint64_t) + sizeof(uint64_t) +
+                                  sizeof(uint8_t); /* mirrors
+                                  ucp_tag_offload_unexp_rndv_hdr_t /
+                                  uct_cxi_rndv_hdr_wire_t's 17-byte layout */
+    std::vector<uint8_t> hdr_buf(HDR_LEN, 0x77);
+
     /* No receiver posted for this tag -- the rendezvous Put lands in the
-     * overflow ring and is silently dropped by the current ignore-stub
-     * (Part 2/3, deferred). No Get will ever be issued against this
-     * exposure, so cancelling here exercises pure sender-side bookkeeping
-     * removal with no hardware race possible. */
-    ucs_status_ptr_t sp = uct_ep_tag_rndv_zcopy(ep, TAG, NULL, 0, &siov, 1,
-                                                0, &sctx.super);
+     * overflow ring and goes through the real unexpected-rendezvous
+     * SEARCH_AND_DELETE/rndv_cb path (see test_cxi_tag.h's uct_cxi_tag_
+     * rndv_cb stub), possibly racing this same ep's header announce (see
+     * uct_cxi_rndv_unexp_pending_t in cxi_tag.h) -- either way, no receive
+     * is ever posted to complete the data pull and no Get is ever issued
+     * against this exposure, so cancelling here still exercises pure
+     * sender-side bookkeeping removal with no hardware race possible. */
+    ucs_status_ptr_t sp = uct_ep_tag_rndv_zcopy(ep, TAG, hdr_buf.data(),
+                                                HDR_LEN, &siov, 1, 0,
+                                                &sctx.super);
     ASSERT_FALSE(UCS_PTR_IS_ERR(sp));
 
     ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(ep, sp));
@@ -299,8 +323,9 @@ UCS_TEST_P(test_cxi_tag_rndv, cancel_unmatched)
     for (int i = 0; i < 64; i++) {
         uct_cxi_rndv_send_ctx sctx2;
         init_rndv_send_ctx(sctx2);
-        ucs_status_ptr_t sp2 = uct_ep_tag_rndv_zcopy(ep, TAG, NULL, 0, &siov,
-                                                     1, 0, &sctx2.super);
+        ucs_status_ptr_t sp2 = uct_ep_tag_rndv_zcopy(ep, TAG, hdr_buf.data(),
+                                                     HDR_LEN, &siov, 1, 0,
+                                                     &sctx2.super);
         ASSERT_FALSE(UCS_PTR_IS_ERR(sp2))
                 << "iteration " << i << ": rndv_zcopy failed -- possible "
                    "op_pool leak from a prior cancel";

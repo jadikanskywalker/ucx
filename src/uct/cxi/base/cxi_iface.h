@@ -17,6 +17,7 @@
 #include <ucs/datastruct/khash.h>
 #include <ucs/datastruct/list.h>
 #include <ucs/datastruct/mpool.h>
+#include <ucs/datastruct/queue.h>
 #include <ucs/time/time.h>
 
 #include <libcxi/libcxi.h>
@@ -189,17 +190,19 @@ typedef struct uct_cxi_pte_fc {
 struct uct_cxi_rdzv_op;
 
 /*
- * Per-peer cache of the two constant fields of UCP's unexpected-rndv
- * header (ep_id, md_index) -- its third field, req_id, varies per message
- * and travels separately (see uct_ep_tag_rndv_zcopy's warm/slim design in
- * cxi_tag.c). Growable hash keyed by initiator (event->tgt_long.initiator.
- * initiator.process): the number of distinct peers isn't knowable in
- * advance, and a fixed-size table would either waste memory or, worse,
- * evict a still-needed entry under load -- same reasoning as uct_srd_ep_
- * hash's own per-peer table (uct/ib/efa/srd/srd_iface.h). One entry per
- * peer that has ever sent a "warm" rendezvous message, for the life of the
- * iface; never removed (a later warm message from the same peer just
- * overwrites the existing entry).
+ * Per-peer cache of the two constant-for-the-life-of-the-ep fields of
+ * UCP's unexpected-rndv header (ep_id, md_index), populated by that peer's
+ * one-time control-message announce (uct_cxi_ep_send_rndv_hdr_announce /
+ * uct_cxi_iface_handle_rndv_hdr_announce, cxi_am.c/cxi_tag.c). The header's
+ * third field, req_id, varies per message and travels via header_data on
+ * every rendezvous Put instead. Growable hash keyed by initiator
+ * (event->tgt_long.initiator.initiator.process): the number of distinct
+ * peers isn't knowable in advance, and a fixed-size table would either
+ * waste memory or, worse, evict a still-needed entry under load -- same
+ * reasoning as uct_srd_ep_hash's own per-peer table (uct/ib/efa/srd/
+ * srd_iface.h). One entry per peer that has ever sent an announce, for the
+ * life of the iface; never removed (a later announce from the same peer
+ * just overwrites the existing entry).
  */
 typedef struct uct_cxi_rndv_peer_hdr {
     uint64_t ep_id;
@@ -410,15 +413,20 @@ typedef struct uct_cxi_iface {
          * same generation can never have its memory reused out from under
          * it.
          *
-         * Relies on a given arrival's own raw C_EVENT_PUT always being
-         * delivered before whatever event later decrements its reference
-         * (a real priority-LE delayed match, or our own SEARCH_AND_DELETE
-         * outcome) -- this transport already depends on that same
-         * EQ-ordering guarantee elsewhere, so it is assumed here rather
-         * than defended against a second time. uct_cxi_iface_tag_ovf_
-         * release()'s assert is the safety net if that assumption is ever
-         * violated. */
-        uint32_t             *ovf_refcnt;          /**< [num_bufs] */
+         * Signed, not unsigned: the event that decrements a given arrival's
+         * reference (a real priority-LE delayed match, or our own
+         * SEARCH_AND_DELETE outcome) is not guaranteed to be delivered
+         * after that same arrival's own raw C_EVENT_PUT -- confirmed on
+         * real hardware (a second cluster hit refcnt==0 inside
+         * uct_cxi_iface_tag_ovf_release() before that arrival's own
+         * increment had run). A decrement can thus transiently land before
+         * its matching increment, taking this negative; uct_cxi_iface_tag_
+         * ovf_release() and tag_handle_ovf_arrival() both only ever act on
+         * the exact value 0 via uct_cxi_iface_tag_ovf_maybe_repost() (never
+         * "<= 0"), so this transient state never triggers a premature
+         * repost -- it just waits for the out-of-order increment to bring
+         * it back to net zero. */
+        int32_t              *ovf_refcnt;          /**< [num_bufs] */
         uint8_t              *ovf_repost_pending; /**< [num_bufs] */
 
         ucs_mpool_t           unexp_pool;  /**< Copy-out buffers for unexpected
@@ -427,15 +435,23 @@ typedef struct uct_cxi_iface {
         /* uct_cxi_rdzv_get_op_t pool for software-issued (get_issued==0)
          * rendezvous Gets -- see cxi_tag.h. Capped the same as
          * max_outstanding: can never have more outstanding software Gets
-         * than outstanding priority-LE receives. Also backs the corrective
-         * header Get (uct_cxi_rdzv_hdr_get_op_t) for a warm+matched
-         * arrival -- same capacity reasoning, at most one of either kind
-         * outstanding per slot at a time. */
+         * than outstanding priority-LE receives. */
         ucs_mpool_t           rdzv_get_op_pool;
 
         /* Per-peer unexpected-rndv header cache -- see uct_cxi_rndv_peer_
-         * hdr_t's own doc comment above. */
+         * hdr_t's own doc comment above. Populated by uct_cxi_iface_
+         * handle_rndv_hdr_announce() (cxi_tag.c), the receive-side handler
+         * for each peer's one-time control-message announce. */
         khash_t(uct_cxi_rndv_peer_hash) rndv_peer_cache;
+
+        /* Genuinely-unexpected rendezvous SEARCH_AND_DELETE confirmations
+         * that raced ahead of their initiator's one-time header announce
+         * (no ordering guarantee between the two -- see uct_cxi_rndv_unexp_
+         * pending_t's own doc comment in cxi_tag.h). Drained by
+         * uct_cxi_iface_handle_rndv_hdr_announce() once that initiator's
+         * rndv_peer_cache entry is populated. */
+        ucs_queue_head_t      rndv_unexp_pending_q;
+        ucs_mpool_t           rndv_unexp_pending_pool;
 
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;

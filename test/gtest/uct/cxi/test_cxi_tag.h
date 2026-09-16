@@ -46,9 +46,12 @@ uct_cxi_tag_rndv_cb(void *arg, unsigned flags, uint64_t stag,
                     uint64_t remote_addr, size_t length,
                     const void *rkey_buf)
 {
-    /* Phase A: RNDV_ZCOPY is unsupported, so this should never fire from
-     * this transport -- present only because create_entity() requires a
-     * real callback (see rc_mlx5's identical HW_TM gating pattern). */
+    /* Fires for a genuinely-unexpected rendezvous arrival (no priority LE
+     * posted) -- e.g. test_cxi_tag_rndv.cc's cancel_unmatched, which
+     * deliberately never posts a receive. Most other tests here always
+     * post a receive first, so this stub is never meaningfully exercised
+     * by them -- present only because create_entity() requires a real
+     * callback (see rc_mlx5's identical HW_TM gating pattern). */
     return UCS_OK;
 }
 

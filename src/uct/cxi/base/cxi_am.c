@@ -142,6 +142,70 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
 
 
 /* -------------------------------------------------------------------------
+ * ep_send_rndv_hdr_announce
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * uct_cxi_ep_send_rndv_hdr_announce -- one-time-per-ep control message
+ * carrying {ep_id, md_index} to the peer, over the same unrestricted IDC
+ * path as uct_cxi_ep_am_short() above, but with UCT_CXI_RNDV_HDR_ANNOUNCE_
+ * FLAG set in match_bits instead of a real am_id -- the receiver's AM
+ * dispatch (cxi_iface.c) checks that bit before ever calling
+ * uct_iface_invoke_am(), routing this to uct_cxi_iface_handle_rndv_hdr_
+ * announce() (cxi_tag.c) instead. Fire-and-forget, same as am_short: no
+ * desc, no outstanding tracking, no events -- the fabric's own retry engine
+ * is trusted for reliability, same as every other unacked Put in this
+ * transport.
+ */
+ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
+                                                uint64_t ep_id,
+                                                uint8_t md_index)
+{
+    uct_cxi_iface_t         *iface = uct_cxi_am_ep_iface(ep);
+    uct_cxi_rndv_peer_hdr_t  payload;
+    int                      ret;
+
+    payload.ep_id    = ep_id;
+    payload.md_index = md_index;
+
+    {
+        struct c_cstate_cmd cstate    = {};
+        cstate.event_send_disable     = 1;
+        cstate.event_success_disable  = 0;
+        cstate.restricted             = 0;
+        cstate.index_ext              = ep->dfa_am_idx_ext;
+
+        ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
+    }
+    if (ucs_unlikely(ret != 0)) {
+        ucs_error("cxi ep %p rndv_hdr_announce cstate emit failed: %d", ep,
+                 ret);
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    {
+        struct c_idc_msg_hdr hdr = {};
+        hdr.dfa        = ep->dfa_am;
+        hdr.match_bits = UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG;
+
+        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, &payload,
+                                  sizeof(payload));
+    }
+    if (ucs_unlikely(ret != 0)) {
+        ucs_error("cxi ep %p rndv_hdr_announce idc_msg emit failed: %d", ep,
+                 ret);
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    cxi_cq_ring(iface->tx.cmdq);
+    ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u",
+             ep, (unsigned long)ep_id, (unsigned)md_index);
+    return UCS_OK;
+}
+
+
+/* -------------------------------------------------------------------------
  * ep_am_bcopy
  * -------------------------------------------------------------------------
  */

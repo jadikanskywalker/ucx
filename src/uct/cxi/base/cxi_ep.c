@@ -82,7 +82,7 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->retry_backoff_until  = 0;
     ep->consecutive_failures  = 0;
     ep->consecutive_successes = 0;
-    ep->rndv_hdr_state        = UCT_CXI_RNDV_HDR_UNCONFIRMED;
+    ep->rndv_hdr_announced    = 0;
     ucs_arbiter_group_init(&ep->arb_group);
 
     /* Build all DFAs at creation time so the hot path needs no check.

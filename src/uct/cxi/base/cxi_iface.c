@@ -1228,8 +1228,8 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
          * unexpected -- reporting anything below 17 would silently
          * disable the whole offloaded-rendezvous protocol, not just the
          * unexpected-arrival path this header now actually supports (see
-         * uct_ep_tag_rndv_zcopy's warm/slim header logic in cxi_tag.c).
-         * 256 keeps comfortable margin above that real minimum. max_zcopy/
+         * uct_ep_tag_rndv_zcopy in cxi_tag.c). 256 keeps comfortable margin
+         * above that real minimum. max_zcopy/
          * max_iov bounded by c_full_dma_cmd's own request_len (uint32_t)
          * and our own single-iov restriction. */
         iface_attr->cap.flags              |= UCT_IFACE_FLAG_TAG_RNDV_ZCOPY;
@@ -1643,16 +1643,15 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             uint64_t buf_iova = iface->am.rx_mh.iova_offset +
                                 (uint64_t)(uintptr_t)buf_va;
             uint32_t len      = event->tgt_long.mlength;
-            uint8_t  am_id    = (uint8_t)(event->tgt_long.match_bits & 0x1f);
             void    *data     = buf_va +
                                 (size_t)(event->tgt_long.start - buf_iova);
 
             // ucs_trace("cxi C_EVENT_PUT: buf=%d ptl_list=%d "
-            //           "am_id=%u mlength=%u rlength=%u "
+            //           "mlength=%u rlength=%u "
             //           "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
             //           "offset=%zu auto_unlinked=%u rc=%d",
             //           buf_idx, (int)event->tgt_long.ptl_list,
-            //           (unsigned)am_id, (unsigned)len,
+            //           (unsigned)len,
             //           (unsigned)event->tgt_long.rlength,
             //           (unsigned long)event->tgt_long.start,
             //           (unsigned long)event->tgt_long.remote_offset,
@@ -1661,16 +1660,27 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             //           (unsigned)event->tgt_long.auto_unlinked,
             //           cxi_event_rc(event));
 
+            /* A transport-internal rendezvous-header announce (see
+             * UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG, cxi_am.h) -- route away from
+             * uct_iface_invoke_am() entirely, it is not a real user AM. */
             if (ucs_unlikely(event->tgt_long.match_bits &
-                             UCT_CXI_AM_HDR_FLAG)) {
-                uint64_t hdr = event->tgt_long.header_data;
-                memcpy((uint8_t *)data - sizeof(uint64_t),
-                       &hdr, sizeof(uint64_t));
-                data = (uint8_t *)data - sizeof(uint64_t);
-                len += sizeof(uint64_t);
-            }
+                             UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG)) {
+                uct_cxi_iface_handle_rndv_hdr_announce(iface, event, data,
+                                                       len);
+            } else {
+                uint8_t am_id = (uint8_t)(event->tgt_long.match_bits & 0x1f);
 
-            uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
+                if (ucs_unlikely(event->tgt_long.match_bits &
+                                 UCT_CXI_AM_HDR_FLAG)) {
+                    uint64_t hdr = event->tgt_long.header_data;
+                    memcpy((uint8_t *)data - sizeof(uint64_t),
+                           &hdr, sizeof(uint64_t));
+                    data = (uint8_t *)data - sizeof(uint64_t);
+                    len += sizeof(uint64_t);
+                }
+
+                uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
+            }
 
             if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
                 /* This Put exhausted the buffer's remaining space and
