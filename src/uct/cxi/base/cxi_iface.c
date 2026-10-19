@@ -599,6 +599,112 @@ ucs_status_t uct_cxi_query_devices(uct_md_h md,
     return UCS_OK;
 }
 
+/*
+ * uct_cxi_eq_init -- allocate one event queue: mmap its ring buffer, pin it
+ * for the NIC and create the hardware queue on top of it. The caller must
+ * have filled in eq->num_events, eq->reserved_slots_pct and eq->grow.* (the
+ * resolved config) beforehand.
+ */
+static ucs_status_t
+uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
+                struct cxil_wait_obj *wait_obj)
+{
+    size_t             buf_len = (size_t)eq->num_events *
+                                 UCT_CXI_EQ_ENTRY_SIZE;
+    struct cxi_eq_attr eq_attr;
+    int                ret;
+
+    /* mmap a private anonymous buffer for the event queue ring. */
+    eq->buf = mmap(NULL, buf_len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (eq->buf == MAP_FAILED) {
+        ucs_error("cxi mmap eq_buf size %zu failed: %m", buf_len);
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    /* Pin the EQ buffer so the NIC can DMA into it. */
+    ret = cxil_map(lni, eq->buf, buf_len,
+                   CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE, NULL, &eq->md);
+    if (ret != 0) {
+        ucs_error("cxi cxil_map eq_buf failed: %s", strerror(-ret));
+        goto err_munmap;
+    }
+
+    /* Allocate the event queue backed by the pinned buffer.
+     * reserved_slots is one-sided (blocks LPE/RX from the reservation,
+     * does not cap TX) — see EQ_RESERVED_SLOTS_PCT doc and the design
+     * notes in iface_progress(). */
+    memset(&eq_attr, 0, sizeof(eq_attr));
+    eq_attr.queue           = eq->buf;
+    eq_attr.queue_len       = buf_len;
+    eq_attr.reserved_slots  = (eq->num_events * eq->reserved_slots_pct) / 100;
+    eq->reserved_slots      = eq_attr.reserved_slots;
+    /* status_thresh_*: a single hardware-native fill-percentage threshold
+     * (see EQ_DYNAMIC_GROWTH doc) — status_thresh_count=0 when disabled
+     * costs nothing (no status write-backs ever generated). */
+    if (eq->grow.enabled) {
+        eq_attr.status_thresh_base  = eq->grow.thresh_pct;
+        eq_attr.status_thresh_delta = 0;
+        eq_attr.status_thresh_count = 1;
+    }
+    ret = cxil_alloc_evtq(lni, eq->md, &eq_attr, wait_obj, NULL, &eq->evtq);
+    if (ret != 0) {
+        ucs_error("cxi cxil_alloc_evtq failed: %s", strerror(-ret));
+        goto err_unmap;
+    }
+
+    return UCS_OK;
+
+err_unmap:
+    cxil_unmap(eq->md);
+err_munmap:
+    munmap(eq->buf, buf_len);
+    return UCS_ERR_IO_ERROR;
+}
+
+/*
+ * uct_cxi_eq_abort_resize -- release the pending buffer of a resize left in
+ * flight (iface torn down before C_EVENT_EQ_SWITCH arrived). It leaks unless
+ * freed explicitly: it's not reachable via uct_cxi_eq_cleanup(), which only
+ * knows about the currently-active buffer.
+ */
+static void uct_cxi_eq_abort_resize(uct_cxi_eq_t *eq)
+{
+    int ret;
+
+    if (!eq->grow.resizing) {
+        return;
+    }
+
+    ret = cxil_unmap(eq->grow.pending_md);
+    if (ret != 0) {
+        ucs_warn("cxi cxil_unmap pending eq.grow buffer failed: %s",
+                 strerror(-ret));
+    }
+    munmap(eq->grow.pending_buf, eq->grow.pending_len);
+}
+
+/*
+ * uct_cxi_eq_cleanup -- destroy the hardware queue and release its buffer.
+ * Everything bound to the queue (PTEs, command queues) must already be gone.
+ */
+static void uct_cxi_eq_cleanup(uct_cxi_eq_t *eq)
+{
+    int ret;
+
+    ret = cxil_destroy_evtq(eq->evtq);
+    if (ret != 0) {
+        ucs_warn("cxi cxil_destroy_evtq failed: %s", strerror(-ret));
+    }
+
+    ret = cxil_unmap(eq->md);
+    if (ret != 0) {
+        ucs_warn("cxi cxil_unmap eq_md failed: %s", strerror(-ret));
+    }
+
+    munmap(eq->buf, (size_t)eq->num_events * UCT_CXI_EQ_ENTRY_SIZE);
+}
+
 UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                     const uct_iface_params_t *params,
                     const uct_iface_config_t *tl_config)
@@ -607,14 +713,12 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                                                            uct_cxi_iface_config_t);
     uct_cxi_md_t              *cxi_md   = ucs_derived_of(md, uct_cxi_md_t);
     struct cxil_lni           *lni      = cxi_md->cxi_lni;
-    struct cxi_eq_attr         eq_attr;
     struct cxi_cq_alloc_opts   cq_opts;
     ucs_mpool_params_t         mp_params;
     ucs_status_t               status;
     int                        ret;
     unsigned                   op_max_bufs;
     unsigned                   desc_max_bufs;
-    size_t                     eq_buf_len;
 
     UCT_CHECK_PARAM(params->field_mask & UCT_IFACE_PARAM_FIELD_OPEN_MODE,
                     "UCT_IFACE_PARAM_FIELD_OPEN_MODE is not defined");
@@ -668,7 +772,6 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         desc_max_bufs = (desc_cfg == UINT_MAX) ?
                         ucs_max(self->eq.num_events / 2, 1u) : desc_cfg;
     }
-    eq_buf_len = (size_t)self->eq.num_events * UCT_CXI_EQ_ENTRY_SIZE;
     self->eq.max_poll = ucs_max(config->eq_max_poll, 1u);
 
     /* PTE flow-control recovery config, resolved once here (setup time,
@@ -695,50 +798,10 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err;
     }
 
-    /* Step 3: mmap a private anonymous buffer for the event queue ring. */
-    self->eq.buf = mmap(NULL, eq_buf_len,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (self->eq.buf == MAP_FAILED) {
-        ucs_error("cxi mmap eq_buf size %zu failed: %m", eq_buf_len);
-        status = UCS_ERR_NO_MEMORY;
+    /* Steps 3-5: event queue (ring buffer, pinning, hardware queue). */
+    status = uct_cxi_eq_init(&self->eq, lni, self->wait_obj);
+    if (status != UCS_OK) {
         goto err_destroy_wait_obj;
-    }
-
-    /* Step 4: pin the EQ buffer so the NIC can DMA into it. */
-    ret = cxil_map(lni, self->eq.buf, eq_buf_len,
-                   CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE,
-                   NULL, &self->eq.md);
-    if (ret != 0) {
-        ucs_error("cxi cxil_map eq_buf failed: %s", strerror(-ret));
-        status = UCS_ERR_IO_ERROR;
-        goto err_munmap_eq;
-    }
-
-    /* Step 5: allocate the event queue backed by the pinned buffer.
-     * reserved_slots is one-sided (blocks LPE/RX from the reservation,
-     * does not cap TX) — see EQ_RESERVED_SLOTS_PCT doc and the design
-     * notes in iface_progress(). */
-    memset(&eq_attr, 0, sizeof(eq_attr));
-    eq_attr.queue          = self->eq.buf;
-    eq_attr.queue_len      = eq_buf_len;
-    eq_attr.reserved_slots = (self->eq.num_events *
-                              self->eq.reserved_slots_pct) / 100;
-    self->eq.reserved_slots = eq_attr.reserved_slots;
-    /* status_thresh_*: a single hardware-native fill-percentage threshold
-     * (see EQ_DYNAMIC_GROWTH doc) — status_thresh_count=0 when disabled
-     * costs nothing (no status write-backs ever generated). */
-    if (self->eq.grow.enabled) {
-        eq_attr.status_thresh_base  = self->eq.grow.thresh_pct;
-        eq_attr.status_thresh_delta = 0;
-        eq_attr.status_thresh_count = 1;
-    }
-    ret = cxil_alloc_evtq(lni, self->eq.md, &eq_attr,
-                          self->wait_obj, NULL, &self->eq.evtq);
-    if (ret != 0) {
-        ucs_error("cxi cxil_alloc_evtq failed: %s", strerror(-ret));
-        status = UCS_ERR_IO_ERROR;
-        goto err_unmap_eq;
     }
 
     /* Step 6: TX communication profile. */
@@ -748,7 +811,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         ucs_error("cxi cxil_alloc_cp vni %u failed: %s",
                   (unsigned)cxi_md->vni, strerror(-ret));
         status = UCS_ERR_IO_ERROR;
-        goto err_destroy_evtq;
+        goto err_cleanup_eq;
     }
 
     /* Step 7: TX command queue. */
@@ -1022,12 +1085,8 @@ err_destroy_tx_cmdq:
     cxil_destroy_cmdq(self->tx.cmdq);
 err_destroy_cp:
     cxil_destroy_cp(self->tx.cp);
-err_destroy_evtq:
-    cxil_destroy_evtq(self->eq.evtq);
-err_unmap_eq:
-    cxil_unmap(self->eq.md);
-err_munmap_eq:
-    munmap(self->eq.buf, eq_buf_len);
+err_cleanup_eq:
+    uct_cxi_eq_cleanup(&self->eq);
 err_destroy_wait_obj:
     cxil_destroy_wait_obj(self->wait_obj);
 err:
@@ -1042,18 +1101,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
 
-    /* A resize left in flight (iface torn down before C_EVENT_EQ_SWITCH
-     * arrived) leaks its pending buffer unless freed explicitly here —
-     * it's not reachable via the eq_buf/eq_md cleanup below, which only
-     * knows about the currently-active buffer. */
-    if (self->eq.grow.resizing) {
-        ret = cxil_unmap(self->eq.grow.pending_md);
-        if (ret != 0) {
-            ucs_warn("cxi cxil_unmap pending eq.grow buffer failed: %s",
-                     strerror(-ret));
-        }
-        munmap(self->eq.grow.pending_buf, self->eq.grow.pending_len);
-    }
+    uct_cxi_eq_abort_resize(&self->eq);
 
     ucs_arbiter_cleanup(&self->tx.arbiter);
 
@@ -1123,17 +1171,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
         ucs_warn("cxi cxil_destroy_cp failed: %s", strerror(-ret));
     }
 
-    ret = cxil_destroy_evtq(self->eq.evtq);
-    if (ret != 0) {
-        ucs_warn("cxi cxil_destroy_evtq failed: %s", strerror(-ret));
-    }
-
-    ret = cxil_unmap(self->eq.md);
-    if (ret != 0) {
-        ucs_warn("cxi cxil_unmap eq_md failed: %s", strerror(-ret));
-    }
-
-    munmap(self->eq.buf, (size_t)self->eq.num_events * UCT_CXI_EQ_ENTRY_SIZE);
+    uct_cxi_eq_cleanup(&self->eq);
 
     ret = cxil_destroy_wait_obj(self->wait_obj);
     if (ret != 0) {
@@ -1392,7 +1430,7 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
  * mirrored here via eq.grow.resizing) — the caller must not call this
  * again until eq_grow_complete() has run.
  */
-static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
+static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
 {
     uct_cxi_md_t  *md = uct_cxi_iface_md(iface);
     size_t         new_len;
@@ -1400,15 +1438,15 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
     struct cxi_md *new_md;
     int            ret;
 
-    if (iface->eq.num_events >= iface->eq.grow.max_len_events) {
+    if (eq->num_events >= eq->grow.max_len_events) {
         ucs_debug("cxi EQ at configured max_len (%u events) — "
                   "not growing further, reactive recovery remains "
-                  "the backstop", iface->eq.grow.max_len_events);
+                  "the backstop", eq->grow.max_len_events);
         return;
     }
 
-    new_len = ucs_min((size_t)iface->eq.num_events * 2,
-                      (size_t)iface->eq.grow.max_len_events) *
+    new_len = ucs_min((size_t)eq->num_events * 2,
+                      (size_t)eq->grow.max_len_events) *
              UCT_CXI_EQ_ENTRY_SIZE;
     new_len = ucs_align_up_pow2(new_len, ucs_get_page_size());
 
@@ -1433,7 +1471,7 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
         return;
     }
 
-    ret = cxil_evtq_resize(iface->eq.evtq, new_buf, new_len, new_md);
+    ret = cxil_evtq_resize(eq->evtq, new_buf, new_len, new_md);
     if (ret != 0) {
         ucs_warn("cxi EQ grow: cxil_evtq_resize failed: %s", strerror(-ret));
         cxil_unmap(new_md);
@@ -1441,12 +1479,12 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
         return;
     }
 
-    iface->eq.grow.pending_buf = new_buf;
-    iface->eq.grow.pending_md  = new_md;
-    iface->eq.grow.pending_len = new_len;
-    iface->eq.grow.resizing    = 1;
+    eq->grow.pending_buf = new_buf;
+    eq->grow.pending_md  = new_md;
+    eq->grow.pending_len = new_len;
+    eq->grow.resizing    = 1;
     ucs_debug("cxi EQ grow: resize submitted %u -> %zu events",
-             iface->eq.num_events, new_len / UCT_CXI_EQ_ENTRY_SIZE);
+             eq->num_events, new_len / UCT_CXI_EQ_ENTRY_SIZE);
 }
 
 /*
@@ -1458,25 +1496,25 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
  * the reserved floor silently shrinks as a fraction of the queue on
  * every doubling.
  */
-static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface)
+static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
 {
-    void          *old_buf = iface->eq.buf;
-    struct cxi_md *old_md  = iface->eq.md;
-    size_t         old_len = (size_t)iface->eq.num_events *
+    void          *old_buf = eq->buf;
+    struct cxi_md *old_md  = eq->md;
+    size_t         old_len = (size_t)eq->num_events *
                              UCT_CXI_EQ_ENTRY_SIZE;
     unsigned       target_reserved;
     int            ret;
 
-    if (!iface->eq.grow.resizing) {
+    if (!eq->grow.resizing) {
         ucs_warn("cxi C_EVENT_EQ_SWITCH with no resize in flight — ignoring");
         return;
     }
 
-    ret = cxil_evtq_resize_complete(iface->eq.evtq);
+    ret = cxil_evtq_resize_complete(eq->evtq);
     if (ret != 0) {
         ucs_error("cxi EQ grow: cxil_evtq_resize_complete failed: %s — "
                   "EQ remains at %u events", strerror(-ret),
-                  iface->eq.num_events);
+                  eq->num_events);
         return;
     }
 
@@ -1487,35 +1525,356 @@ static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface)
     }
     munmap(old_buf, old_len);
 
-    iface->eq.buf        = iface->eq.grow.pending_buf;
-    iface->eq.md          = iface->eq.grow.pending_md;
-    iface->eq.num_events = (unsigned)(iface->eq.grow.pending_len /
+    eq->buf        = eq->grow.pending_buf;
+    eq->md          = eq->grow.pending_md;
+    eq->num_events = (unsigned)(eq->grow.pending_len /
                                       UCT_CXI_EQ_ENTRY_SIZE);
-    iface->eq.grow.pending_buf = NULL;
-    iface->eq.grow.pending_md  = NULL;
-    iface->eq.grow.pending_len = 0;
-    iface->eq.grow.resizing    = 0;
+    eq->grow.pending_buf = NULL;
+    eq->grow.pending_md  = NULL;
+    eq->grow.pending_len = 0;
+    eq->grow.resizing    = 0;
 
-    target_reserved = (iface->eq.num_events *
-                       iface->eq.reserved_slots_pct) / 100;
+    target_reserved = (eq->num_events *
+                       eq->reserved_slots_pct) / 100;
     ret = cxil_evtq_adjust_reserved_fc(
-            iface->eq.evtq, (int)target_reserved - (int)iface->eq.reserved_slots);
+            eq->evtq, (int)target_reserved - (int)eq->reserved_slots);
     if (ret < 0) {
         ucs_warn("cxi EQ grow: reserved-slots adjust failed: %s — "
                  "reserved floor now a smaller fraction of the grown EQ",
                  strerror(-ret));
     } else {
-        iface->eq.reserved_slots = (unsigned)ret;
+        eq->reserved_slots = (unsigned)ret;
     }
 
-    ucs_debug("cxi EQ grown: now %u events", iface->eq.num_events);
+    ucs_debug("cxi EQ grown: now %u events", eq->num_events);
 }
 
-static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
+/*
+ * uct_cxi_iface_handle_event -- dispatch one event drained from \a eq.
+ * Handlers are keyed on the event type (and PTE index), not on which queue
+ * delivered it; \a eq only selects the per-queue drain/growth state.
+ */
+static void uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
+                                       const union c_event *event)
 {
-    uct_cxi_iface_t     *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
+    uct_cxi_send_op_t *op;
+
+    if ((event->hdr.event_type == C_EVENT_REPLY) &&
+        event->init_short.rendezvous) {
+        /* NIC-auto-issued (get_issued==1) rendezvous Get completed.
+         * user_ptr here is not a pointer -- it's a bit-packed struct
+         * cxi_rdzv_user_ptr, not something the generic op-based
+         * dispatch below can touch at all -- see
+         * uct_cxi_iface_tag_handle_rdzv_reply's own doc comment
+         * (cxi_tag.c). */
+        uct_cxi_iface_tag_handle_rdzv_reply(iface, event);
+    } else if (event->hdr.event_type == C_EVENT_ACK  ||
+        event->hdr.event_type == C_EVENT_REPLY) {
+        /* Initiator-side TX completion.
+         * ACK   = restricted PUT confirmed by remote (RMA).
+         * REPLY = GET data returned (RMA, or a software-issued
+         *         get_issued==0 rendezvous Get -- see below). */
+        op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
+        if (op->ep == NULL) {
+            /* Software-issued rendezvous Get (uct_cxi_rdzv_get_op_t,
+             * see uct_cxi_iface_issue_rdzv_get in cxi_tag.c) --
+             * deliberately has no uct_cxi_ep_t (tag receives are
+             * posted on the iface, not a specific peer), so none of
+             * the ep-bookkeeping below applies; dispatch straight to
+             * its handler. No other op type in this transport ever
+             * has ep==NULL. */
+            ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
+            op->handler(op, status);
+        } else {
+            ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
+
+            if (ucs_unlikely(status != UCS_OK)) {
+                ucs_error("cxi TX event %d error: rc=%d ep %p",
+                          (int)event->hdr.event_type,
+                          cxi_event_rc(event), op->ep);
+                if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
+                    iface->am.pte != NULL) {
+                    struct cxi_pte_status pte_s = {};
+                    if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
+                        ucs_error("cxi AM PTE state=%u drop_count=%u ule_count=%u",
+                                  pte_s.state, pte_s.drop_count, pte_s.ule_count);
+                    }
+                }
+            }
+            /* Target PTE in graceful recovery (en_flowctrl) or any
+             * other completion status feeds this EP's adaptive
+             * concurrency cap / retry cadence — see
+             * uct_cxi_ep_tx_complete(). No wire message needed: this
+             * is a purely local, self-observed signal. */
+            uct_cxi_ep_tx_complete(op->ep, status);
+            /* Latch the worst status seen across every op draining
+             * while a flush is pending on this EP — first failure
+             * sticks (uct_completion_update_status). The final
+             * uct_invoke_completion(..., UCS_OK) below is safe
+             * regardless: it internally re-applies update_status,
+             * which UCS_OK can never overwrite an already-latched
+             * error with. */
+            if (op->ep->flush_comp != NULL) {
+                uct_completion_update_status(op->ep->flush_comp, status);
+            }
+            op->ep->outstanding--;
+            iface->tx.outstanding--;
+            if (op->ep->outstanding == 0 && op->ep->flush_comp != NULL) {
+                uct_invoke_completion(op->ep->flush_comp, UCS_OK);
+                op->ep->flush_comp = NULL;
+            }
+            ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
+                      (int)event->hdr.event_type,
+                      cxi_event_rc(event), op->ep, op->ep->outstanding);
+            if (op->handler != NULL) {
+                op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
+            } else {
+                if (op->comp != NULL) {
+                    uct_invoke_completion(op->comp, status);
+                }
+                ucs_mpool_put(op);     /* zcopy / short */
+            }
+        }
+    } else if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
+               (iface->tag.pte != NULL) &&
+               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+        /* Direct-matched rendezvous Put (Phase B) -- always on the
+         * priority list (an unexpected rendezvous arrival stays
+         * C_EVENT_PUT/ptl_list==OVERFLOW, handled by the branch
+         * below). Joins tag_handle_rdzv_match's 3-event completion
+         * accounting -- see its doc comment. */
+        uct_cxi_iface_tag_handle_rdzv_match(iface, event);
+    } else if ((event->hdr.event_type == C_EVENT_GET) &&
+               (iface->rdzv.pte != NULL) &&
+               (event->tgt_long.ptlte_index == iface->rdzv.pte->ptn)) {
+        /* A peer's Get read from our exposed rendezvous catch-all LE
+         * -- the send side of a rendezvous transfer completing. */
+        uct_cxi_iface_tag_handle_rdzv_get(iface, event);
+    } else if ((event->hdr.event_type == C_EVENT_PUT) &&
+               (iface->tag.pte != NULL) &&
+               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+        /* Target-side TAG receive.  Both LE populations on this PTE
+         * report C_EVENT_PUT; ptl_list is the discriminator (shared
+         * ptlte_index alone can't tell them apart) -- see cxi_tag.h.
+         * A direct-matched rendezvous Put's eager-attached prefix
+         * also lands here (ptl_list==PRIORITY, event->tgt_long.
+         * rendezvous==1) alongside its own separate C_EVENT_RENDEZVOUS
+         * above -- route by that flag, not just ptl_list. */
+        if (event->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) {
+            uct_cxi_iface_tag_handle_ovf_arrival(iface, event);
+        } else if (event->tgt_long.rendezvous) {
+            uct_cxi_iface_tag_handle_rdzv_match(iface, event);
+        } else {
+            uct_cxi_iface_tag_handle_eager_match(iface, event);
+        }
+    } else if (event->hdr.event_type == C_EVENT_PUT) {
+        /* Target-side AM receive.  buffer_id identifies which rx_buf the
+         * NIC wrote into.  start is the absolute IOVA of the first byte. */
+        int      buf_idx  = (int)event->tgt_long.buffer_id;
+        uint8_t *buf_va   = iface->am.rx_base +
+                            buf_idx * iface->am.buf_size;
+        uint64_t buf_iova = iface->am.rx_mh.iova_offset +
+                            (uint64_t)(uintptr_t)buf_va;
+        uint32_t len      = event->tgt_long.mlength;
+        void    *data     = buf_va +
+                            (size_t)(event->tgt_long.start - buf_iova);
+
+        // ucs_trace("cxi C_EVENT_PUT: buf=%d ptl_list=%d "
+        //           "mlength=%u rlength=%u "
+        //           "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
+        //           "offset=%zu auto_unlinked=%u rc=%d",
+        //           buf_idx, (int)event->tgt_long.ptl_list,
+        //           (unsigned)len,
+        //           (unsigned)event->tgt_long.rlength,
+        //           (unsigned long)event->tgt_long.start,
+        //           (unsigned long)event->tgt_long.remote_offset,
+        //           (unsigned long)buf_iova,
+        //           (size_t)(event->tgt_long.start - buf_iova),
+        //           (unsigned)event->tgt_long.auto_unlinked,
+        //           cxi_event_rc(event));
+
+        /* A transport-internal rendezvous-header announce (see
+         * UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG, cxi_am.h) -- route away from
+         * uct_iface_invoke_am() entirely, it is not a real user AM. */
+        if (ucs_unlikely(event->tgt_long.match_bits &
+                         UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG)) {
+            uct_cxi_iface_handle_rndv_hdr_announce(iface, event, data,
+                                                   len);
+        } else {
+            uint8_t am_id = (uint8_t)(event->tgt_long.match_bits & 0x1f);
+
+            if (ucs_unlikely(event->tgt_long.match_bits &
+                             UCT_CXI_AM_HDR_FLAG)) {
+                uint64_t hdr = event->tgt_long.header_data;
+                memcpy((uint8_t *)data - sizeof(uint64_t),
+                       &hdr, sizeof(uint64_t));
+                data = (uint8_t *)data - sizeof(uint64_t);
+                len += sizeof(uint64_t);
+            }
+
+            uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
+        }
+
+        if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+            /* This Put exhausted the buffer's remaining space and
+             * triggered auto-unlink as a side effect (min_free).  EQ
+             * delivery is ordered, so this is guaranteed to be the
+             * last Put for this buffer generation — safe to repost
+             * right here, no separate tracking needed.  (The genuine
+             * C_EVENT_UNLINK below only fires for explicit/manual
+             * unlinks, e.g. teardown — it never drives repost.) */
+            uct_cxi_iface_post_am_le(iface, buf_idx, 1);
+        }
+
+    } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
+        /* Two distinct things produce this event, and ptlte_state alone
+         * cannot tell them apart — both report DISABLED identically:
+         *   - A fresh, NIC-initiated disable (return_code == C_RC_OK).
+         *   - The completion of our *own* SETSTATE(ENABLED) attempt,
+         *     rejected (C_RC_NO_MATCH) if drop_count moved between our
+         *     cxil_pte_status() read and the command actually landing
+         *     in hardware — a real race at sustained high message
+         *     rates, not a bug in the read/issue sequence. sc_reason
+         *     is not meaningful on a rejection completion (observed:
+         *     nonsensical values outside the documented enum) — only
+         *     return_code distinguishes the two cases. */
+        uint8_t  ptlte_state =
+                event->tgt_long.initiator.state_change.ptlte_state;
+        uint8_t  sc_reason =
+                event->tgt_long.initiator.state_change.sc_reason;
+        int      rc          = cxi_event_rc(event);
+        uint16_t ptlte_index = event->tgt_long.ptlte_index;
+
+        ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
+                 "sc_reason=%u sc_nic_auto=%u rc=%d",
+                 (unsigned)ptlte_index,
+                 (unsigned)ptlte_state, (unsigned)sc_reason,
+                 (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto,
+                 rc);
+
+        if (rc != C_RC_OK) {
+            /* Our own SETSTATE(ENABLED) was rejected — drop_count
+             * moved between our cxil_pte_status() read and the
+             * command landing in hardware (a real race at sustained
+             * high message rates). This is NOT caused by EQ
+             * pressure — the rejection generates no EQ traffic of
+             * its own — so retry immediately with a fresh read
+             * rather than waiting on drain progress that has
+             * nothing to do with this PTE's drop_count. */
+            struct cxil_pte  *pte;
+            uct_cxi_pte_fc_t *fc = uct_cxi_iface_pte_by_index(
+                    iface, ptlte_index, &pte);
+            if (fc != NULL) {
+                uct_cxi_iface_pte_recover(iface, pte, fc);
+            }
+        } else if (ptlte_state == C_PTLTE_DISABLED) {
+            if (sc_reason == C_SC_FC_EQ_FULL) {
+                /* Fresh disable caused by EQ capacity — iface-wide:
+                 * every PTE and every initiator-side completion
+                 * shares this ring. Defer recovery until the EQ has
+                 * actually drained (see the eq.need_to_drain
+                 * countdown below) rather than retrying inline. */
+                if (eq->need_to_drain == 0) {
+                    eq->need_to_drain = (eq->num_events *
+                                               eq->drain_pct) / 100;
+                }
+            } else if ((iface->am.pte != NULL) &&
+                       (ptlte_index == iface->am.pte->ptn)) {
+                /* Fresh disable for a non-EQ-capacity reason on the
+                 * AM PTE — matching-resource exhaustion (N=4 fixed
+                 * rotating buffers all simultaneously full; RMA/AMO
+                 * can't reach this path, see uct_cxi_pte_fc_t).
+                 * Independent of EQ-fill: gate new AM sends via
+                 * am.fc.exhausted (uct_cxi_ep_fc_blocked) and
+                 * attempt recovery right away rather than waiting on
+                 * drain progress, which doesn't free buffer/LE
+                 * capacity. */
+                iface->am.fc.exhausted = 1;
+                uct_cxi_iface_pte_recover(iface, iface->am.pte,
+                                          &iface->am.fc);
+            }
+        } else if (ptlte_state == C_PTLTE_ENABLED) {
+            /* Successful re-enable clears matching-resource
+             * EXHAUSTED for the AM PTE. (DRAINING clears separately
+             * via eq.need_to_drain reaching 0, not here.) */
+            if ((iface->am.pte != NULL) &&
+                (ptlte_index == iface->am.pte->ptn)) {
+                iface->am.fc.exhausted = 0;
+            }
+        }
+    } else if ((event->hdr.event_type == C_EVENT_UNLINK) &&
+               (iface->tag.pte != NULL) &&
+               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+        uct_cxi_iface_tag_handle_unlink(iface, event);
+    } else if (event->hdr.event_type == C_EVENT_UNLINK) {
+        /* Auto-unlink (min_free) is signaled via auto_unlinked on the
+         * triggering C_EVENT_PUT above, not via this event — that's
+         * where repost happens.  A genuine C_EVENT_UNLINK here means
+         * an explicit/manual unlink (e.g. teardown); nothing to
+         * repost for those. */
+        ucs_debug("cxi AM LE C_EVENT_UNLINK buf=%d (manual)",
+                  (int)event->tgt_long.buffer_id);
+    } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
+               (iface->tag.pte != NULL) &&
+               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+        /* Either our own SEARCH_AND_DELETE's "found" confirmation
+         * (buffer_id in the eager or, checked first since it's
+         * numerically higher, rendezvous range -- see UCT_CXI_TAG_
+         * SEARCH_DELETE_*_BUFIDX_BASE in cxi_tag.h), or delayed
+         * correlation for a real match (same disposition as a direct
+         * match, routed by event->tgt_long.rendezvous). */
+        if (event->tgt_long.buffer_id >=
+            UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE) {
+            uct_cxi_iface_tag_handle_search_delete_confirm_rndv(iface,
+                                                                event);
+        } else if (event->tgt_long.buffer_id >=
+                   UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
+            uct_cxi_iface_tag_handle_search_delete_confirm_eager(iface, event);
+        } else if (event->tgt_long.rendezvous) {
+            uct_cxi_iface_tag_handle_rdzv_match(iface, event);
+        } else {
+            uct_cxi_iface_tag_handle_eager_match(iface, event);
+        }
+    } else if ((event->hdr.event_type == C_EVENT_SEARCH) &&
+               (iface->tag.pte != NULL) &&
+               (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
+               (event->tgt_long.buffer_id >=
+                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE)) {
+        int is_rndv = event->tgt_long.buffer_id >=
+            UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
+        int buf_idx = (int)event->tgt_long.buffer_id -
+                    (is_rndv ? UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
+                                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE);
+        ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND%s] buf_idx=%d rc=%d "
+                 "match_bits=0x%lx", is_rndv ? "-RNDV" : "", buf_idx,
+                 cxi_event_rc(event), (unsigned long)event->tgt_long.match_bits);
+    } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
+        ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
+                 "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",
+                 (int)event->tgt_long.ptl_list,
+                 (unsigned)(event->tgt_long.match_bits & 0x1f),
+                 (unsigned)event->tgt_long.mlength,
+                 (unsigned long)event->tgt_long.start,
+                 (unsigned long)event->tgt_long.remote_offset,
+                 cxi_event_rc(event));
+    } else if (event->hdr.event_type == C_EVENT_EQ_SWITCH) {
+        /* Last event hardware writes to the old buffer of a
+         * preemptive resize (see uct_cxi_iface_eq_grow_start) —
+         * switch reading to the new buffer. */
+        uct_cxi_iface_eq_grow_complete(iface, eq);
+    } else {
+        ucs_info("cxi iface_progress: unhandled event type %d rc=%d",
+                 (int)event->hdr.event_type, cxi_event_rc(event));
+    }
+}
+
+/*
+ * uct_cxi_iface_eq_poll -- drain up to eq->max_poll events from \a eq, then
+ * run the per-queue drop, preemptive-growth and ack bookkeeping.
+ */
+static unsigned uct_cxi_iface_eq_poll(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
+{
     const union c_event *event;
-    uct_cxi_send_op_t   *op;
     unsigned             n = 0;
 
     /* Bounded per the EQ_MAX_POLL doc — a steady flood must not keep this
@@ -1524,315 +1883,9 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
      * time to act; matches every other UCX transport's poll-a-bounded-
      * batch-and-return pattern (RC/UD/DC's TX/RX_MAX_POLL, TCP's
      * UCT_TCP_MAX_EVENTS) rather than draining to empty. */
-    while ((n < iface->eq.max_poll) &&
-           ((event = cxi_eq_get_event(iface->eq.evtq)) != NULL)) {
-        if ((event->hdr.event_type == C_EVENT_REPLY) &&
-            event->init_short.rendezvous) {
-            /* NIC-auto-issued (get_issued==1) rendezvous Get completed.
-             * user_ptr here is not a pointer -- it's a bit-packed struct
-             * cxi_rdzv_user_ptr, not something the generic op-based
-             * dispatch below can touch at all -- see
-             * uct_cxi_iface_tag_handle_rdzv_reply's own doc comment
-             * (cxi_tag.c). */
-            uct_cxi_iface_tag_handle_rdzv_reply(iface, event);
-        } else if (event->hdr.event_type == C_EVENT_ACK  ||
-            event->hdr.event_type == C_EVENT_REPLY) {
-            /* Initiator-side TX completion.
-             * ACK   = restricted PUT confirmed by remote (RMA).
-             * REPLY = GET data returned (RMA, or a software-issued
-             *         get_issued==0 rendezvous Get -- see below). */
-            op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
-            if (op->ep == NULL) {
-                /* Software-issued rendezvous Get (uct_cxi_rdzv_get_op_t,
-                 * see uct_cxi_iface_issue_rdzv_get in cxi_tag.c) --
-                 * deliberately has no uct_cxi_ep_t (tag receives are
-                 * posted on the iface, not a specific peer), so none of
-                 * the ep-bookkeeping below applies; dispatch straight to
-                 * its handler. No other op type in this transport ever
-                 * has ep==NULL. */
-                ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
-                op->handler(op, status);
-            } else {
-                ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
-
-                if (ucs_unlikely(status != UCS_OK)) {
-                    ucs_error("cxi TX event %d error: rc=%d ep %p",
-                              (int)event->hdr.event_type,
-                              cxi_event_rc(event), op->ep);
-                    if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
-                        iface->am.pte != NULL) {
-                        struct cxi_pte_status pte_s = {};
-                        if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
-                            ucs_error("cxi AM PTE state=%u drop_count=%u ule_count=%u",
-                                      pte_s.state, pte_s.drop_count, pte_s.ule_count);
-                        }
-                    }
-                }
-                /* Target PTE in graceful recovery (en_flowctrl) or any
-                 * other completion status feeds this EP's adaptive
-                 * concurrency cap / retry cadence — see
-                 * uct_cxi_ep_tx_complete(). No wire message needed: this
-                 * is a purely local, self-observed signal. */
-                uct_cxi_ep_tx_complete(op->ep, status);
-                /* Latch the worst status seen across every op draining
-                 * while a flush is pending on this EP — first failure
-                 * sticks (uct_completion_update_status). The final
-                 * uct_invoke_completion(..., UCS_OK) below is safe
-                 * regardless: it internally re-applies update_status,
-                 * which UCS_OK can never overwrite an already-latched
-                 * error with. */
-                if (op->ep->flush_comp != NULL) {
-                    uct_completion_update_status(op->ep->flush_comp, status);
-                }
-                op->ep->outstanding--;
-                iface->tx.outstanding--;
-                if (op->ep->outstanding == 0 && op->ep->flush_comp != NULL) {
-                    uct_invoke_completion(op->ep->flush_comp, UCS_OK);
-                    op->ep->flush_comp = NULL;
-                }
-                ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
-                          (int)event->hdr.event_type,
-                          cxi_event_rc(event), op->ep, op->ep->outstanding);
-                if (op->handler != NULL) {
-                    op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
-                } else {
-                    if (op->comp != NULL) {
-                        uct_invoke_completion(op->comp, status);
-                    }
-                    ucs_mpool_put(op);     /* zcopy / short */
-                }
-            }
-        } else if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
-                   (iface->tag.pte != NULL) &&
-                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-            /* Direct-matched rendezvous Put (Phase B) -- always on the
-             * priority list (an unexpected rendezvous arrival stays
-             * C_EVENT_PUT/ptl_list==OVERFLOW, handled by the branch
-             * below). Joins tag_handle_rdzv_match's 3-event completion
-             * accounting -- see its doc comment. */
-            uct_cxi_iface_tag_handle_rdzv_match(iface, event);
-        } else if ((event->hdr.event_type == C_EVENT_GET) &&
-                   (iface->rdzv.pte != NULL) &&
-                   (event->tgt_long.ptlte_index == iface->rdzv.pte->ptn)) {
-            /* A peer's Get read from our exposed rendezvous catch-all LE
-             * -- the send side of a rendezvous transfer completing. */
-            uct_cxi_iface_tag_handle_rdzv_get(iface, event);
-        } else if ((event->hdr.event_type == C_EVENT_PUT) &&
-                   (iface->tag.pte != NULL) &&
-                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-            /* Target-side TAG receive.  Both LE populations on this PTE
-             * report C_EVENT_PUT; ptl_list is the discriminator (shared
-             * ptlte_index alone can't tell them apart) -- see cxi_tag.h.
-             * A direct-matched rendezvous Put's eager-attached prefix
-             * also lands here (ptl_list==PRIORITY, event->tgt_long.
-             * rendezvous==1) alongside its own separate C_EVENT_RENDEZVOUS
-             * above -- route by that flag, not just ptl_list. */
-            if (event->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) {
-                uct_cxi_iface_tag_handle_ovf_arrival(iface, event);
-            } else if (event->tgt_long.rendezvous) {
-                uct_cxi_iface_tag_handle_rdzv_match(iface, event);
-            } else {
-                uct_cxi_iface_tag_handle_eager_match(iface, event);
-            }
-        } else if (event->hdr.event_type == C_EVENT_PUT) {
-            /* Target-side AM receive.  buffer_id identifies which rx_buf the
-             * NIC wrote into.  start is the absolute IOVA of the first byte. */
-            int      buf_idx  = (int)event->tgt_long.buffer_id;
-            uint8_t *buf_va   = iface->am.rx_base +
-                                buf_idx * iface->am.buf_size;
-            uint64_t buf_iova = iface->am.rx_mh.iova_offset +
-                                (uint64_t)(uintptr_t)buf_va;
-            uint32_t len      = event->tgt_long.mlength;
-            void    *data     = buf_va +
-                                (size_t)(event->tgt_long.start - buf_iova);
-
-            // ucs_trace("cxi C_EVENT_PUT: buf=%d ptl_list=%d "
-            //           "mlength=%u rlength=%u "
-            //           "start=0x%lx remote_offset=0x%lx buf_iova=0x%lx "
-            //           "offset=%zu auto_unlinked=%u rc=%d",
-            //           buf_idx, (int)event->tgt_long.ptl_list,
-            //           (unsigned)len,
-            //           (unsigned)event->tgt_long.rlength,
-            //           (unsigned long)event->tgt_long.start,
-            //           (unsigned long)event->tgt_long.remote_offset,
-            //           (unsigned long)buf_iova,
-            //           (size_t)(event->tgt_long.start - buf_iova),
-            //           (unsigned)event->tgt_long.auto_unlinked,
-            //           cxi_event_rc(event));
-
-            /* A transport-internal rendezvous-header announce (see
-             * UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG, cxi_am.h) -- route away from
-             * uct_iface_invoke_am() entirely, it is not a real user AM. */
-            if (ucs_unlikely(event->tgt_long.match_bits &
-                             UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG)) {
-                uct_cxi_iface_handle_rndv_hdr_announce(iface, event, data,
-                                                       len);
-            } else {
-                uint8_t am_id = (uint8_t)(event->tgt_long.match_bits & 0x1f);
-
-                if (ucs_unlikely(event->tgt_long.match_bits &
-                                 UCT_CXI_AM_HDR_FLAG)) {
-                    uint64_t hdr = event->tgt_long.header_data;
-                    memcpy((uint8_t *)data - sizeof(uint64_t),
-                           &hdr, sizeof(uint64_t));
-                    data = (uint8_t *)data - sizeof(uint64_t);
-                    len += sizeof(uint64_t);
-                }
-
-                uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
-            }
-
-            if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
-                /* This Put exhausted the buffer's remaining space and
-                 * triggered auto-unlink as a side effect (min_free).  EQ
-                 * delivery is ordered, so this is guaranteed to be the
-                 * last Put for this buffer generation — safe to repost
-                 * right here, no separate tracking needed.  (The genuine
-                 * C_EVENT_UNLINK below only fires for explicit/manual
-                 * unlinks, e.g. teardown — it never drives repost.) */
-                uct_cxi_iface_post_am_le(iface, buf_idx, 1);
-            }
-
-        } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
-            /* Two distinct things produce this event, and ptlte_state alone
-             * cannot tell them apart — both report DISABLED identically:
-             *   - A fresh, NIC-initiated disable (return_code == C_RC_OK).
-             *   - The completion of our *own* SETSTATE(ENABLED) attempt,
-             *     rejected (C_RC_NO_MATCH) if drop_count moved between our
-             *     cxil_pte_status() read and the command actually landing
-             *     in hardware — a real race at sustained high message
-             *     rates, not a bug in the read/issue sequence. sc_reason
-             *     is not meaningful on a rejection completion (observed:
-             *     nonsensical values outside the documented enum) — only
-             *     return_code distinguishes the two cases. */
-            uint8_t  ptlte_state =
-                    event->tgt_long.initiator.state_change.ptlte_state;
-            uint8_t  sc_reason =
-                    event->tgt_long.initiator.state_change.sc_reason;
-            int      rc          = cxi_event_rc(event);
-            uint16_t ptlte_index = event->tgt_long.ptlte_index;
-
-            ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
-                     "sc_reason=%u sc_nic_auto=%u rc=%d",
-                     (unsigned)ptlte_index,
-                     (unsigned)ptlte_state, (unsigned)sc_reason,
-                     (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto,
-                     rc);
-
-            if (rc != C_RC_OK) {
-                /* Our own SETSTATE(ENABLED) was rejected — drop_count
-                 * moved between our cxil_pte_status() read and the
-                 * command landing in hardware (a real race at sustained
-                 * high message rates). This is NOT caused by EQ
-                 * pressure — the rejection generates no EQ traffic of
-                 * its own — so retry immediately with a fresh read
-                 * rather than waiting on drain progress that has
-                 * nothing to do with this PTE's drop_count. */
-                struct cxil_pte  *pte;
-                uct_cxi_pte_fc_t *fc = uct_cxi_iface_pte_by_index(
-                        iface, ptlte_index, &pte);
-                if (fc != NULL) {
-                    uct_cxi_iface_pte_recover(iface, pte, fc);
-                }
-            } else if (ptlte_state == C_PTLTE_DISABLED) {
-                if (sc_reason == C_SC_FC_EQ_FULL) {
-                    /* Fresh disable caused by EQ capacity — iface-wide:
-                     * every PTE and every initiator-side completion
-                     * shares this ring. Defer recovery until the EQ has
-                     * actually drained (see the eq.need_to_drain
-                     * countdown below) rather than retrying inline. */
-                    if (iface->eq.need_to_drain == 0) {
-                        iface->eq.need_to_drain = (iface->eq.num_events *
-                                                   iface->eq.drain_pct) / 100;
-                    }
-                } else if ((iface->am.pte != NULL) &&
-                           (ptlte_index == iface->am.pte->ptn)) {
-                    /* Fresh disable for a non-EQ-capacity reason on the
-                     * AM PTE — matching-resource exhaustion (N=4 fixed
-                     * rotating buffers all simultaneously full; RMA/AMO
-                     * can't reach this path, see uct_cxi_pte_fc_t).
-                     * Independent of EQ-fill: gate new AM sends via
-                     * am.fc.exhausted (uct_cxi_ep_fc_blocked) and
-                     * attempt recovery right away rather than waiting on
-                     * drain progress, which doesn't free buffer/LE
-                     * capacity. */
-                    iface->am.fc.exhausted = 1;
-                    uct_cxi_iface_pte_recover(iface, iface->am.pte,
-                                              &iface->am.fc);
-                }
-            } else if (ptlte_state == C_PTLTE_ENABLED) {
-                /* Successful re-enable clears matching-resource
-                 * EXHAUSTED for the AM PTE. (DRAINING clears separately
-                 * via eq.need_to_drain reaching 0, not here.) */
-                if ((iface->am.pte != NULL) &&
-                    (ptlte_index == iface->am.pte->ptn)) {
-                    iface->am.fc.exhausted = 0;
-                }
-            }
-        } else if ((event->hdr.event_type == C_EVENT_UNLINK) &&
-                   (iface->tag.pte != NULL) &&
-                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-            uct_cxi_iface_tag_handle_unlink(iface, event);
-        } else if (event->hdr.event_type == C_EVENT_UNLINK) {
-            /* Auto-unlink (min_free) is signaled via auto_unlinked on the
-             * triggering C_EVENT_PUT above, not via this event — that's
-             * where repost happens.  A genuine C_EVENT_UNLINK here means
-             * an explicit/manual unlink (e.g. teardown); nothing to
-             * repost for those. */
-            ucs_debug("cxi AM LE C_EVENT_UNLINK buf=%d (manual)",
-                      (int)event->tgt_long.buffer_id);
-        } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
-                   (iface->tag.pte != NULL) &&
-                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-            /* Either our own SEARCH_AND_DELETE's "found" confirmation
-             * (buffer_id in the eager or, checked first since it's
-             * numerically higher, rendezvous range -- see UCT_CXI_TAG_
-             * SEARCH_DELETE_*_BUFIDX_BASE in cxi_tag.h), or delayed
-             * correlation for a real match (same disposition as a direct
-             * match, routed by event->tgt_long.rendezvous). */
-            if (event->tgt_long.buffer_id >=
-                UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE) {
-                uct_cxi_iface_tag_handle_search_delete_confirm_rndv(iface,
-                                                                    event);
-            } else if (event->tgt_long.buffer_id >=
-                       UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
-                uct_cxi_iface_tag_handle_search_delete_confirm_eager(iface, event);
-            } else if (event->tgt_long.rendezvous) {
-                uct_cxi_iface_tag_handle_rdzv_match(iface, event);
-            } else {
-                uct_cxi_iface_tag_handle_eager_match(iface, event);
-            }
-        } else if ((event->hdr.event_type == C_EVENT_SEARCH) &&
-                   (iface->tag.pte != NULL) &&
-                   (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
-                   (event->tgt_long.buffer_id >=
-                    UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE)) {
-            int is_rndv = event->tgt_long.buffer_id >=
-                UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
-            int buf_idx = (int)event->tgt_long.buffer_id -
-                        (is_rndv ? UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
-                                    UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE);
-            ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND%s] buf_idx=%d rc=%d "
-                     "match_bits=0x%lx", is_rndv ? "-RNDV" : "", buf_idx,
-                     cxi_event_rc(event), (unsigned long)event->tgt_long.match_bits);
-        } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
-            ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
-                     "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",
-                     (int)event->tgt_long.ptl_list,
-                     (unsigned)(event->tgt_long.match_bits & 0x1f),
-                     (unsigned)event->tgt_long.mlength,
-                     (unsigned long)event->tgt_long.start,
-                     (unsigned long)event->tgt_long.remote_offset,
-                     cxi_event_rc(event));
-        } else if (event->hdr.event_type == C_EVENT_EQ_SWITCH) {
-            /* Last event hardware writes to the old buffer of a
-             * preemptive resize (see uct_cxi_iface_eq_grow_start) —
-             * switch reading to the new buffer. */
-            uct_cxi_iface_eq_grow_complete(iface);
-        } else {
-            ucs_info("cxi iface_progress: unhandled event type %d rc=%d",
-                     (int)event->hdr.event_type, cxi_event_rc(event));
-        }
+    while ((n < eq->max_poll) &&
+           ((event = cxi_eq_get_event(eq->evtq)) != NULL)) {
+        uct_cxi_iface_handle_event(iface, eq, event);
         n++;
 
         /* Draining back down after a drop (see below) — count every event
@@ -1846,19 +1899,17 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
          * disabled; re-enabling immediately on every drop instead would
          * just re-trigger the same disable on the next blocked event
          * under sustained pressure. */
-        if ((iface->eq.need_to_drain > 0) &&
-            (--iface->eq.need_to_drain == 0)) {
+        if ((eq->need_to_drain > 0) && (--eq->need_to_drain == 0)) {
             uct_cxi_iface_recover_ptes(iface);
         }
     }
 
-    if (ucs_unlikely(cxi_eq_get_drops(iface->eq.evtq))) {
+    if (ucs_unlikely(cxi_eq_get_drops(eq->evtq))) {
         ucs_error("cxi EQ drop detected: events lost (EQ full)");
-        if (iface->eq.need_to_drain == 0) {
-            iface->eq.need_to_drain = (iface->eq.num_events *
-                                       iface->eq.drain_pct) / 100;
+        if (eq->need_to_drain == 0) {
+            eq->need_to_drain = (eq->num_events * eq->drain_pct) / 100;
         }
-        cxi_eq_ack_drops(iface->eq.evtq);
+        cxi_eq_ack_drops(eq->evtq);
     }
 
     /* Preemptive growth: cheap, timestamp-gated fast path (returns 0
@@ -1866,20 +1917,30 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
      * uct_cxi_iface_eq_grow_start(). Independent of the reactive drop
      * handling above; both may fire in the same iface's lifetime without
      * coupling. */
-    if (iface->eq.grow.enabled && !iface->eq.grow.resizing) {
+    if (eq->grow.enabled && !eq->grow.resizing) {
         struct c_eq_status eq_status;
 
-        if (cxi_eq_get_status(iface->eq.evtq, &eq_status) &&
+        if (cxi_eq_get_status(eq->evtq, &eq_status) &&
             eq_status.thld_sts &&
-            (cxi_eq_status_fill_level(iface->eq.evtq, &eq_status) >=
-                    iface->eq.grow.thresh_pct)) {
-            uct_cxi_iface_eq_grow_start(iface);
+            (cxi_eq_status_fill_level(eq->evtq, &eq_status) >=
+                    eq->grow.thresh_pct)) {
+            uct_cxi_iface_eq_grow_start(iface, eq);
         }
     }
 
     if (n > 0) {
-        cxi_eq_ack_events(iface->eq.evtq);
+        cxi_eq_ack_events(eq->evtq);
     }
+
+    return n;
+}
+
+static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
+{
+    uct_cxi_iface_t *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
+    unsigned         n;
+
+    n = uct_cxi_iface_eq_poll(iface, &iface->eq);
 
     /* Retry any sends queued via uct_ep_pending_add() now that this round
      * of completions may have freed cmdq/op_pool/desc_pool resources.
