@@ -28,6 +28,19 @@ AS_IF([test "x$with_cxi" != "xno"],
                   [AC_MSG_ERROR([CXI transport requested but libcxi not found])])])
        LIBS="$saved_LIBS"])
 
+# Connected-endpoint flow control (per-peer credits) is on by default;
+# --disable-cxi-fc builds the transport without it.
+AC_ARG_ENABLE([cxi-fc],
+              [AS_HELP_STRING([--disable-cxi-fc],
+                              [Disable CXI connected-endpoint flow control
+                               (per-peer credits), default: enabled])],
+              [],
+              [enable_cxi_fc=yes])
+
+AS_IF([test "x$enable_cxi_fc" = "xno"],
+      [AC_DEFINE([UCT_CXI_DISABLE_FC], [1],
+                 [Defined if CXI connected-endpoint flow control is disabled])])
+
 AM_CONDITIONAL([HAVE_CXI], [test "x$cxi_supported" = "xyes"])
 AC_CONFIG_FILES([src/uct/cxi/Makefile
                  src/uct/cxi/ucx-cxi.pc])
