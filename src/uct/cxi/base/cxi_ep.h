@@ -147,7 +147,7 @@ void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
  * Four independent reasons, all gate identically (return
  * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion — no new
  * caller-visible status):
- *   - iface->eq_need_to_drain: the shared EQ is being drained back down
+ *   - iface->eq.need_to_drain: the shared EQ is being drained back down
  *     after a drop, before any disabled PTE is re-checked (see cxi_iface.c).
  *     New local sends are held back to stop refilling it out from under
  *     that drain. Iface-wide — applies regardless of which PTE this op
@@ -165,7 +165,7 @@ static UCS_F_ALWAYS_INLINE int
 uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
                        const uct_cxi_pte_fc_t *pte_fc)
 {
-    return ucs_unlikely((iface->eq_need_to_drain > 0) ||
+    return ucs_unlikely((iface->eq.need_to_drain > 0) ||
                          ((pte_fc != NULL) && pte_fc->exhausted) ||
                          (ep->outstanding >= ep->max_outstanding) ||
                          (ep->retry_backoff_until > ucs_get_time()));

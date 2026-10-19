@@ -256,7 +256,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable = 0;
         cmd.restricted           = 0;
-        cmd.eq                   = iface->evtq->eqn;
+        cmd.eq                   = iface->eq.evtq->eqn;
         cmd.dfa                  = ep->dfa_am;
         cmd.match_bits           = (uint64_t)id;
         cmd.remote_offset        = 0;  /* NIC places at its managed write pointer */
@@ -356,7 +356,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.event_send_disable    = 1;
         cmd.event_success_disable = 0;
         cmd.restricted            = 0;
-        cmd.eq                    = iface->evtq->eqn;
+        cmd.eq                    = iface->eq.evtq->eqn;
         cmd.dfa                   = ep->dfa_am;
         cmd.remote_offset         = 0;
         cmd.user_ptr              = (uint64_t)(uintptr_t)op;

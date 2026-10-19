@@ -101,7 +101,7 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->evtq->eqn;
+        cstate.eq                  = iface->eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)op;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
@@ -190,7 +190,7 @@ uct_cxi_ep_atomic_fetch_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.restricted          = 1;
         cstate.write_lac           = desc->lac;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->evtq->eqn;
+        cstate.eq                  = iface->eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)desc;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
@@ -288,7 +288,7 @@ uct_cxi_ep_atomic_cswap_common(uct_ep_h tl_ep, uint64_t compare,
         cstate.restricted          = 1;
         cstate.write_lac           = desc->lac;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->evtq->eqn;
+        cstate.eq                  = iface->eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)desc;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);

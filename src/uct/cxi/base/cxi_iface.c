@@ -243,7 +243,7 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         struct cxi_pt_alloc_opts pt_opts = {
             .en_flowctrl = 1
         };
-        ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->rma.pte[lac]);
+        ret = cxil_alloc_pte(lni, self->eq.evtq, &pt_opts, &self->rma.pte[lac]);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte lac %u: %s", lac, strerror(-ret));
@@ -274,14 +274,14 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         cxi_cq_ring(self->tgt.cmdq);
 
         while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(self->eq.evtq)) != NULL) {
                 if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
                     ev->tgt_long.initiator.state_change.ptlte_state
                             == C_PTLTE_ENABLED) {
                     enabled = true;
                 }
             }
-            cxi_eq_ack_events(self->evtq);
+            cxi_eq_ack_events(self->eq.evtq);
         }
     }
 
@@ -399,7 +399,7 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
             .use_long_event = 1,   /* force 64-byte events with rlength/start */
             .en_flowctrl    = 1
         };
-        ret = cxil_alloc_pte(lni, self->evtq, &pt_opts, &self->am.pte);
+        ret = cxil_alloc_pte(lni, self->eq.evtq, &pt_opts, &self->am.pte);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte AM: %s", strerror(-ret));
@@ -430,14 +430,14 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
         cxi_cq_ring(self->tgt.cmdq);
 
         while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(self->eq.evtq)) != NULL) {
                 if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
                     ev->tgt_long.initiator.state_change.ptlte_state
                             == C_PTLTE_ENABLED) {
                     enabled = true;
                 }
             }
-            cxi_eq_ack_events(self->evtq);
+            cxi_eq_ack_events(self->eq.evtq);
         }
     }
 
@@ -646,13 +646,13 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      *
      * Each pool cap keeps its existing, independent meaning for the same
      * sentinel ("unbounded — size this pool from the EQ") — unset
-     * resolves to half of eq_num_events each, so that the common case of
+     * resolves to half of eq.num_events each, so that the common case of
      * neither pool being explicitly set still sums to exactly
-     * eq_num_events (matching each in-flight op holding one pool slot
+     * eq.num_events (matching each in-flight op holding one pool slot
      * until its single EQ completion event is drained), rather than each
      * independently claiming the *full* EQ. An explicitly-set pool cap is
      * used exactly as given, even if that (combined with an explicit
-     * EQ_SIZE) sums past eq_num_events — a reachable raw EQ drop from
+     * EQ_SIZE) sums past eq.num_events — a reachable raw EQ drop from
      * TX-side crowding is then a consequence of that explicit, informed
      * choice, not something silently protected against.
      */
@@ -661,31 +661,31 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         unsigned op_cfg   = config->op_mp.max_bufs;
         unsigned desc_cfg = config->bcopy_mp.max_bufs;
 
-        self->eq_num_events = (eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
+        self->eq.num_events = (eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
                               eq_cfg;
         op_max_bufs   = (op_cfg == UINT_MAX) ?
-                        ucs_max(self->eq_num_events / 2, 1u) : op_cfg;
+                        ucs_max(self->eq.num_events / 2, 1u) : op_cfg;
         desc_max_bufs = (desc_cfg == UINT_MAX) ?
-                        ucs_max(self->eq_num_events / 2, 1u) : desc_cfg;
+                        ucs_max(self->eq.num_events / 2, 1u) : desc_cfg;
     }
-    eq_buf_len = (size_t)self->eq_num_events * UCT_CXI_EQ_ENTRY_SIZE;
-    self->eq_max_poll = ucs_max(config->eq_max_poll, 1u);
+    eq_buf_len = (size_t)self->eq.num_events * UCT_CXI_EQ_ENTRY_SIZE;
+    self->eq.max_poll = ucs_max(config->eq_max_poll, 1u);
 
     /* PTE flow-control recovery config, resolved once here (setup time,
      * not the hot path) — see cxi_iface.h / iface_progress(). */
-    self->eq_need_to_drain     = 0;
-    self->eq_drain_pct         = config->eq_drain_pct;
+    self->eq.need_to_drain     = 0;
+    self->eq.drain_pct         = config->eq_drain_pct;
     self->eq_flap_limit        = config->eq_flap_limit;
     self->eq_flap_window       = ucs_time_from_sec(config->eq_flap_window);
-    self->eq_reserved_slots_pct = config->eq_reserved_slots_pct;
+    self->eq.reserved_slots_pct = config->eq_reserved_slots_pct;
     memset(&self->am.fc, 0, sizeof(self->am.fc));
     memset(self->rma.fc, 0, sizeof(self->rma.fc));
 
     /* Preemptive EQ growth config — see cxi_iface.h / eq_grow_start(). */
-    memset(&self->eq_grow, 0, sizeof(self->eq_grow));
-    self->eq_grow.enabled        = config->dynamic_eq_growth;
-    self->eq_grow.thresh_pct     = config->eq_grow_thresh_pct;
-    self->eq_grow.max_len_events = config->eq_max_len;
+    memset(&self->eq.grow, 0, sizeof(self->eq.grow));
+    self->eq.grow.enabled        = config->dynamic_eq_growth;
+    self->eq.grow.thresh_pct     = config->eq_grow_thresh_pct;
+    self->eq.grow.max_len_events = config->eq_max_len;
 
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
@@ -696,19 +696,19 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     }
 
     /* Step 3: mmap a private anonymous buffer for the event queue ring. */
-    self->eq_buf = mmap(NULL, eq_buf_len,
+    self->eq.buf = mmap(NULL, eq_buf_len,
                         PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (self->eq_buf == MAP_FAILED) {
+    if (self->eq.buf == MAP_FAILED) {
         ucs_error("cxi mmap eq_buf size %zu failed: %m", eq_buf_len);
         status = UCS_ERR_NO_MEMORY;
         goto err_destroy_wait_obj;
     }
 
     /* Step 4: pin the EQ buffer so the NIC can DMA into it. */
-    ret = cxil_map(lni, self->eq_buf, eq_buf_len,
+    ret = cxil_map(lni, self->eq.buf, eq_buf_len,
                    CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE,
-                   NULL, &self->eq_md);
+                   NULL, &self->eq.md);
     if (ret != 0) {
         ucs_error("cxi cxil_map eq_buf failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -720,21 +720,21 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * does not cap TX) — see EQ_RESERVED_SLOTS_PCT doc and the design
      * notes in iface_progress(). */
     memset(&eq_attr, 0, sizeof(eq_attr));
-    eq_attr.queue          = self->eq_buf;
+    eq_attr.queue          = self->eq.buf;
     eq_attr.queue_len      = eq_buf_len;
-    eq_attr.reserved_slots = (self->eq_num_events *
-                              self->eq_reserved_slots_pct) / 100;
-    self->eq_reserved_slots = eq_attr.reserved_slots;
+    eq_attr.reserved_slots = (self->eq.num_events *
+                              self->eq.reserved_slots_pct) / 100;
+    self->eq.reserved_slots = eq_attr.reserved_slots;
     /* status_thresh_*: a single hardware-native fill-percentage threshold
      * (see EQ_DYNAMIC_GROWTH doc) — status_thresh_count=0 when disabled
      * costs nothing (no status write-backs ever generated). */
-    if (self->eq_grow.enabled) {
-        eq_attr.status_thresh_base  = self->eq_grow.thresh_pct;
+    if (self->eq.grow.enabled) {
+        eq_attr.status_thresh_base  = self->eq.grow.thresh_pct;
         eq_attr.status_thresh_delta = 0;
         eq_attr.status_thresh_count = 1;
     }
-    ret = cxil_alloc_evtq(lni, self->eq_md, &eq_attr,
-                          self->wait_obj, NULL, &self->evtq);
+    ret = cxil_alloc_evtq(lni, self->eq.md, &eq_attr,
+                          self->wait_obj, NULL, &self->eq.evtq);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_evtq failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -756,7 +756,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     cq_opts.count = UCT_CXI_CMDQ_DEPTH;
     cq_opts.flags = CXI_CQ_IS_TX;
     cq_opts.lcid  = self->tx.cp->lcid;
-    ret = cxil_alloc_cmdq(lni, self->evtq, &cq_opts, &self->tx.cmdq);
+    ret = cxil_alloc_cmdq(lni, self->eq.evtq, &cq_opts, &self->tx.cmdq);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_cmdq tx failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -766,7 +766,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     /* Step 8: target command queue (LE management). */
     memset(&cq_opts, 0, sizeof(cq_opts));
     cq_opts.count = UCT_CXI_CMDQ_DEPTH;
-    ret = cxil_alloc_cmdq(lni, self->evtq, &cq_opts, &self->tgt.cmdq);
+    ret = cxil_alloc_cmdq(lni, self->eq.evtq, &cq_opts, &self->tgt.cmdq);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_cmdq tg failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -804,7 +804,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * Step 12: send-op pool for zcopy/short completion tracking.
      *
      * max_elems = op_max_bufs (resolved in Step 1.5 from TX_OP_MAX_BUFS,
-     * with -1 meaning "size to eq_num_events") so pool exhaustion returns
+     * with -1 meaning "size to eq.num_events") so pool exhaustion returns
      * UCS_ERR_NO_RESOURCE — triggering the pending-retry path — before
      * outstanding ops can exceed the hardware EQ depth.
      */
@@ -1023,11 +1023,11 @@ err_destroy_tx_cmdq:
 err_destroy_cp:
     cxil_destroy_cp(self->tx.cp);
 err_destroy_evtq:
-    cxil_destroy_evtq(self->evtq);
+    cxil_destroy_evtq(self->eq.evtq);
 err_unmap_eq:
-    cxil_unmap(self->eq_md);
+    cxil_unmap(self->eq.md);
 err_munmap_eq:
-    munmap(self->eq_buf, eq_buf_len);
+    munmap(self->eq.buf, eq_buf_len);
 err_destroy_wait_obj:
     cxil_destroy_wait_obj(self->wait_obj);
 err:
@@ -1046,13 +1046,13 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
      * arrived) leaks its pending buffer unless freed explicitly here —
      * it's not reachable via the eq_buf/eq_md cleanup below, which only
      * knows about the currently-active buffer. */
-    if (self->eq_grow.resizing) {
-        ret = cxil_unmap(self->eq_grow.pending_md);
+    if (self->eq.grow.resizing) {
+        ret = cxil_unmap(self->eq.grow.pending_md);
         if (ret != 0) {
-            ucs_warn("cxi cxil_unmap pending eq_grow buffer failed: %s",
+            ucs_warn("cxi cxil_unmap pending eq.grow buffer failed: %s",
                      strerror(-ret));
         }
-        munmap(self->eq_grow.pending_buf, self->eq_grow.pending_len);
+        munmap(self->eq.grow.pending_buf, self->eq.grow.pending_len);
     }
 
     ucs_arbiter_cleanup(&self->tx.arbiter);
@@ -1123,17 +1123,17 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
         ucs_warn("cxi cxil_destroy_cp failed: %s", strerror(-ret));
     }
 
-    ret = cxil_destroy_evtq(self->evtq);
+    ret = cxil_destroy_evtq(self->eq.evtq);
     if (ret != 0) {
         ucs_warn("cxi cxil_destroy_evtq failed: %s", strerror(-ret));
     }
 
-    ret = cxil_unmap(self->eq_md);
+    ret = cxil_unmap(self->eq.md);
     if (ret != 0) {
         ucs_warn("cxi cxil_unmap eq_md failed: %s", strerror(-ret));
     }
 
-    munmap(self->eq_buf, (size_t)self->eq_num_events * UCT_CXI_EQ_ENTRY_SIZE);
+    munmap(self->eq.buf, (size_t)self->eq.num_events * UCT_CXI_EQ_ENTRY_SIZE);
 
     ret = cxil_destroy_wait_obj(self->wait_obj);
     if (ret != 0) {
@@ -1256,7 +1256,7 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
  * uct_cxi_iface_pte_recover — issue SETSTATE(ENABLED) for one PTE if it's
  * currently DISABLED, subject to a per-PTE flap limit.
  *
- * Called only once the shared EQ has been drained by eq_need_to_drain (see
+ * Called only once the shared EQ has been drained by eq.need_to_drain (see
  * iface_progress()) — never immediately on a raw drop, since re-enabling
  * into a still-full EQ just re-triggers the same disable on the PTE's next
  * blocked event.  cxil_pte_status() is queried directly rather than relying
@@ -1314,7 +1314,7 @@ uct_cxi_iface_pte_recover(uct_cxi_iface_t *iface, struct cxil_pte *pte,
  * uct_cxi_iface_recover_ptes — check every locally-owned PTE (AM + each open
  * RMA LAC — bounded by UCT_CXI_MAX_LACS+1, not connection count) and recover
  * any found DISABLED.  Called once the EQ has been drained enough
- * (eq_need_to_drain reaching 0), not per-drop.
+ * (eq.need_to_drain reaching 0), not per-drop.
  */
 static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
 {
@@ -1383,13 +1383,13 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
  * uct_cxi_iface_eq_grow_start — begin a preemptive EQ resize.
  *
  * Called from iface_progress() once a hardware fill-threshold status
- * update reports the EQ at or above eq_grow.thresh_pct. Submits a new,
+ * update reports the EQ at or above eq.grow.thresh_pct. Submits a new,
  * double-sized buffer via cxil_evtq_resize() — hardware keeps writing to
  * the old buffer for a few more events, then emits C_EVENT_EQ_SWITCH
  * (handled in the main event loop) once it has switched to the new one.
  *
  * Only one resize may be in flight at a time (enforced by the driver,
- * mirrored here via eq_grow.resizing) — the caller must not call this
+ * mirrored here via eq.grow.resizing) — the caller must not call this
  * again until eq_grow_complete() has run.
  */
 static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
@@ -1400,15 +1400,15 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
     struct cxi_md *new_md;
     int            ret;
 
-    if (iface->eq_num_events >= iface->eq_grow.max_len_events) {
+    if (iface->eq.num_events >= iface->eq.grow.max_len_events) {
         ucs_debug("cxi EQ at configured max_len (%u events) — "
                   "not growing further, reactive recovery remains "
-                  "the backstop", iface->eq_grow.max_len_events);
+                  "the backstop", iface->eq.grow.max_len_events);
         return;
     }
 
-    new_len = ucs_min((size_t)iface->eq_num_events * 2,
-                      (size_t)iface->eq_grow.max_len_events) *
+    new_len = ucs_min((size_t)iface->eq.num_events * 2,
+                      (size_t)iface->eq.grow.max_len_events) *
              UCT_CXI_EQ_ENTRY_SIZE;
     new_len = ucs_align_up_pow2(new_len, ucs_get_page_size());
 
@@ -1433,7 +1433,7 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
         return;
     }
 
-    ret = cxil_evtq_resize(iface->evtq, new_buf, new_len, new_md);
+    ret = cxil_evtq_resize(iface->eq.evtq, new_buf, new_len, new_md);
     if (ret != 0) {
         ucs_warn("cxi EQ grow: cxil_evtq_resize failed: %s", strerror(-ret));
         cxil_unmap(new_md);
@@ -1441,12 +1441,12 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
         return;
     }
 
-    iface->eq_grow.pending_buf = new_buf;
-    iface->eq_grow.pending_md  = new_md;
-    iface->eq_grow.pending_len = new_len;
-    iface->eq_grow.resizing    = 1;
+    iface->eq.grow.pending_buf = new_buf;
+    iface->eq.grow.pending_md  = new_md;
+    iface->eq.grow.pending_len = new_len;
+    iface->eq.grow.resizing    = 1;
     ucs_debug("cxi EQ grow: resize submitted %u -> %zu events",
-             iface->eq_num_events, new_len / UCT_CXI_EQ_ENTRY_SIZE);
+             iface->eq.num_events, new_len / UCT_CXI_EQ_ENTRY_SIZE);
 }
 
 /*
@@ -1460,23 +1460,23 @@ static void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface)
  */
 static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface)
 {
-    void          *old_buf = iface->eq_buf;
-    struct cxi_md *old_md  = iface->eq_md;
-    size_t         old_len = (size_t)iface->eq_num_events *
+    void          *old_buf = iface->eq.buf;
+    struct cxi_md *old_md  = iface->eq.md;
+    size_t         old_len = (size_t)iface->eq.num_events *
                              UCT_CXI_EQ_ENTRY_SIZE;
     unsigned       target_reserved;
     int            ret;
 
-    if (!iface->eq_grow.resizing) {
+    if (!iface->eq.grow.resizing) {
         ucs_warn("cxi C_EVENT_EQ_SWITCH with no resize in flight — ignoring");
         return;
     }
 
-    ret = cxil_evtq_resize_complete(iface->evtq);
+    ret = cxil_evtq_resize_complete(iface->eq.evtq);
     if (ret != 0) {
         ucs_error("cxi EQ grow: cxil_evtq_resize_complete failed: %s — "
                   "EQ remains at %u events", strerror(-ret),
-                  iface->eq_num_events);
+                  iface->eq.num_events);
         return;
     }
 
@@ -1487,28 +1487,28 @@ static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface)
     }
     munmap(old_buf, old_len);
 
-    iface->eq_buf        = iface->eq_grow.pending_buf;
-    iface->eq_md          = iface->eq_grow.pending_md;
-    iface->eq_num_events = (unsigned)(iface->eq_grow.pending_len /
+    iface->eq.buf        = iface->eq.grow.pending_buf;
+    iface->eq.md          = iface->eq.grow.pending_md;
+    iface->eq.num_events = (unsigned)(iface->eq.grow.pending_len /
                                       UCT_CXI_EQ_ENTRY_SIZE);
-    iface->eq_grow.pending_buf = NULL;
-    iface->eq_grow.pending_md  = NULL;
-    iface->eq_grow.pending_len = 0;
-    iface->eq_grow.resizing    = 0;
+    iface->eq.grow.pending_buf = NULL;
+    iface->eq.grow.pending_md  = NULL;
+    iface->eq.grow.pending_len = 0;
+    iface->eq.grow.resizing    = 0;
 
-    target_reserved = (iface->eq_num_events *
-                       iface->eq_reserved_slots_pct) / 100;
+    target_reserved = (iface->eq.num_events *
+                       iface->eq.reserved_slots_pct) / 100;
     ret = cxil_evtq_adjust_reserved_fc(
-            iface->evtq, (int)target_reserved - (int)iface->eq_reserved_slots);
+            iface->eq.evtq, (int)target_reserved - (int)iface->eq.reserved_slots);
     if (ret < 0) {
         ucs_warn("cxi EQ grow: reserved-slots adjust failed: %s — "
                  "reserved floor now a smaller fraction of the grown EQ",
                  strerror(-ret));
     } else {
-        iface->eq_reserved_slots = (unsigned)ret;
+        iface->eq.reserved_slots = (unsigned)ret;
     }
 
-    ucs_debug("cxi EQ grown: now %u events", iface->eq_num_events);
+    ucs_debug("cxi EQ grown: now %u events", iface->eq.num_events);
 }
 
 static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
@@ -1524,8 +1524,8 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
      * time to act; matches every other UCX transport's poll-a-bounded-
      * batch-and-return pattern (RC/UD/DC's TX/RX_MAX_POLL, TCP's
      * UCT_TCP_MAX_EVENTS) rather than draining to empty. */
-    while ((n < iface->eq_max_poll) &&
-           ((event = cxi_eq_get_event(iface->evtq)) != NULL)) {
+    while ((n < iface->eq.max_poll) &&
+           ((event = cxi_eq_get_event(iface->eq.evtq)) != NULL)) {
         if ((event->hdr.event_type == C_EVENT_REPLY) &&
             event->init_short.rendezvous) {
             /* NIC-auto-issued (get_issued==1) rendezvous Get completed.
@@ -1739,11 +1739,11 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
                     /* Fresh disable caused by EQ capacity — iface-wide:
                      * every PTE and every initiator-side completion
                      * shares this ring. Defer recovery until the EQ has
-                     * actually drained (see the eq_need_to_drain
+                     * actually drained (see the eq.need_to_drain
                      * countdown below) rather than retrying inline. */
-                    if (iface->eq_need_to_drain == 0) {
-                        iface->eq_need_to_drain = (iface->eq_num_events *
-                                                   iface->eq_drain_pct) / 100;
+                    if (iface->eq.need_to_drain == 0) {
+                        iface->eq.need_to_drain = (iface->eq.num_events *
+                                                   iface->eq.drain_pct) / 100;
                     }
                 } else if ((iface->am.pte != NULL) &&
                            (ptlte_index == iface->am.pte->ptn)) {
@@ -1763,7 +1763,7 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
             } else if (ptlte_state == C_PTLTE_ENABLED) {
                 /* Successful re-enable clears matching-resource
                  * EXHAUSTED for the AM PTE. (DRAINING clears separately
-                 * via eq_need_to_drain reaching 0, not here.) */
+                 * via eq.need_to_drain reaching 0, not here.) */
                 if ((iface->am.pte != NULL) &&
                     (ptlte_index == iface->am.pte->ptn)) {
                     iface->am.fc.exhausted = 0;
@@ -1838,7 +1838,7 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
         /* Draining back down after a drop (see below) — count every event
          * processed here, since it's already being iterated; no extra
          * hardware query needed. Real events are frequently smaller than
-         * the worst-case 64 bytes eq_num_events is sized around (e.g.
+         * the worst-case 64 bytes eq.num_events is sized around (e.g.
          * C_EVENT_ACK/REPLY use the ~32-byte short format), so counting
          * against that conservative unit only ever under-counts how much
          * room was actually freed — safe in the conservative direction.
@@ -1846,19 +1846,19 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
          * disabled; re-enabling immediately on every drop instead would
          * just re-trigger the same disable on the next blocked event
          * under sustained pressure. */
-        if ((iface->eq_need_to_drain > 0) &&
-            (--iface->eq_need_to_drain == 0)) {
+        if ((iface->eq.need_to_drain > 0) &&
+            (--iface->eq.need_to_drain == 0)) {
             uct_cxi_iface_recover_ptes(iface);
         }
     }
 
-    if (ucs_unlikely(cxi_eq_get_drops(iface->evtq))) {
+    if (ucs_unlikely(cxi_eq_get_drops(iface->eq.evtq))) {
         ucs_error("cxi EQ drop detected: events lost (EQ full)");
-        if (iface->eq_need_to_drain == 0) {
-            iface->eq_need_to_drain = (iface->eq_num_events *
-                                       iface->eq_drain_pct) / 100;
+        if (iface->eq.need_to_drain == 0) {
+            iface->eq.need_to_drain = (iface->eq.num_events *
+                                       iface->eq.drain_pct) / 100;
         }
-        cxi_eq_ack_drops(iface->evtq);
+        cxi_eq_ack_drops(iface->eq.evtq);
     }
 
     /* Preemptive growth: cheap, timestamp-gated fast path (returns 0
@@ -1866,19 +1866,19 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
      * uct_cxi_iface_eq_grow_start(). Independent of the reactive drop
      * handling above; both may fire in the same iface's lifetime without
      * coupling. */
-    if (iface->eq_grow.enabled && !iface->eq_grow.resizing) {
+    if (iface->eq.grow.enabled && !iface->eq.grow.resizing) {
         struct c_eq_status eq_status;
 
-        if (cxi_eq_get_status(iface->evtq, &eq_status) &&
+        if (cxi_eq_get_status(iface->eq.evtq, &eq_status) &&
             eq_status.thld_sts &&
-            (cxi_eq_status_fill_level(iface->evtq, &eq_status) >=
-                    iface->eq_grow.thresh_pct)) {
+            (cxi_eq_status_fill_level(iface->eq.evtq, &eq_status) >=
+                    iface->eq.grow.thresh_pct)) {
             uct_cxi_iface_eq_grow_start(iface);
         }
     }
 
     if (n > 0) {
-        cxi_eq_ack_events(iface->evtq);
+        cxi_eq_ack_events(iface->eq.evtq);
     }
 
     /* Retry any sends queued via uct_ep_pending_add() now that this round
