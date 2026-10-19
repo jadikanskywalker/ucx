@@ -38,14 +38,6 @@
  * queue before giving up. The NIC normally frees room within microseconds. */
 #define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
 
-/* TX event queue slots kept out of iface->tx.max_inflight, because the events
- * that use them are not counted in iface->tx.outstanding: the single
- * synchronous get_short's REPLY (1), plus a few for the error events the
- * hardware can report on a command queue's event queue
- * (C_EVENT_COMMAND_FAILURE, C_EVENT_ERROR). Those never occur in normal
- * operation; if more arrive than this holds, the queue drops the extras and
- * progress reports the drop. */
-#define UCT_CXI_TX_EQ_UNTRACKED  8U
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
@@ -88,6 +80,7 @@
  *   pid_offsets 0 .. UCT_CXI_MAX_LACS-1  → RMA/AMO, one per LAC
  *   pid_offset  UCT_CXI_MAX_LACS          → Tag-matching (Phase 7)
  *   pid_offset  UCT_CXI_MAX_LACS + 1      → Active messages (Phase 6)
+ *   pid_offset  UCT_CXI_MAX_LACS + 2      → Flow-control control channel
  *
  * The rendezvous source-exposure PTE (Phase B) is NOT in this scheme --
  * confirmed on real hardware (every NIC-auto-issued rendezvous Get failed
@@ -100,6 +93,7 @@
 #define UCT_CXI_MAX_LACS   1
 #define UCT_CXI_PTE_TAG    UCT_CXI_MAX_LACS
 #define UCT_CXI_PTE_AM    (UCT_CXI_MAX_LACS + 1)
+#define UCT_CXI_PTE_CTRL  (UCT_CXI_MAX_LACS + 2)
 
 
 /**
@@ -168,6 +162,17 @@ typedef struct uct_cxi_iface_config {
     unsigned                  tag_max_outstanding; /**< Max simultaneously-posted
                                               priority LEs (hard ceiling 65535 --
                                               buffer_id is uint16_t)                */
+#ifndef UCT_CXI_DISABLE_FC
+    int                       fc_enable;       /**< Handshake with peers and
+                                                    open the control PTE       */
+    unsigned                  fc_msg_window;   /**< Message credits granted to
+                                                    each peer                  */
+    size_t                    fc_byte_window;  /**< Byte credits granted to
+                                                    each peer                  */
+    double                    fc_connect_timeout; /**< Give up on a peer's
+                                                    handshake after this long
+                                                    (seconds)                  */
+#endif
 } uct_cxi_iface_config_t;
 
 
@@ -196,6 +201,26 @@ typedef struct uct_cxi_pte_fc {
     void      *onload_cb;         /**< Reserved for TAG; unused today */
 } uct_cxi_pte_fc_t;
 
+
+#ifndef UCT_CXI_DISABLE_FC
+#include "cxi_fc.h"
+#endif
+
+/* TX event queue slots kept out of iface->tx.max_inflight, because the events
+ * that use them are not counted in iface->tx.outstanding: the single
+ * synchronous get_short's REPLY (1), plus a few for the error events the
+ * hardware can report on a command queue's event queue
+ * (C_EVENT_COMMAND_FAILURE, C_EVENT_ERROR). Those never occur in normal
+ * operation; if more arrive than this holds, the queue drops the extras and
+ * progress reports the drop. With flow control, also the control channel's
+ * own requests, which are bounded by UCT_CXI_CTRL_SLOTS and bypass the data
+ * send cap. Defined here, after cxi_fc.h, so it can name that constant. */
+#ifdef UCT_CXI_DISABLE_FC
+#define UCT_CXI_TX_EQ_UNTRACKED  8U
+#else
+/* Plus the control channel's own slots. */
+#define UCT_CXI_TX_EQ_UNTRACKED  (8U + UCT_CXI_CTRL_SLOTS)
+#endif
 
 /* Defined in cxi_tag.h (included after this header, via cxi_ep.h); only a
  * pointer to it is needed here, so a forward declaration avoids a circular
@@ -561,6 +586,11 @@ typedef struct uct_cxi_iface {
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for am.pte     */
     } am;
 
+#ifndef UCT_CXI_DISABLE_FC
+    /* ── Connected-endpoint flow control (peers + control channel) ──── */
+    uct_cxi_fc_iface_t    fc;
+#endif
+
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */
     struct cxil_domain   *domain;
 
@@ -656,5 +686,42 @@ int uct_cxi_iface_is_reachable(uct_iface_h tl_iface,
 int uct_cxi_iface_is_reachable_v2(const uct_iface_h tl_iface,
                                    const uct_iface_is_reachable_params_t *params);
 ucs_status_t uct_cxi_iface_event_fd_get(uct_iface_h tl_iface, int *fd_p);
+
+#ifndef UCT_CXI_DISABLE_FC
+
+BEGIN_C_DECLS
+
+/* cxi_peer.c */
+ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
+                             const uct_cxi_iface_config_t *config);
+void         uct_cxi_fc_cleanup(uct_cxi_iface_t *iface);
+ucs_status_t uct_cxi_iface_open_ctrl_pte(uct_cxi_iface_t *iface,
+                                         struct cxil_lni *lni);
+void         uct_cxi_iface_close_ctrl_pte(uct_cxi_iface_t *iface);
+
+/**
+ * Find or create the peer record for remote interface (\a nid, \a pid).
+ * Returns NULL only if memory for the record could not be allocated.
+ */
+uct_cxi_peer_t *uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid,
+                                 uint32_t pid);
+
+/** Start \a peer's handshake, unless one has been started or finished. */
+void uct_cxi_peer_connect(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
+
+/** A C_EVENT_PUT on the control PTE. */
+void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
+                                   const union c_event *event);
+
+/** The TX completion of a control request, \a req from the user_ptr. */
+void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
+                                const union c_event *event);
+
+/** Resend CREQs that have gone unanswered; give up on stale handshakes. */
+void uct_cxi_fc_progress(uct_cxi_iface_t *iface);
+
+END_C_DECLS
+
+#endif /* UCT_CXI_DISABLE_FC */
 
 #endif /* UCT_CXI_IFACE_H */

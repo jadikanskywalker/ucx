@@ -541,6 +541,65 @@ UCS_TEST_P(test_cxi_am, eq_split_routing)
     flush_ep(sender(), ep);
 }
 
+/**
+ * All 64 bits of an AM's match_bits reach the receiver.
+ *
+ * The AM list entry wildcards every match bit, and the transport itself only
+ * uses bits 0-6 (am_id, header flag, announce flag). Bits 7-63 are meant to
+ * carry other per-message information (flow control credits piggybacked on
+ * ordinary AMs), which only works if they are delivered verbatim, so check it
+ * with a distinct pattern in each byte. The message is sent as raw IDC and the
+ * receiver's queue read directly, so no handler runs and nothing is
+ * interpreted on the way.
+ */
+UCS_TEST_P(test_cxi_am, match_bits_high_bits_delivered)
+{
+    static const uint64_t HIGH_PATTERN = 0xA5C3965A3CE1D2B4ULL & ~0x7fULL;
+    static const uint64_t MATCH_BITS   = HIGH_PATTERN | 0x03 /* am_id */;
+
+    uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
+    uct_cxi_iface_t *riface = ucs_derived_of(receiver().iface(), uct_cxi_iface_t);
+
+    sender().connect_to_iface(0, receiver());
+    uct_cxi_ep_t *cep = ucs_derived_of(sender().ep(0), uct_cxi_ep_t);
+
+    uint64_t payload = 0x1122334455667788ULL;
+    {
+        struct c_cstate_cmd cstate = {};
+        cstate.event_send_disable  = 1;
+        cstate.restricted          = 0;
+        cstate.index_ext           = cep->dfa_am_idx_ext;
+        ASSERT_EQ(0, cxi_cq_emit_c_state(siface->tx.cmdq, &cstate));
+    }
+    {
+        struct c_idc_msg_hdr hdr = {};
+        hdr.dfa        = cep->dfa_am;
+        hdr.match_bits = MATCH_BITS;
+        ASSERT_EQ(0, cxi_cq_emit_idc_msg(siface->tx.cmdq, &hdr, &payload,
+                                         sizeof(payload)));
+    }
+    cxi_cq_ring(siface->tx.cmdq);
+
+    bool       got      = false;
+    uint64_t   received = 0;
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+    while (!got && (ucs_get_time() < deadline)) {
+        const union c_event *ev;
+        while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
+            if ((ev->hdr.event_type == C_EVENT_PUT) &&
+                (ev->tgt_long.ptlte_index == riface->am.pte->ptn)) {
+                received = ev->tgt_long.match_bits;
+                got      = true;
+            }
+        }
+        cxi_eq_ack_events(riface->rx_eq.evtq);
+    }
+
+    ASSERT_TRUE(got) << "AM never arrived";
+    EXPECT_EQ(MATCH_BITS, received)
+            << "match_bits altered in transit (bits 7-63 must survive)";
+}
+
 #ifndef UCT_CXI_DISABLE_FC
 
 /**

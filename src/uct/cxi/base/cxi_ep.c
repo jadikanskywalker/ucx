@@ -86,6 +86,17 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->destroyed             = 0;
     ucs_arbiter_group_init(&ep->arb_group);
 
+#ifndef UCT_CXI_DISABLE_FC
+    /* One handshake per remote iface, however many eps are created to it. */
+    ep->peer = NULL;
+    if (iface->fc.enabled) {
+        ep->peer = uct_cxi_peer_get(iface, ep->rem_nid, ep->rem_pid);
+        if (ep->peer != NULL) {
+            uct_cxi_peer_connect(iface, ep->peer);
+        }
+    }
+#endif
+
     /* Build all DFAs at creation time so the hot path needs no check.
      * RMA DFAs: pid_offset = lac index (one per LAC).
      * AM DFA:   pid_offset = UCT_CXI_PTE_AM (fixed protocol constant). */

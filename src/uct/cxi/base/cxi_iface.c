@@ -219,6 +219,34 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, tag_max_outstanding),
      UCS_CONFIG_TYPE_UINT},
 
+#ifndef UCT_CXI_DISABLE_FC
+    {"FC_ENABLE", "y",
+     "Connected-endpoint flow control: open the control PTE and handshake\n"
+     "with each peer when an endpoint to it is created. When off, this\n"
+     "interface neither opens the control PTE nor handshakes, and peers\n"
+     "treat it as a plain connectionless peer.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_enable),
+     UCS_CONFIG_TYPE_BOOL},
+
+    {"FC_MSG_WINDOW", "512",
+     "Message credits granted to each peer: how many messages one peer may\n"
+     "have outstanding to this interface at a time.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_msg_window),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"FC_BYTE_WINDOW", "1m",
+     "Byte credits granted to each peer: how many bytes one peer may have\n"
+     "outstanding to this interface at a time (counted in 64-byte units).\n"
+     "Must be at least the largest message a peer may send.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_byte_window),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"FC_CONNECT_TIMEOUT", "30s",
+     "Give up on a peer's handshake after this long without a reply.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_connect_timeout),
+     UCS_CONFIG_TYPE_TIME},
+#endif
+
     {NULL}
 };
 
@@ -1119,6 +1147,19 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         }
     }
 
+#ifndef UCT_CXI_DISABLE_FC
+    /* Step 17: connected-endpoint flow control -- per-peer state and the
+     * control PTE its handshake runs on. */
+    status = uct_cxi_fc_init(self, config);
+    if (status != UCS_OK) {
+        goto err_rdzv_pte;
+    }
+    status = uct_cxi_iface_open_ctrl_pte(self, lni);
+    if (status != UCS_OK) {
+        goto err_fc;
+    }
+#endif
+
     ucs_info("cxi iface open %p nid 0x%x pid %u ptn %u pid_bits %u "
              "max_lacs %u",
              self, cxi_md->device.nid, self->domain->pid,
@@ -1126,6 +1167,12 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
              (unsigned)UCT_CXI_MAX_LACS);
     return UCS_OK;
 
+#ifndef UCT_CXI_DISABLE_FC
+err_fc:
+    uct_cxi_fc_cleanup(self);
+#endif
+err_rdzv_pte:
+    uct_cxi_iface_close_rdzv_pte(self);
 err_tag_pte:
     uct_cxi_iface_close_tag_pte(self);
 err_am_pte:
@@ -1208,6 +1255,12 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
         });
     }
     kh_destroy_inplace(uct_cxi_zombie_ep_hash, &self->tx.zombie_eps);
+
+#ifndef UCT_CXI_DISABLE_FC
+    /* Opened last, closed first. */
+    uct_cxi_iface_close_ctrl_pte(self);
+    uct_cxi_fc_cleanup(self);
+#endif
 
     /* Close RDZV PTE first (opened after TAG, so closed before it), then
      * TAG PTE (opened after AM, so closed before it). Both are no-ops if
@@ -1466,6 +1519,9 @@ static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
     uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
     uct_cxi_iface_pte_recover(iface, iface->tag.pte, &iface->tag.fc);
     uct_cxi_iface_pte_recover(iface, iface->rdzv.pte, &iface->rdzv.fc);
+#ifndef UCT_CXI_DISABLE_FC
+    uct_cxi_iface_pte_recover(iface, iface->fc.ctrl.pte, &iface->fc.ctrl.fc);
+#endif
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
                                   &iface->rma.fc[lac]);
@@ -1497,6 +1553,12 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
         *pte_p = iface->rdzv.pte;
         return &iface->rdzv.fc;
     }
+#ifndef UCT_CXI_DISABLE_FC
+    if ((iface->fc.ctrl.pte != NULL) && (ptlte_index == iface->fc.ctrl.ptn)) {
+        *pte_p = iface->fc.ctrl.pte;
+        return &iface->fc.ctrl.fc;
+    }
+#endif
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         if ((iface->rma.pte[lac] != NULL) &&
             (ptlte_index == iface->rma.pte[lac]->ptn)) {
@@ -1858,6 +1920,13 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
                                              ~UCT_CXI_USER_PTR_SHORT);
             uct_cxi_iface_ep_tx_done(iface, event, ep, status);
             uct_cxi_iface_ep_release(iface, ep);
+#ifndef UCT_CXI_DISABLE_FC
+        } else if (ucs_unlikely(user_ptr & UCT_CXI_USER_PTR_CTRL)) {
+            /* Flow-control control message, not tied to any ep. */
+            uct_cxi_iface_ctrl_tx_done(
+                    iface, (uct_cxi_ctrl_req_t *)(uintptr_t)(
+                            user_ptr & ~UCT_CXI_USER_PTR_CTRL), event);
+#endif
         } else {
             op = (uct_cxi_send_op_t *)(uintptr_t)user_ptr;
             ep = op->ep;
@@ -1915,6 +1984,12 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         } else {
             uct_cxi_iface_tag_handle_eager_match(iface, event);
         }
+#ifndef UCT_CXI_DISABLE_FC
+    } else if ((event->hdr.event_type == C_EVENT_PUT) &&
+               (event->tgt_long.ptlte_index == iface->fc.ctrl.ptn)) {
+        /* Flow-control control channel (handshake). */
+        uct_cxi_iface_handle_ctrl_msg(iface, event);
+#endif
     } else if (event->hdr.event_type == C_EVENT_PUT) {
         /* Target-side AM receive.  buffer_id identifies which rx_buf the
          * NIC wrote into.  start is the absolute IOVA of the first byte. */
@@ -2114,6 +2189,13 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxi_iface_t *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
     unsigned         n;
+
+#ifndef UCT_CXI_DISABLE_FC
+    /* Resend handshake requests that have gone unanswered. */
+    if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.connecting))) {
+        uct_cxi_fc_progress(iface);
+    }
+#endif
 
     /* Each queue gets its own EQ_MAX_POLL budget, so neither a receive flood
      * nor a burst of completions can starve the other. */

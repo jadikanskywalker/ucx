@@ -41,6 +41,7 @@ AS_IF([test "x$enable_cxi_fc" = "xno"],
       [AC_DEFINE([UCT_CXI_DISABLE_FC], [1],
                  [Defined if CXI connected-endpoint flow control is disabled])])
 
+AM_CONDITIONAL([CXI_FC], [test "x$enable_cxi_fc" != "xno"])
 AM_CONDITIONAL([HAVE_CXI], [test "x$cxi_supported" = "xyes"])
 AC_CONFIG_FILES([src/uct/cxi/Makefile
                  src/uct/cxi/ucx-cxi.pc])

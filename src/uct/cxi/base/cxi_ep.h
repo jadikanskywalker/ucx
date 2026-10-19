@@ -121,6 +121,11 @@ typedef struct uct_cxi_ep {
                                              backoff in effect. */
     unsigned          consecutive_failures;  /**< For backoff/shrink growth */
     unsigned          consecutive_successes; /**< For backoff/grow reset    */
+#ifndef UCT_CXI_DISABLE_FC
+    struct uct_cxi_peer *peer;         /**< Remote iface's flow-control state,
+                                             shared with every ep to it; NULL
+                                             when flow control is off */
+#endif
     uint8_t           destroyed;       /**< uct_ep_destroy() was called while
                                              sends were still in flight; the
                                              last completion frees the ep (see
@@ -192,6 +197,10 @@ uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
  * from -- so a build without it keeps the untracked fire-and-forget path.
  */
 #define UCT_CXI_USER_PTR_SHORT  1ULL
+
+/* A user_ptr that is a pointer to a control request (cxi_fc.h), not an op or
+ * an ep. */
+#define UCT_CXI_USER_PTR_CTRL   2ULL
 
 #ifdef UCT_CXI_DISABLE_FC
 
