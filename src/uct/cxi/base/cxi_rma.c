@@ -435,6 +435,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
                          &rdzv_idx_ext);
             cmd.lac           = desc->lac;
             cmd.restricted    = 0;
+            cmd.initiator     = iface->match_id;
             cmd.dfa           = rdzv_dfa;
             cmd.index_ext     = rdzv_idx_ext;
             cmd.remote_offset = remote_addr;
@@ -593,6 +594,7 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
                          &rdzv_idx_ext);
             cmd.lac           = local_mh->cxi_md->lac;
             cmd.restricted    = 0;
+            cmd.initiator     = iface->match_id;
             cmd.dfa           = rdzv_dfa;
             cmd.index_ext     = rdzv_idx_ext;
             cmd.remote_offset = remote_addr;

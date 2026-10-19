@@ -1207,6 +1207,7 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
         cmd.lac                = 0; /* LAC 0 only -- see design plan scoping */
         cmd.event_send_disable = 1;
         cmd.restricted         = 0;
+        cmd.initiator          = iface->match_id;
         /* REPLY on the RX queue, where a NIC-issued rendezvous Get's REPLY
          * lands too: this Get is issued from an event handler, which cannot
          * be refused when the TX queue is full, and each posted receive
@@ -1811,6 +1812,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
         struct c_cstate_cmd cstate   = {};
         cstate.event_send_disable    = 1;
         cstate.restricted            = 0; /* unrestricted -> TAG PTE */
+        cstate.initiator             = iface->match_id;
         cstate.index_ext             = ep->dfa_tag_idx_ext;
         uct_cxi_idc_track_cstate(&cstate, iface);
 
@@ -1881,6 +1883,7 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable  = 0;
         cmd.restricted             = 0;
+        cmd.initiator              = iface->match_id;
         cmd.eq                     = iface->tx_eq.evtq->eqn;
         cmd.dfa                    = ep->dfa_tag;
         cmd.match_bits             = tag;
@@ -1944,6 +1947,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable  = 0;
         cmd.restricted             = 0;
+        cmd.initiator              = iface->match_id;
         cmd.eq                     = iface->tx_eq.evtq->eqn;
         cmd.dfa                    = ep->dfa_tag;
         cmd.match_bits             = tag;
@@ -2125,6 +2129,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.lac                    = memh->cxi_md->lac;
         cmd.event_send_disable     = 1;
         cmd.restricted             = 0;
+        cmd.initiator              = iface->match_id;
         cmd.eq                     = iface->tx_eq.evtq->eqn;
         cmd.dfa                    = ep->dfa_tag;
         cmd.match_bits             = tag;

@@ -103,6 +103,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
         cstate.event_send_disable     = 1;
         cstate.event_success_disable  = 0;
         cstate.restricted             = 0;
+        cstate.initiator              = iface->match_id;
         cstate.index_ext              = ep->dfa_am_idx_ext;
         uct_cxi_idc_track_cstate(&cstate, iface);
 
@@ -177,6 +178,7 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
         cstate.event_send_disable     = 1;
         cstate.event_success_disable  = 0;
         cstate.restricted             = 0;
+        cstate.initiator              = iface->match_id;
         cstate.index_ext              = ep->dfa_am_idx_ext;
         uct_cxi_idc_track_cstate(&cstate, iface);
 
@@ -262,6 +264,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable = 0;
         cmd.restricted           = 0;
+        cmd.initiator            = iface->match_id;
         cmd.eq                   = iface->tx_eq.evtq->eqn;
         cmd.dfa                  = ep->dfa_am;
         cmd.match_bits           = (uint64_t)id;
@@ -362,6 +365,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.event_send_disable    = 1;
         cmd.event_success_disable = 0;
         cmd.restricted            = 0;
+        cmd.initiator             = iface->match_id;
         cmd.eq                    = iface->tx_eq.evtq->eqn;
         cmd.dfa                   = ep->dfa_am;
         cmd.remote_offset         = 0;

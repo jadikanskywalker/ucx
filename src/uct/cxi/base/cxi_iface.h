@@ -564,6 +564,14 @@ typedef struct uct_cxi_iface {
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */
     struct cxil_domain   *domain;
 
+    /* The identity this interface sends as the "initiator" of every
+     * unrestricted command (CXI_MATCH_ID of its pid and NIC address). The
+     * target's events report the initiator exactly as the sender put it in the
+     * command, so a sender that leaves it zero is indistinguishable from every
+     * other to the receiver, which keys per-peer state on it (see
+     * tag.rndv_peer_cache). Restricted RMA/AMO commands have no such field. */
+    uint32_t              match_id;
+
 } uct_cxi_iface_t;
 
 

@@ -898,3 +898,102 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
 
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_rndv_unexp, cxi)
+
+/**
+ * Unexpected rendezvous from two different senders to one receiver.
+ *
+ * Each sender announces its own {ep_id, md_index} once; the receiver must
+ * rebuild every arrival's header from the announce of the sender that sent
+ * it. That needs the receiver to tell senders apart, which it does by the
+ * initiator field of the arrival event -- so this fails if events do not
+ * carry the sender's identity (all senders then look like one, and the last
+ * announce overwrites the others).
+ *
+ * Everything is let to land before the receiver looks, so both announces are
+ * processed before either arrival is.
+ */
+class test_cxi_tag_rndv_unexp_two_senders : public test_cxi_tag_rndv_unexp {
+protected:
+    void init() override
+    {
+        test_cxi_tag_rndv_unexp::init();
+        m_entities.push_back(uct_test::create_entity(
+                0, NULL, unexp_rndv_eager_cb, unexp_rndv_cb, &m_ctx,
+                &m_ctx)); /* second sender */
+    }
+
+    entity &sender2() { return m_entities.at(2); }
+};
+
+UCS_TEST_P(test_cxi_tag_rndv_unexp_two_senders, each_sender_keeps_its_header)
+{
+    static const size_t   PAY_LEN = 256;
+    static const uint64_t TAG_A   = 0xA000000000000001ULL;
+    static const uint64_t TAG_B   = 0xB000000000000002ULL;
+    static const uint64_t EP_ID_A = 0xAAAA0000AAAA0001ULL;
+    static const uint64_t EP_ID_B = 0xBBBB0000BBBB0002ULL;
+    static const uint64_t REQ_A   = 0x1111111111111111ULL;
+    static const uint64_t REQ_B   = 0x2222222222222222ULL;
+    static const uint8_t  MD_A    = 3;
+    static const uint8_t  MD_B    = 9;
+
+    sender().connect_to_iface(0, receiver());
+    sender2().connect_to_iface(0, receiver());
+
+    std::vector<uint8_t> tx_a(PAY_LEN, 0xAA), tx_b(PAY_LEN, 0xBB);
+    uct_mem_h            memh_a = reg(sender(), tx_a.data(), PAY_LEN);
+    uct_mem_h            memh_b = reg(sender2(), tx_b.data(), PAY_LEN);
+    uct_cxi_rndv_send_ctx sctx_a, sctx_b;
+    init_rndv_send_ctx(sctx_a);
+    init_rndv_send_ctx(sctx_b);
+
+    std::vector<uint8_t> hdr_a = pack_rndv_hdr(EP_ID_A, REQ_A, MD_A);
+    std::vector<uint8_t> hdr_b = pack_rndv_hdr(EP_ID_B, REQ_B, MD_B);
+    uct_iov_t iov_a = {tx_a.data(), PAY_LEN, memh_a, 0, 1};
+    uct_iov_t iov_b = {tx_b.data(), PAY_LEN, memh_b, 0, 1};
+
+    ucs_status_ptr_t op_a = uct_ep_tag_rndv_zcopy(sender().ep(0), TAG_A,
+                                                  hdr_a.data(), hdr_a.size(),
+                                                  &iov_a, 1, 0, &sctx_a.super);
+    ucs_status_ptr_t op_b = uct_ep_tag_rndv_zcopy(sender2().ep(0), TAG_B,
+                                                  hdr_b.data(), hdr_b.size(),
+                                                  &iov_b, 1, 0, &sctx_b.super);
+    ASSERT_FALSE(UCS_PTR_IS_ERR(op_a));
+    ASSERT_FALSE(UCS_PTR_IS_ERR(op_b));
+
+    /* Both announces and both arrivals land before the receiver looks. */
+    usleep(200000);
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+    while ((m_ctx.records.size() < 2) && (ucs_get_time() < deadline)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(sender2().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    ASSERT_EQ(2u, m_ctx.records.size());
+
+    for (const rndv_arrival_record &rec : m_ctx.records) {
+        const bool is_a = (rec.tag == TAG_A);
+        ASSERT_TRUE(is_a || (rec.tag == TAG_B)) << "unknown tag 0x" << std::hex
+                                                << rec.tag;
+        EXPECT_EQ(is_a ? EP_ID_A : EP_ID_B, rec.ep_id)
+                << "arrival for tag 0x" << std::hex << rec.tag
+                << " was given another sender's ep_id";
+        EXPECT_EQ(is_a ? MD_A : MD_B, rec.md_index)
+                << "arrival for tag 0x" << std::hex << rec.tag
+                << " was given another sender's md_index";
+        EXPECT_EQ(is_a ? REQ_A : REQ_B, rec.req_id);
+        uct_rkey_release(m_ctx.component, &rec.rkey_bundle);
+    }
+
+    /* Nothing pulls the data: withdraw the sends. */
+    uct_ep_tag_rndv_cancel(sender().ep(0), op_a);
+    uct_ep_tag_rndv_cancel(sender2().ep(0), op_b);
+    flush_ep(sender(), sender().ep(0));
+    flush_ep(sender2(), sender2().ep(0));
+    dereg(sender(), memh_a);
+    dereg(sender2(), memh_b);
+}
+
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_rndv_unexp_two_senders, cxi)
+

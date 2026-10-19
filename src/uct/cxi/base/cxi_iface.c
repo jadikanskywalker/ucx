@@ -927,6 +927,9 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err_destroy_tg_cmdq;
     }
 
+    self->match_id = CXI_MATCH_ID(cxi_md->pid_bits, self->domain->pid,
+                                  cxi_md->device.nid);
+
     /*
      * Steps 10–11: open UCT_CXI_MAX_LACS RMA PTEs (one per LAC, eagerly).
      *
