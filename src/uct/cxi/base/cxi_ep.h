@@ -121,6 +121,10 @@ typedef struct uct_cxi_ep {
                                              backoff in effect. */
     unsigned          consecutive_failures;  /**< For backoff/shrink growth */
     unsigned          consecutive_successes; /**< For backoff/grow reset    */
+    uint8_t           destroyed;       /**< uct_ep_destroy() was called while
+                                             sends were still in flight; the
+                                             last completion frees the ep (see
+                                             uct_cxi_ep_destroy) */
     uint8_t           rndv_hdr_announced; /**< 0 until this ep's one-time
                                              rendezvous-header announce
                                              (ep_id, md_index) has been sent
@@ -144,13 +148,18 @@ void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
  * uct_cxi_ep_fc_blocked — true if this send should be deferred to the
  * pending/arbiter retry path rather than attempted now.
  *
- * Three independent reasons, all gate identically (return
+ * Four independent reasons, all gate identically (return
  * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion — no new
  * caller-visible status):
  *   - pte_fc->exhausted: the *specific* PTE this op targets has hit
  *     matching-resource exhaustion (AM only — pass NULL for RMA/AMO ops,
  *     which never populate this; see uct_cxi_pte_fc_t). Unrelated PTEs'
  *     traffic is unaffected.
+ *   - iface->tx.outstanding >= iface->tx.max_inflight: the TX event queue
+ *     has no slot left for another completion. Every counted send yields
+ *     exactly one TX event, so this is what keeps the queue from
+ *     overflowing: a send takes a slot when it is rung and gives it back
+ *     when its completion is processed (RC's tx_cq_available, per iface).
  *   - ep->outstanding >= ep->max_outstanding: this EP's adaptive
  *     concurrency cap (see uct_cxi_ep_tx_complete).
  *   - ep->retry_backoff_until: this EP's adaptive retry-cadence backoff,
@@ -161,12 +170,80 @@ void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
  * and can no longer refill the RX queue out from under that drain.
  */
 static UCS_F_ALWAYS_INLINE int
-uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_pte_fc_t *pte_fc)
+uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
+                      const uct_cxi_pte_fc_t *pte_fc)
 {
     return ucs_unlikely(((pte_fc != NULL) && pte_fc->exhausted) ||
+                         (iface->tx.outstanding >= iface->tx.max_inflight) ||
                          (ep->outstanding >= ep->max_outstanding) ||
                          (ep->retry_backoff_until > ucs_get_time()));
 }
+
+/*
+ * IDC "short" sends (AM, tag, rendezvous-header announce) carry no per-send
+ * descriptor, so their completion is tracked by tagging the command's user_ptr
+ * with UCT_CXI_USER_PTR_SHORT and storing the ep pointer itself: no pool
+ * element to take or return, and the completion handler gets the ep it needs
+ * to account the send against. Ops, which are pointers to a uct_cxi_send_op_t
+ * (at least 8-byte aligned), never have this bit set.
+ *
+ * Tracked shorts exist to make connected-endpoint flow control possible --
+ * without a completion there is nothing to refund a lost send's credit
+ * from -- so a build without it keeps the untracked fire-and-forget path.
+ */
+#define UCT_CXI_USER_PTR_SHORT  1ULL
+
+#ifdef UCT_CXI_DISABLE_FC
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
+{
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep)
+{
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_idc_track_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+}
+
+#else
+
+/**
+ * Make the send's completion event land on the TX EQ. Goes in the c_state
+ * command that precedes the IDC message.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
+{
+    cstate->eq = iface->tx_eq.evtq->eqn;
+}
+
+/**
+ * Tag the completion with \a ep. For an unrestricted IDC message the event's
+ * user_ptr is the one in the message's own header -- the c_state command's
+ * user_ptr only applies to restricted IDC puts -- so this goes in the
+ * c_idc_msg_hdr, not the c_state.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep)
+{
+    ucs_assert(((uintptr_t)ep & UCT_CXI_USER_PTR_SHORT) == 0);
+    hdr->user_ptr = (uint64_t)(uintptr_t)ep | UCT_CXI_USER_PTR_SHORT;
+}
+
+/** Account the send once it has been rung (undone by its completion). */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_idc_track_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+    ep->outstanding++;
+    iface->tx.outstanding++;
+}
+
+#endif /* UCT_CXI_DISABLE_FC */
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);
 void         uct_cxi_ep_destroy(uct_ep_h tl_ep);

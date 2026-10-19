@@ -83,6 +83,7 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ep->consecutive_failures  = 0;
     ep->consecutive_successes = 0;
     ep->rndv_hdr_announced    = 0;
+    ep->destroyed             = 0;
     ucs_arbiter_group_init(&ep->arb_group);
 
     /* Build all DFAs at creation time so the hot path needs no check.
@@ -124,6 +125,30 @@ void uct_cxi_ep_destroy(uct_ep_h tl_ep)
 
     ucs_debug("cxi ep %p destroy (outstanding=%u)", ep, ep->outstanding);
     uct_cxi_ep_pending_purge(tl_ep, uct_cxi_ep_pending_purge_warn_cb, ep);
+
+    /* Completions of sends still in flight find their ep through a pointer
+     * stored in the command (op->ep, or the tagged user_ptr of a short), so
+     * freeing it now would leave them a dangling one. Leave the free to the
+     * last completion instead (see uct_cxi_iface_ep_tx_done). */
+    if (ep->outstanding > 0) {
+        uct_cxi_iface_t *iface = ucs_derived_of(ep->super.super.iface,
+                                                uct_cxi_iface_t);
+        int              ret;
+
+        kh_put(uct_cxi_zombie_ep_hash, &iface->tx.zombie_eps, (uintptr_t)ep,
+               &ret);
+        if (ret >= 0) {
+            ep->destroyed = 1;
+            return;
+        }
+
+        /* Cannot remember it, so cannot free it later: leak it rather than
+         * free memory a completion is about to dereference. */
+        ucs_error("cxi ep %p: no memory to track a destroyed ep with %u "
+                  "sends in flight, leaking it", ep, ep->outstanding);
+        return;
+    }
+
     ucs_free(ep);
 }
 

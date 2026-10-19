@@ -23,6 +23,7 @@
 
 #include "test_cxi_am.h"
 
+#include <uct/cxi/base/cxi_ep.h>
 #include <uct/cxi/base/cxi_iface.h>
 #include <uct/cxi/base/cxi_md.h>
 
@@ -539,5 +540,85 @@ UCS_TEST_P(test_cxi_am, eq_split_routing)
     /* The normal path must still complete the op from the TX queue. */
     flush_ep(sender(), ep);
 }
+
+#ifndef UCT_CXI_DISABLE_FC
+
+/**
+ * An am_short is tracked until its ACK, like every other send.
+ *
+ * IDC shorts used to be fire-and-forget, so a dropped one was invisible and
+ * flush did not cover them. They now complete on the TX queue: the ep and iface
+ * count them as outstanding from the send until the ACK is processed, which
+ * ep_flush waits for.
+ */
+UCS_TEST_P(test_cxi_am, am_short_tracked_until_ack)
+{
+    static const uint8_t AM_ID = 7;
+
+    uct_cxi_am_recv_ctx ctx = {false, {}};
+    set_am_handler(AM_ID, &ctx);
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h         ep     = sender().ep(0);
+    uct_cxi_ep_t    *cep    = ucs_derived_of(ep, uct_cxi_ep_t);
+    uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
+
+    uint8_t payload[16] = {};
+    ASSERT_UCS_OK(uct_ep_am_short(ep, AM_ID, 0x1234, payload, sizeof(payload)));
+
+    /* Nothing has been progressed yet: the ACK cannot have been handled. */
+    EXPECT_EQ(1u, cep->outstanding);
+    EXPECT_EQ(1u, siface->tx.outstanding);
+    EXPECT_EQ(UCS_INPROGRESS, uct_ep_flush(ep, 0, NULL));
+
+    flush_ep(sender(), ep);
+    EXPECT_EQ(0u, cep->outstanding);
+    EXPECT_EQ(0u, siface->tx.outstanding);
+
+    poll_am(ep, ctx);
+}
+
+/**
+ * An ep destroyed while sends are in flight is not freed under them.
+ *
+ * A send's completion finds its ep through a pointer stored in the command,
+ * so freeing the ep at uct_ep_destroy() would leave that completion a dangling
+ * one. The ep is kept (flagged destroyed, remembered in the iface) and freed
+ * by the last completion, which also forgets it. Nothing here can see the free
+ * itself; it is the clean run (and a valgrind run, where available) that shows
+ * the completion did not touch freed memory.
+ */
+UCS_TEST_P(test_cxi_am, ep_destroy_with_am_short_in_flight)
+{
+    static const uint8_t AM_ID = 8;
+
+    uct_cxi_am_recv_ctx ctx = {false, {}};
+    set_am_handler(AM_ID, &ctx);
+
+    sender().connect_to_iface(0, receiver());
+    uct_cxi_ep_t    *cep    = ucs_derived_of(sender().ep(0), uct_cxi_ep_t);
+    uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
+
+    uint8_t payload[16] = {};
+    ASSERT_UCS_OK(uct_ep_am_short(sender().ep(0), AM_ID, 0x1234, payload,
+                                  sizeof(payload)));
+    ASSERT_EQ(1u, siface->tx.outstanding);
+
+    sender().destroy_ep(0);
+    EXPECT_EQ(1u, cep->destroyed) << "the ep must outlive its in-flight send";
+    EXPECT_EQ(1u, kh_size(&siface->tx.zombie_eps))
+            << "the iface must remember it, to free it if it closes first";
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+    while ((siface->tx.outstanding > 0) && (ucs_get_time() < deadline)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    EXPECT_EQ(0u, siface->tx.outstanding);
+    EXPECT_EQ(0u, kh_size(&siface->tx.zombie_eps))
+            << "the last completion must have freed the ep";
+}
+
+#endif /* UCT_CXI_DISABLE_FC */
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_am, cxi)

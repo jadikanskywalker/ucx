@@ -91,7 +91,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     UCT_CHECK_LENGTH(length, 0,
                      C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t), "am_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->am.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -104,6 +104,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
         cstate.event_success_disable  = 0;
         cstate.restricted             = 0;
         cstate.index_ext              = ep->dfa_am_idx_ext;
+        uct_cxi_idc_track_cstate(&cstate, iface);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
@@ -116,6 +117,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
         struct c_idc_msg_hdr hdr = {};
         hdr.dfa        = ep->dfa_am;
         hdr.match_bits = (uint64_t)id;
+        uct_cxi_idc_track_hdr(&hdr, ep);
 
         ucs_trace("cxi IDC_SEND: am_id=%u total_len=%zu "
                   "nid=%u pid=%u idx_ext=%u "
@@ -134,6 +136,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     }
 
     cxi_cq_ring(iface->tx.cmdq);
+    uct_cxi_idc_track_commit(ep, iface);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, SHORT, sizeof(uint64_t) + length);
@@ -175,6 +178,7 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
         cstate.event_success_disable  = 0;
         cstate.restricted             = 0;
         cstate.index_ext              = ep->dfa_am_idx_ext;
+        uct_cxi_idc_track_cstate(&cstate, iface);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
@@ -188,6 +192,7 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
         struct c_idc_msg_hdr hdr = {};
         hdr.dfa        = ep->dfa_am;
         hdr.match_bits = UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG;
+        uct_cxi_idc_track_hdr(&hdr, ep);
 
         ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, &payload,
                                   sizeof(payload));
@@ -199,6 +204,7 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     }
 
     cxi_cq_ring(iface->tx.cmdq);
+    uct_cxi_idc_track_commit(ep, iface);
     ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u",
              ep, (unsigned long)ep_id, (unsigned)md_index);
     return UCS_OK;
@@ -232,7 +238,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     size_t               length;
     int                  ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->am.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -332,7 +338,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
                      iface->am.buf_size - sizeof(uint64_t),
                      "am_zcopy total");
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->am.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 

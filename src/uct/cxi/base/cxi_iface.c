@@ -63,8 +63,8 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
                                   "so one chunk can saturate the cmdq without regrowth.\n"
                                   "MAX_BUFS default (512) is bounded so pool exhaustion\n"
                                   "reliably triggers UCS_ERR_NO_RESOURCE / pending-retry.\n"
-                                  "The TX event queue is sized from this cap (see\n"
-                                  "TX_EQ_SIZE), so it cannot overflow. -1 means 512.\n"
+                                  "Total sends in flight are separately capped by the TX\n"
+                                  "event queue depth (TX_EQ_SIZE). -1 means 512.\n"
                                   "Workloads with many concurrently-busy endpoints on one\n"
                                   "interface should raise this together with\n"
                                   "TX_OP_MAX_BUFS — per-endpoint size for expected\n"
@@ -91,12 +91,13 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
 
     {"TX_EQ_SIZE", "-1",
      "TX event queue depth: completions (ACK/REPLY) of commands this iface\n"
-     "issued. -1 (default) sizes it from the TX pool caps\n"
-     "(TX_OP_MAX_BUFS + BCOPY_MAX_BUFS, plus the rendezvous and software-Get\n"
-     "tracking limits), which makes overflow impossible because every\n"
-     "in-flight command holds a pool slot. An explicit value below that\n"
-     "minimum is used as given but logged: a dropped completion is not\n"
-     "recoverable.",
+     "issued. -1 (default) resolves to 1024. A send holds one slot from the\n"
+     "moment it is issued until its completion is processed, so this also\n"
+     "caps the number of sends in flight (minus a few slots reserved for\n"
+     "get_short and error events): beyond it sends return\n"
+     "UCS_ERR_NO_RESOURCE and wait on the pending queue. Raise it for\n"
+     "workloads that need more concurrent sends than that; TX_OP_MAX_BUFS\n"
+     "and BCOPY_MAX_BUFS separately bound the pool-backed ones.",
      ucs_offsetof(uct_cxi_iface_config_t, tx_eq_size),
      UCS_CONFIG_TYPE_INT},
 
@@ -668,45 +669,6 @@ uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
 }
 
 /*
- * uct_cxi_iface_tx_eq_events -- TX event queue depth. Every in-flight
- * command holds one slot of a bounded pool or tracking table and completes
- * with exactly one event, so the queue is sized to cover all of them at once
- * and cannot overflow:
- *   - send ops and bcopy descriptors (op_pool / desc_pool caps),
- *   - rendezvous Put ACKs (iface->rdzv.ops, at most
- *     UCT_CXI_RDZV_MAX_OUTSTANDING_MAX),
- *   - software-issued rendezvous Get REPLYs (rdzv_get_op_pool, capped at
- *     tag.max_outstanding),
- *   - the single synchronous get_short,
- * plus UCT_CXI_TX_EQ_HEADROOM for command-queue error events.
- */
-static unsigned
-uct_cxi_iface_tx_eq_events(const uct_cxi_iface_config_t *config,
-                           unsigned op_max_bufs, unsigned desc_max_bufs)
-{
-    uint64_t events = (uint64_t)op_max_bufs + desc_max_bufs +
-                      UCT_CXI_RDZV_MAX_OUTSTANDING_MAX +
-                      ucs_min(config->tag_max_outstanding,
-                              UCT_CXI_TAG_MAX_OUTSTANDING_MAX) +
-                      1 + UCT_CXI_TX_EQ_HEADROOM;
-    uint64_t max    = UINT_MAX / UCT_CXI_EQ_ENTRY_SIZE;
-
-    events = ucs_min(events, max);
-    if (config->tx_eq_size == UINT_MAX) {
-        return (unsigned)events;
-    }
-
-    if (config->tx_eq_size < events) {
-        ucs_warn("cxi TX_EQ_SIZE=%u is below the %u events needed to hold "
-                 "every in-flight command (TX_OP_MAX_BUFS=%u, "
-                 "BCOPY_MAX_BUFS=%u); a dropped completion is not "
-                 "recoverable", config->tx_eq_size, (unsigned)events,
-                 op_max_bufs, desc_max_bufs);
-    }
-    return config->tx_eq_size;
-}
-
-/*
  * uct_cxi_eq_init -- allocate one event queue: mmap its ring buffer, pin it
  * for the NIC and create the hardware queue on top of it. The caller must
  * have filled in eq->num_events, eq->reserved_slots_pct and eq->grow.* (the
@@ -847,24 +809,25 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      *
      * Each pool cap's -1/UINT_MAX sentinel (config table default is 512, so
      * only an explicit -1/inf lands here) resolves to half of the default RX
-     * depth. The TX event queue is then sized from the resolved caps (see
-     * uct_cxi_iface_tx_eq_events()), so TX completions can never overflow it
-     * and pool exhaustion — UCS_ERR_NO_RESOURCE / pending-retry — is the only
-     * TX-side backpressure.
+     * depth.
      *
-     * EQ_SIZE uses the same -1/UINT_MAX-sentinel convention — unset resolves
-     * to UCT_CXI_EQ_NUM_EVENTS, explicitly set uses that value exactly. This
-     * is a real sentinel, not a "differs from the compiled-in default"
-     * guess, so a user explicitly setting EQ_SIZE to the same value the
-     * default would have produced is still correctly seen as "set" — the
+     * EQ_SIZE and TX_EQ_SIZE use the same -1/UINT_MAX-sentinel convention —
+     * unset resolves to UCT_CXI_EQ_NUM_EVENTS, explicitly set uses that value
+     * exactly. This is a real sentinel, not a "differs from the compiled-in
+     * default" guess, so a user explicitly setting a size to the same value
+     * the default would have produced is still correctly seen as "set" — the
      * config table must keep passing -1 through un-resolved for this check to
      * mean anything; nothing upstream of here may substitute in the default
-     * early. It sizes the RX queue only.
+     * early. EQ_SIZE sizes the RX queue; TX_EQ_SIZE the TX queue, which holds
+     * one completion per send in flight and so also caps how many there may
+     * be (tx.max_inflight): beyond that sends wait on the pending queue
+     * instead of growing the event queue.
      */
     {
-        unsigned eq_cfg   = config->eq_size;
-        unsigned op_cfg   = config->op_mp.max_bufs;
-        unsigned desc_cfg = config->bcopy_mp.max_bufs;
+        unsigned eq_cfg    = config->eq_size;
+        unsigned tx_eq_cfg = config->tx_eq_size;
+        unsigned op_cfg    = config->op_mp.max_bufs;
+        unsigned desc_cfg  = config->bcopy_mp.max_bufs;
 
         op_max_bufs   = (op_cfg == UINT_MAX) ?
                         ucs_max(UCT_CXI_EQ_NUM_EVENTS / 2, 1u) : op_cfg;
@@ -878,10 +841,23 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                                                     eq_cfg,
                              config->eq_reserved_slots_pct,
                              config->dynamic_eq_growth, config);
+
+        if ((tx_eq_cfg != UINT_MAX) && (tx_eq_cfg <= UCT_CXI_TX_EQ_UNTRACKED)) {
+            ucs_warn("cxi TX_EQ_SIZE=%u leaves no room for sends beyond the "
+                     "%u slots reserved for get_short and error events; "
+                     "using %u", tx_eq_cfg, UCT_CXI_TX_EQ_UNTRACKED,
+                     UCT_CXI_TX_EQ_UNTRACKED + 1);
+            tx_eq_cfg = UCT_CXI_TX_EQ_UNTRACKED + 1;
+        }
         uct_cxi_eq_configure(&self->tx_eq, "tx",
-                             uct_cxi_iface_tx_eq_events(config, op_max_bufs,
-                                                        desc_max_bufs),
+                             (tx_eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
+                                                       tx_eq_cfg,
                              0, 0, config);
+
+        /* configure() may round the depth up; derive the cap from what the
+         * queue actually holds. */
+        self->tx.max_inflight = self->tx_eq.num_events -
+                                UCT_CXI_TX_EQ_UNTRACKED;
     }
 
     /* PTE flow-control recovery config, resolved once here (setup time,
@@ -978,6 +954,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * outstanding ops can exceed the hardware EQ depth.
      */
     self->tx.outstanding = 0;
+    kh_init_inplace(uct_cxi_zombie_ep_hash, &self->tx.zombie_eps);
     ucs_arbiter_init(&self->tx.arbiter);
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_send_op_t);
@@ -1213,6 +1190,21 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     uct_cxi_eq_abort_resize(&self->tx_eq);
 
     ucs_arbiter_cleanup(&self->tx.arbiter);
+
+    /* Endpoints destroyed with sends in flight are normally freed by the last
+     * of those sends' completions; closing first means those completions are
+     * never processed, so free them here. */
+    if (kh_size(&self->tx.zombie_eps) > 0) {
+        uint64_t zombie;
+
+        ucs_debug("cxi iface %p closing while %u destroyed endpoint(s) still "
+                  "have sends in flight", self,
+                  (unsigned)kh_size(&self->tx.zombie_eps));
+        kh_foreach_key(&self->tx.zombie_eps, zombie, {
+            ucs_free((void*)(uintptr_t)zombie);
+        });
+    }
+    kh_destroy_inplace(uct_cxi_zombie_ep_hash, &self->tx.zombie_eps);
 
     /* Close RDZV PTE first (opened after TAG, so closed before it), then
      * TAG PTE (opened after AM, so closed before it). Both are no-ops if
@@ -1747,6 +1739,83 @@ uct_cxi_iface_handle_state_change(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
 }
 
 /*
+ * uct_cxi_iface_tx_error -- log a TX completion that did not succeed. Rare,
+ * kept out of line so it adds nothing to the inlined completion path.
+ */
+static UCS_F_NOINLINE void
+uct_cxi_iface_tx_error(uct_cxi_iface_t *iface, const union c_event *event,
+                       uct_cxi_ep_t *ep)
+{
+    ucs_error("cxi TX event %d error: rc=%d ep %p",
+              (int)event->hdr.event_type, cxi_event_rc(event), ep);
+    if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
+        iface->am.pte != NULL) {
+        struct cxi_pte_status pte_s = {};
+        if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
+            ucs_error("cxi AM PTE state=%u drop_count=%u ule_count=%u",
+                      pte_s.state, pte_s.drop_count, pte_s.ule_count);
+        }
+    }
+}
+
+/*
+ * uct_cxi_iface_ep_tx_done -- account one completed send against its ep:
+ * the part common to every send, whether it was tracked by an op or by a
+ * tagged user_ptr (IDC shorts).
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_iface_ep_tx_done(uct_cxi_iface_t *iface, const union c_event *event,
+                         uct_cxi_ep_t *ep, ucs_status_t status)
+{
+    if (ucs_unlikely(status != UCS_OK)) {
+        uct_cxi_iface_tx_error(iface, event, ep);
+    }
+    /* Target PTE in graceful recovery (en_flowctrl) or any
+     * other completion status feeds this EP's adaptive
+     * concurrency cap / retry cadence — see
+     * uct_cxi_ep_tx_complete(). No wire message needed: this
+     * is a purely local, self-observed signal. */
+    uct_cxi_ep_tx_complete(ep, status);
+    /* Latch the worst status seen across every op draining
+     * while a flush is pending on this EP — first failure
+     * sticks (uct_completion_update_status). The final
+     * uct_invoke_completion(..., UCS_OK) below is safe
+     * regardless: it internally re-applies update_status,
+     * which UCS_OK can never overwrite an already-latched
+     * error with. */
+    if (ep->flush_comp != NULL) {
+        uct_completion_update_status(ep->flush_comp, status);
+    }
+    ep->outstanding--;
+    iface->tx.outstanding--;
+    if (ep->outstanding == 0 && ep->flush_comp != NULL) {
+        uct_invoke_completion(ep->flush_comp, UCS_OK);
+        ep->flush_comp = NULL;
+    }
+    ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
+              (int)event->hdr.event_type, cxi_event_rc(event), ep,
+              ep->outstanding);
+}
+
+/*
+ * uct_cxi_iface_ep_release -- free an ep that uct_ep_destroy() left alive
+ * because sends were still in flight, once the last one has completed.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_iface_ep_release(uct_cxi_iface_t *iface, uct_cxi_ep_t *ep)
+{
+    khiter_t iter;
+
+    if (ucs_unlikely(ep->destroyed) && (ep->outstanding == 0)) {
+        iter = kh_get(uct_cxi_zombie_ep_hash, &iface->tx.zombie_eps,
+                      (uintptr_t)ep);
+        ucs_assert(iter != kh_end(&iface->tx.zombie_eps));
+        kh_del(uct_cxi_zombie_ep_hash, &iface->tx.zombie_eps, iter);
+        ucs_free(ep);
+    }
+}
+
+/*
  * uct_cxi_iface_handle_event -- dispatch one event drained from \a eq.
  * Handlers are keyed on the event type (and PTE index), not on which queue
  * delivered it; \a eq only selects the per-queue drain/growth state.
@@ -1772,65 +1841,43 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
          * ACK   = restricted PUT confirmed by remote (RMA).
          * REPLY = GET data returned (RMA, or a software-issued
          *         get_issued==0 rendezvous Get -- see below). */
-        op = (uct_cxi_send_op_t *)(uintptr_t)event->init_short.user_ptr;
-        if (op->ep == NULL) {
-            /* Software-issued rendezvous Get (uct_cxi_rdzv_get_op_t,
-             * see uct_cxi_iface_issue_rdzv_get in cxi_tag.c) --
-             * deliberately has no uct_cxi_ep_t (tag receives are
-             * posted on the iface, not a specific peer), so none of
-             * the ep-bookkeeping below applies; dispatch straight to
-             * its handler. No other op type in this transport ever
-             * has ep==NULL. */
-            ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
-            op->handler(op, status);
-        } else {
-            ucs_status_t status = uct_cxi_rc_to_status(cxi_event_rc(event));
+        uint64_t     user_ptr = event->init_short.user_ptr;
+        ucs_status_t status   = uct_cxi_rc_to_status(cxi_event_rc(event));
+        uct_cxi_ep_t *ep;
 
-            if (ucs_unlikely(status != UCS_OK)) {
-                ucs_error("cxi TX event %d error: rc=%d ep %p",
-                          (int)event->hdr.event_type,
-                          cxi_event_rc(event), op->ep);
-                if (cxi_event_rc(event) == C_RC_ENTRY_NOT_FOUND &&
-                    iface->am.pte != NULL) {
-                    struct cxi_pte_status pte_s = {};
-                    if (cxil_pte_status(iface->am.pte, &pte_s) == 0) {
-                        ucs_error("cxi AM PTE state=%u drop_count=%u ule_count=%u",
-                                  pte_s.state, pte_s.drop_count, pte_s.ule_count);
-                    }
-                }
-            }
-            /* Target PTE in graceful recovery (en_flowctrl) or any
-             * other completion status feeds this EP's adaptive
-             * concurrency cap / retry cadence — see
-             * uct_cxi_ep_tx_complete(). No wire message needed: this
-             * is a purely local, self-observed signal. */
-            uct_cxi_ep_tx_complete(op->ep, status);
-            /* Latch the worst status seen across every op draining
-             * while a flush is pending on this EP — first failure
-             * sticks (uct_completion_update_status). The final
-             * uct_invoke_completion(..., UCS_OK) below is safe
-             * regardless: it internally re-applies update_status,
-             * which UCS_OK can never overwrite an already-latched
-             * error with. */
-            if (op->ep->flush_comp != NULL) {
-                uct_completion_update_status(op->ep->flush_comp, status);
-            }
-            op->ep->outstanding--;
-            iface->tx.outstanding--;
-            if (op->ep->outstanding == 0 && op->ep->flush_comp != NULL) {
-                uct_invoke_completion(op->ep->flush_comp, UCS_OK);
-                op->ep->flush_comp = NULL;
-            }
-            ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
-                      (int)event->hdr.event_type,
-                      cxi_event_rc(event), op->ep, op->ep->outstanding);
-            if (op->handler != NULL) {
-                op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
+        /* Every command that reports on the TX queue carries a user_ptr. */
+        ucs_assert(user_ptr != 0);
+
+        if (user_ptr & UCT_CXI_USER_PTR_SHORT) {
+            /* IDC short, tracked by its ep alone (no op) -- see
+             * uct_cxi_idc_track_hdr. */
+            ep = (uct_cxi_ep_t *)(uintptr_t)(user_ptr &
+                                             ~UCT_CXI_USER_PTR_SHORT);
+            uct_cxi_iface_ep_tx_done(iface, event, ep, status);
+            uct_cxi_iface_ep_release(iface, ep);
+        } else {
+            op = (uct_cxi_send_op_t *)(uintptr_t)user_ptr;
+            ep = op->ep;
+            if (ep == NULL) {
+                /* Software-issued rendezvous Get (uct_cxi_rdzv_get_op_t,
+                 * see uct_cxi_iface_issue_rdzv_get in cxi_tag.c) --
+                 * deliberately has no uct_cxi_ep_t (tag receives are
+                 * posted on the iface, not a specific peer), so none of
+                 * the ep-bookkeeping applies; dispatch straight to its
+                 * handler. No other op type in this transport ever has
+                 * ep==NULL. */
+                op->handler(op, status);
             } else {
-                if (op->comp != NULL) {
-                    uct_invoke_completion(op->comp, status);
+                uct_cxi_iface_ep_tx_done(iface, event, ep, status);
+                if (op->handler != NULL) {
+                    op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
+                } else {
+                    if (op->comp != NULL) {
+                        uct_invoke_completion(op->comp, status);
+                    }
+                    ucs_mpool_put(op);     /* zcopy / short */
                 }
-                ucs_mpool_put(op);     /* zcopy / short */
+                uct_cxi_iface_ep_release(iface, ep);
             }
         }
     } else if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&

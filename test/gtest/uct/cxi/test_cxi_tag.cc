@@ -19,6 +19,7 @@
 
 #include "test_cxi_tag.h"
 
+#include <uct/cxi/base/cxi_ep.h>
 #include <uct/cxi/base/cxi_iface.h>
 #include <uct/cxi/base/cxi_md.h>
 
@@ -248,6 +249,37 @@ UCS_TEST_P(test_cxi_tag, unexpected_bcopy)
 
     flush_ep(sender(), ep);
 }
+
+#ifndef UCT_CXI_DISABLE_FC
+
+/**
+ * A tag_eager_short is tracked until its ACK, like every other send (see
+ * test_cxi_am.am_short_tracked_until_ack).
+ */
+UCS_TEST_P(test_cxi_tag, tag_eager_short_tracked_until_ack)
+{
+    static const uct_tag_t TAG = 0x1357924680ABCDEFULL;
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h         ep     = sender().ep(0);
+    uct_cxi_ep_t    *cep    = ucs_derived_of(ep, uct_cxi_ep_t);
+    uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
+
+    uint8_t payload[16] = {};
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, payload, sizeof(payload)));
+
+    EXPECT_EQ(1u, cep->outstanding);
+    EXPECT_EQ(1u, siface->tx.outstanding);
+
+    flush_ep(sender(), ep);
+    EXPECT_EQ(0u, cep->outstanding);
+    EXPECT_EQ(0u, siface->tx.outstanding);
+
+    poll_until(m_unexp.fired);
+    EXPECT_EQ(TAG, m_unexp.tag);
+}
+
+#endif /* UCT_CXI_DISABLE_FC */
 
 /**
  * Several unexpected eager messages of very different sizes sharing the

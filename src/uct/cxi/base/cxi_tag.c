@@ -1207,7 +1207,12 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
         cmd.lac                = 0; /* LAC 0 only -- see design plan scoping */
         cmd.event_send_disable = 1;
         cmd.restricted         = 0;
-        cmd.eq                 = iface->tx_eq.evtq->eqn;
+        /* REPLY on the RX queue, where a NIC-issued rendezvous Get's REPLY
+         * lands too: this Get is issued from an event handler, which cannot
+         * be refused when the TX queue is full, and each posted receive
+         * already has a slot budgeted there for exactly one Get REPLY. Any
+         * queue's events go through the same dispatch. */
+        cmd.eq                 = iface->rx_eq.evtq->eqn;
         cmd.dfa                = dfa;
         cmd.remote_offset      = event->tgt_long.remote_offset;
         cmd.local_addr         = local_addr;
@@ -1798,7 +1803,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, "tag_eager_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -1807,6 +1812,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
         cstate.event_send_disable    = 1;
         cstate.restricted            = 0; /* unrestricted -> TAG PTE */
         cstate.index_ext             = ep->dfa_tag_idx_ext;
+        uct_cxi_idc_track_cstate(&cstate, iface);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
@@ -1820,6 +1826,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
         struct c_idc_msg_hdr hdr = {};
         hdr.dfa        = ep->dfa_tag;
         hdr.match_bits = tag;
+        uct_cxi_idc_track_hdr(&hdr, ep);
 
         ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, data, length);
     }
@@ -1830,6 +1837,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
     }
 
     cxi_cq_ring(iface->tx.cmdq);
+    uct_cxi_idc_track_commit(ep, iface);
     ucs_debug("cxi TAG [SEND-SHORT] ep=%p tag=0x%lx len=%zu", ep,
              (unsigned long)tag, length);
     return UCS_OK;
@@ -1849,7 +1857,7 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     size_t                length;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -1916,7 +1924,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
 
     UCT_CHECK_IOV_SIZE(iovcnt, 1ul, "tag_eager_zcopy");
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -2066,7 +2074,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM);
     }
 
-    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
     }
 

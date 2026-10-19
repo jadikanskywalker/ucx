@@ -220,8 +220,10 @@ UCS_TEST_P(test_cxi_iface, is_reachable_v2)
 
 /**
  * The iface owns two distinct event queues: a TX queue for initiator
- * completions, sized from the TX pool caps and never grown or partly
- * reserved, and an RX queue for everything the NIC reports for our PTEs.
+ * completions, never grown or partly reserved, and an RX queue for everything
+ * the NIC reports for our PTEs. A send holds one TX slot until its completion
+ * is processed, so the TX depth (minus the few slots kept for get_short and
+ * error events) is also the cap on sends in flight.
  */
 UCS_TEST_P(test_cxi_iface, eq_split_layout)
 {
@@ -234,8 +236,9 @@ UCS_TEST_P(test_cxi_iface, eq_split_layout)
 
     EXPECT_GT(iface->rx_eq.num_events, 0u);
 
-    /* Both pools (default cap 512 each) must fit at once, plus headroom. */
-    EXPECT_GE(iface->tx_eq.num_events, 2 * 512u + UCT_CXI_TX_EQ_HEADROOM);
+    EXPECT_GT(iface->tx_eq.num_events, UCT_CXI_TX_EQ_UNTRACKED);
+    EXPECT_EQ(iface->tx_eq.num_events - UCT_CXI_TX_EQ_UNTRACKED,
+              iface->tx.max_inflight);
 
     EXPECT_FALSE(iface->tx_eq.grow.enabled) << "the TX queue never grows";
     EXPECT_EQ(0u, iface->tx_eq.reserved_slots)

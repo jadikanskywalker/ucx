@@ -38,9 +38,14 @@
  * queue before giving up. The NIC normally frees room within microseconds. */
 #define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
 
-/* Extra TX event queue slots beyond the pool-derived worst case: command
- * queue error events and rounding slack. */
-#define UCT_CXI_TX_EQ_HEADROOM 64U
+/* TX event queue slots kept out of iface->tx.max_inflight, because the events
+ * that use them are not counted in iface->tx.outstanding: the single
+ * synchronous get_short's REPLY (1), plus a few for the error events the
+ * hardware can report on a command queue's event queue
+ * (C_EVENT_COMMAND_FAILURE, C_EVENT_ERROR). Those never occur in normal
+ * operation; if more arrive than this holds, the queue drops the extras and
+ * progress reports the drop. */
+#define UCT_CXI_TX_EQ_UNTRACKED  8U
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
@@ -283,6 +288,15 @@ typedef struct uct_cxi_eq {
     } grow;
 } uct_cxi_eq_t;
 
+/*
+ * Endpoints destroyed with sends still in flight (uct_cxi_ep_destroy): their
+ * completions find the ep through a pointer stored in the command, so the ep
+ * has to outlive them. The last completion frees it; this set is how the
+ * iface finds any that are left when it closes first, since their
+ * completions will then never be processed. Keyed by ep address.
+ */
+KHASH_SET_INIT_INT64(uct_cxi_zombie_ep_hash)
+
 /**
  * CXI interface instance.
  *
@@ -301,6 +315,13 @@ typedef struct uct_cxi_iface {
         ucs_mpool_t      desc_pool;        /**< uct_cxi_send_desc_t — bcopy bounce bufs */
         size_t           max_bcopy;        /**< Max payload per bcopy op (from config) */
         unsigned         outstanding;      /**< Total in-flight sends (all EPs) */
+        unsigned         max_inflight;     /**< Cap on outstanding: every counted
+                                                send yields exactly one TX EQ
+                                                event, so this is the TX EQ depth
+                                                minus UCT_CXI_TX_EQ_UNTRACKED.
+                                                Sends beyond it are refused with
+                                                UCS_ERR_NO_RESOURCE (-> pending
+                                                queue), never queued in the EQ */
         /* Pending-request queue: when a send returns UCS_ERR_NO_RESOURCE,
          * uct_ep_pending_add() queues the caller's callback here via the
          * EP's arb_group.  Drained from uct_cxi_iface_progress() once TX
@@ -312,6 +333,8 @@ typedef struct uct_cxi_iface {
          * Single-threaded poll model guarantees at most one get_short in
          * flight at a time; the implementation spins until C_EVENT_REPLY
          * and then memcpy's into the caller's buffer. */
+        khash_t(uct_cxi_zombie_ep_hash) zombie_eps; /**< Destroyed eps with
+                                                          sends in flight   */
         uint8_t              *get_short_buf; /**< Page-aligned, NIC DMA target    */
         uct_cxi_mem_handle_t  get_short_mh;  /**< cxil_map handle for get_short_buf */
     } tx;

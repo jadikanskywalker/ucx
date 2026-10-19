@@ -98,7 +98,7 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_RES, "get_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -194,7 +194,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
               (unsigned long)(rkey_p->iova + remote_addr),
               (unsigned)rkey_p->lac);
 
-    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -309,7 +309,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
     size_t                length;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -385,7 +385,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
 
     UCT_CHECK_LENGTH(length, 0, iface->tx.max_bcopy, "get_bcopy");
 
-    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -487,7 +487,7 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -556,7 +556,7 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 

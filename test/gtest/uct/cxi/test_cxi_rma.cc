@@ -842,4 +842,64 @@ UCS_TEST_P(test_cxi_rma, get_short_remote_nonaligned)
 }
 
 
+/**
+ * iface->tx.max_inflight caps the sends outstanding on the TX event queue.
+ *
+ * Every counted send yields one TX event, so once as many are in flight as
+ * the cap allows, further sends must be held back with UCS_ERR_NO_RESOURCE
+ * (feeding the usual pending-retry path) until completions free a slot. The
+ * cap is shrunk directly to a tiny value so the test is deterministic; with
+ * the default configuration the op/bcopy pools run out long before it.
+ */
+UCS_TEST_P(test_cxi_rma, tx_inflight_cap_holds_back_sends)
+{
+    static const size_t   SIZE = 64;
+    static const unsigned CAP  = 4;
+
+    uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
+    siface->tx.max_inflight = CAP;
+
+    std::vector<uint8_t> dst(SIZE, 0x00);
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    uct_mem_h dst_memh = reg(receiver(), dst.data(), SIZE);
+    ASSERT_NE(static_cast<uct_mem_h>(nullptr), dst_memh);
+
+    std::string rkey_buf = pack_rkey(receiver(), dst_memh, dst.data(), SIZE);
+    uct_rkey_bundle_t rkey_bundle;
+    ASSERT_UCS_OK(uct_rkey_unpack(GetParam()->component,
+                                   rkey_buf.data(), &rkey_bundle));
+
+    auto pack_fn = [](void *buf, void *arg) -> size_t {
+        memset(buf, 0x5A, SIZE);
+        return SIZE;
+    };
+    auto send = [&]() {
+        return uct_ep_put_bcopy(ep, pack_fn, NULL,
+                                (uint64_t)(uintptr_t)dst.data(),
+                                rkey_bundle.rkey);
+    };
+
+    /* No progress in between, so nothing completes: exactly CAP get in. */
+    unsigned accepted = 0;
+    ssize_t  ret;
+    while ((ret = send()) == static_cast<ssize_t>(SIZE)) {
+        accepted++;
+        ASSERT_LE(accepted, 10 * CAP) << "the cap never held sends back";
+    }
+    EXPECT_EQ(static_cast<ssize_t>(UCS_ERR_NO_RESOURCE), ret);
+    EXPECT_EQ(CAP, accepted);
+
+    /* Completions free the slots again. */
+    flush_ep(sender(), ep);
+    EXPECT_EQ(0u, siface->tx.outstanding);
+    EXPECT_EQ(static_cast<ssize_t>(SIZE), send());
+
+    flush_ep(sender(), ep);
+    uct_rkey_release(GetParam()->component, &rkey_bundle);
+    dereg(receiver(), dst_memh);
+}
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_rma, cxi)

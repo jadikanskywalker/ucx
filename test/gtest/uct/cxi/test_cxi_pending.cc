@@ -337,6 +337,30 @@ UCS_TEST_P(test_cxi_pending, pending_purged_on_ep_destroy)
         EXPECT_EQ(1u, m_warnings.size());
     }
 
+    /* The sends exhaust_op_pool() posted are still in flight and, with the ep
+     * destroyed, their completions are the only thing left to free them (and
+     * the ep itself). Drain them before the iface goes away, or its op pool
+     * is destroyed with elements still checked out and reports each one as
+     * "not returned to mpool". */
+    {
+        uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(),
+                                                 uct_cxi_iface_t);
+        ucs_time_t       drain_deadline = ucs_get_time() +
+                                          ucs_time_from_sec(5.0);
+
+        while ((siface->tx.outstanding > 0) &&
+               (ucs_get_time() < drain_deadline)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        EXPECT_EQ(0u, siface->tx.outstanding);
+    }
+
+    /* Completions freed op_pool slots, which is exactly what used to retry a
+     * queued request: the purged one must stay purged. */
+    EXPECT_FALSE(ctx.fired)
+            << "a request purged at ep destroy was still dispatched";
+
     uct_rkey_release(GetParam()->component, &rkey_bundle);
     dereg(receiver(), target_memh);
 }
