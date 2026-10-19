@@ -33,6 +33,10 @@
  * hardware constant. */
 #define UCT_CXI_EQ_NUM_EVENTS  1024U
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
+/* How long uct_cxi_iface_tgt_post() waits for room in a full target command
+ * queue before giving up. The NIC normally frees room within microseconds. */
+#define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
+
 /* Extra TX event queue slots beyond the pool-derived worst case: command
  * queue error events and rounding slack. */
 #define UCT_CXI_TX_EQ_HEADROOM 64U
@@ -281,17 +285,6 @@ typedef struct uct_cxi_eq {
 } uct_cxi_eq_t;
 
 /**
- * A target command the target command queue had no room for, waiting to be
- * submitted by uct_cxi_iface_tgt_flush_deferred(). Every target command
- * (struct c_target_cmd, struct c_set_state_cmd) is exactly 64 bytes.
- */
-typedef struct uct_cxi_tgt_deferred {
-    ucs_queue_elem_t    queue;
-    struct c_target_cmd cmd;
-} uct_cxi_tgt_deferred_t;
-
-
-/**
  * CXI interface instance.
  *
  * Hardware resources are grouped into sub-structs by function.  Resources
@@ -327,14 +320,6 @@ typedef struct uct_cxi_iface {
     /* ── Shared target-side hardware ────────────────────────────────── */
     struct {
         struct cxi_cq   *cmdq;             /**< Target command queue for LE management */
-        /* Target commands (LE appends/unlinks, SEARCH_AND_DELETE, SETSTATE)
-         * the cmdq had no room for. Submitted in FIFO order from progress;
-         * while non-empty every new command queues behind it, so a command
-         * can never overtake an older one (e.g. an APPEND reusing a
-         * buffer_id before the older UNLINK of that buffer_id has gone
-         * out). See uct_cxi_iface_tgt_post(). */
-        ucs_queue_head_t deferred_q;
-        ucs_mpool_t      deferred_pool;    /**< uct_cxi_tgt_deferred_t */
     } tgt;
 
     /* ── Event queues; event_type dispatches to the handler ─────────────
@@ -604,16 +589,14 @@ BEGIN_C_DECLS
  * Submit a 64-byte target command (struct c_target_cmd or struct
  * c_set_state_cmd) on the target command queue.
  *
- * Returns UCS_OK if the command was placed on the queue, UCS_INPROGRESS if
- * the queue was full (or older commands were already waiting) and the
- * command was deferred to uct_cxi_iface_tgt_flush_deferred(), or an error if
- * it could neither be submitted nor deferred. Callers that must not lose the
- * command treat UCS_INPROGRESS as success.
+ * A full queue is transient -- it only means the NIC has not consumed what
+ * was already rung -- so this retries in place until there is room, for at
+ * most UCT_CXI_TGT_CMDQ_TIMEOUT. Callers (event handlers that cannot hand a
+ * failure back to anyone) can therefore treat UCS_OK as "the NIC has it".
+ * Returns UCS_ERR_TIMED_OUT if the queue stays full for the whole timeout
+ * (a wedged NIC), or UCS_ERR_IO_ERROR on any other emit failure.
  */
 ucs_status_t uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd);
-
-/** Submit deferred target commands, oldest first, until the queue is full. */
-void uct_cxi_iface_tgt_flush_deferred(uct_cxi_iface_t *iface);
 
 END_C_DECLS
 ucs_status_t uct_cxi_iface_flush(uct_iface_h tl_iface, unsigned flags,

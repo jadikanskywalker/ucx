@@ -330,92 +330,48 @@ err_destroy_pte:
     return UCS_ERR_IO_ERROR;
 }
 
-/* Plain host memory: deferred commands are copied into the hardware ring
- * on submission and never DMA'd from. */
-static ucs_mpool_ops_t uct_cxi_tgt_deferred_mpool_ops = {
-    .chunk_alloc   = ucs_mpool_chunk_malloc,
-    .chunk_release = ucs_mpool_chunk_free,
-    .obj_init      = NULL,
-    .obj_cleanup   = NULL,
-    .obj_str       = NULL
-};
-
 /*
- * uct_cxi_iface_tgt_post -- submit one target command, never losing it to a
- * full command queue.
+ * uct_cxi_iface_tgt_post -- submit one target command, waiting for room.
  *
  * cxi_cq_emit_target() fails synchronously with -ENOSPC when the ring has no
- * room, which is transient: the NIC keeps consuming it. Rather than have each
- * caller drop its work (a lost SEARCH_AND_DELETE drops an unexpected
- * message; a lost LE repost permanently shrinks a receive ring), full-queue
- * commands wait in tgt.deferred_q and are submitted by
- * uct_cxi_iface_tgt_flush_deferred() from progress.
- *
- * Order is preserved: while anything is deferred, new commands queue behind
- * it instead of trying the ring, so a later command can never overtake an
- * earlier one (e.g. an APPEND reusing a buffer_id before the older UNLINK of
- * that buffer_id has gone out, which would unlink the new LE).
+ * room. That is transient: every command is rung as soon as it is emitted, so
+ * a full ring just means the NIC has not consumed it yet, and it does not
+ * depend on anything we would do while waiting (a full event queue makes the
+ * NIC drop events, it does not stall the command queue). Callers cannot
+ * recover from a lost command -- a dropped SEARCH_AND_DELETE loses an
+ * unexpected message, a dropped LE repost permanently shrinks a receive
+ * ring, a dropped UNLINK leaves a cancelled receive's LE posted -- so wait,
+ * with a timeout so a wedged NIC surfaces as an error instead of a hang.
+ * Single-threaded progress means nothing can interleave with the wait, so
+ * command order is preserved.
  */
 ucs_status_t uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd)
 {
-    uct_cxi_tgt_deferred_t *d;
-    int                     ret;
+    ucs_time_t deadline = 0;
+    int        ret;
 
-    /* uct_cxi_tgt_deferred_t::cmd stores any target command. */
-    UCS_STATIC_ASSERT(sizeof(struct c_set_state_cmd) ==
-                      sizeof(struct c_target_cmd));
-
-    if (ucs_queue_is_empty(&iface->tgt.deferred_q)) {
+    for (;;) {
         ret = cxi_cq_emit_target(iface->tgt.cmdq, cmd);
         if (ucs_likely(ret == 0)) {
             cxi_cq_ring(iface->tgt.cmdq);
             return UCS_OK;
         }
+
         if (ret != -ENOSPC) {
             ucs_error("cxi target command emit failed: %s", strerror(-ret));
             return UCS_ERR_IO_ERROR;
         }
-    }
 
-    d = ucs_mpool_get(&iface->tgt.deferred_pool);
-    if (d == NULL) {
-        return UCS_ERR_NO_MEMORY;
-    }
-
-    memcpy(&d->cmd, cmd, sizeof(d->cmd));
-    ucs_queue_push(&iface->tgt.deferred_q, &d->queue);
-    ucs_debug("cxi target cmdq full: deferred opcode %u",
-              (unsigned)d->cmd.command.opcode);
-    return UCS_INPROGRESS;
-}
-
-void uct_cxi_iface_tgt_flush_deferred(uct_cxi_iface_t *iface)
-{
-    uct_cxi_tgt_deferred_t *d;
-    int                     submitted = 0;
-    int                     ret;
-
-    while (!ucs_queue_is_empty(&iface->tgt.deferred_q)) {
-        d   = ucs_queue_head_elem_non_empty(&iface->tgt.deferred_q,
-                                            uct_cxi_tgt_deferred_t, queue);
-        ret = cxi_cq_emit_target(iface->tgt.cmdq, &d->cmd);
-        if (ret == -ENOSPC) {
-            break; /* still full: try again from the next progress call */
+        if (deadline == 0) {
+            deadline = ucs_get_time() +
+                       ucs_time_from_sec(UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
+        } else if (ucs_get_time() > deadline) {
+            ucs_error("cxi target command queue stayed full for %.1f s",
+                      UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
+            return UCS_ERR_TIMED_OUT;
         }
-        if (ret != 0) {
-            /* Not transient: retrying would wedge the queue behind it. */
-            ucs_error("cxi deferred target command (opcode %u) emit failed: "
-                      "%s -- dropping it", (unsigned)d->cmd.command.opcode,
-                      strerror(-ret));
-        } else {
-            submitted = 1;
-        }
-        ucs_queue_pull_non_empty(&iface->tgt.deferred_q);
-        ucs_mpool_put(d);
-    }
 
-    if (submitted) {
-        cxi_cq_ring(iface->tgt.cmdq);
+        ucs_compiler_fence();
     }
 }
 
@@ -995,29 +951,13 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err_destroy_tx_cmdq;
     }
 
-    /* Step 8.5: queue for target commands the command queue had no room
-     * for (see uct_cxi_iface_tgt_post). Must exist before the first LE is
-     * posted. Unbounded: entries are small and only exist while the ring
-     * is full. */
-    ucs_queue_head_init(&self->tgt.deferred_q);
-    ucs_mpool_params_reset(&mp_params);
-    mp_params.elem_size       = sizeof(uct_cxi_tgt_deferred_t);
-    mp_params.elems_per_chunk = 64;
-    mp_params.max_elems       = UINT_MAX;
-    mp_params.ops             = &uct_cxi_tgt_deferred_mpool_ops;
-    mp_params.name            = "cxi-tgt-deferred";
-    status = ucs_mpool_init(&mp_params, &self->tgt.deferred_pool);
-    if (status != UCS_OK) {
-        goto err_destroy_tg_cmdq;
-    }
-
     /* Step 9: domain (VNI + PID). */
     ret = cxil_alloc_domain(lni, cxi_md->vni, C_PID_ANY, &self->domain);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_domain vni %u failed: %s",
                   (unsigned)cxi_md->vni, strerror(-ret));
         status = UCS_ERR_IO_ERROR;
-        goto err_cleanup_tgt_deferred;
+        goto err_destroy_tg_cmdq;
     }
 
     /*
@@ -1254,8 +1194,6 @@ err_rma_ptes:
     }
 err_destroy_domain:
     cxil_destroy_domain(self->domain);
-err_cleanup_tgt_deferred:
-    ucs_mpool_cleanup(&self->tgt.deferred_pool, 1);
 err_destroy_tg_cmdq:
     cxil_destroy_cmdq(self->tgt.cmdq);
 err_destroy_tx_cmdq:
@@ -1335,13 +1273,6 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     if (ret != 0) {
         ucs_warn("cxi cxil_destroy_domain failed: %s", strerror(-ret));
     }
-
-    if (!ucs_queue_is_empty(&self->tgt.deferred_q)) {
-        ucs_warn("cxi iface closing with %zu target command(s) still "
-                 "deferred -- dropping them",
-                 ucs_queue_length(&self->tgt.deferred_q));
-    }
-    ucs_mpool_cleanup(&self->tgt.deferred_pool, 1);
 
     ret = cxil_destroy_cmdq(self->tgt.cmdq);
     if (ret != 0) {
@@ -2127,12 +2058,6 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxi_iface_t *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
     unsigned         n;
-
-    /* Anything the target command queue had no room for goes out first, so
-     * the events polled below are not stuck behind work we owe the NIC. */
-    if (ucs_unlikely(!ucs_queue_is_empty(&iface->tgt.deferred_q))) {
-        uct_cxi_iface_tgt_flush_deferred(iface);
-    }
 
     /* Each queue gets its own EQ_MAX_POLL budget, so neither a receive flood
      * nor a burst of completions can starve the other. */

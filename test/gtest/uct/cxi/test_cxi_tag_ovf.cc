@@ -682,26 +682,26 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
 
 
 /**
- * Target commands the command queue has no room for are deferred and
- * submitted oldest-first, never lost and never reordered.
+ * A full target command queue is waited out, not treated as a failure.
  *
- * The NIC drains the ring far too fast to fill it reliably from a test, so
- * "the ring was full when A was posted" is simulated by seeding the deferral
- * queue directly. A SEARCH_AND_DELETE for a tag nobody sent is used as the
- * probe: it has no side effect and produces exactly one C_EVENT_SEARCH
- * (rc NO_MATCH) carrying its buffer_id, which is read from the raw queue
- * (no uct_iface_progress(), so no dispatch interferes).
+ * More commands are posted back-to-back than the ring holds, so
+ * uct_cxi_iface_tgt_post() must at some point find it full and retry until
+ * the NIC has consumed enough. A SEARCH_AND_DELETE for a tag nobody sent is
+ * used as the probe: it has no side effect and produces exactly one
+ * C_EVENT_SEARCH (rc NO_MATCH) carrying its buffer_id. Every post must
+ * succeed, and the results, read from the raw queue (no uct_iface_progress(),
+ * so no dispatch interferes), must come back complete and in post order.
  */
-UCS_TEST_P(test_cxi_tag_ovf, deferred_target_cmds_issue_in_order)
+UCS_TEST_P(test_cxi_tag_ovf, tgt_post_waits_for_full_cmdq)
 {
-    static const uct_tag_t TAG = 0xFEED000000000001ULL;
-    const uint16_t         ID_A = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE;
-    const uint16_t         ID_B = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + 1;
-    const uint16_t         ID_C = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + 2;
+    static const uct_tag_t TAG   = 0xFEED000000000001ULL;
+    /* Larger than the ring (UCT_CXI_CMDQ_DEPTH) so it must fill at least
+     * once, small enough that the results fit in the RX queue unread. */
+    static const unsigned  COUNT = 3 * UCT_CXI_CMDQ_DEPTH / 2;
 
     uct_cxi_iface_t *riface = cxi_iface(receiver());
 
-    auto make_sd = [&](uint16_t buffer_id) {
+    for (unsigned i = 0; i < COUNT; i++) {
         struct c_target_cmd sd = {};
         sd.command.opcode = C_CMD_TGT_SEARCH_AND_DELETE;
         sd.ptl_list       = C_PTL_LIST_UNEXPECTED;
@@ -711,56 +711,30 @@ UCS_TEST_P(test_cxi_tag_ovf, deferred_target_cmds_issue_in_order)
         sd.match_id       = CXI_MATCH_ID_ANY;
         sd.length         = -1U;
         sd.use_once       = 1;
-        sd.buffer_id      = buffer_id;
-        return sd;
-    };
-
-    /* Collect the buffer_ids of the next n SEARCH results, in order. */
-    auto read_searches = [&](size_t n) {
-        std::vector<uint16_t> ids;
-        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(2.0);
-        while ((ids.size() < n) && (ucs_get_time() < deadline)) {
-            const union c_event *ev;
-            while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
-                if ((ev->hdr.event_type == C_EVENT_SEARCH) &&
-                    (ev->tgt_long.ptlte_index == riface->tag.pte->ptn)) {
-                    EXPECT_EQ(C_RC_NO_MATCH, cxi_event_rc(ev));
-                    ids.push_back(ev->tgt_long.buffer_id);
-                }
-            }
-            cxi_eq_ack_events(riface->rx_eq.evtq);
-        }
-        return ids;
-    };
-
-    ASSERT_TRUE(ucs_queue_is_empty(&riface->tgt.deferred_q));
-
-    /* Empty deferral queue and room in the ring: submitted directly. */
-    struct c_target_cmd sd_c = make_sd(ID_C);
-    EXPECT_EQ(UCS_OK, uct_cxi_iface_tgt_post(riface, &sd_c));
-    EXPECT_TRUE(ucs_queue_is_empty(&riface->tgt.deferred_q));
-    EXPECT_EQ(std::vector<uint16_t>({ID_C}), read_searches(1));
-
-    /* Seed A as "deferred when the ring was full". */
-    {
-        uct_cxi_tgt_deferred_t *d =
-                (uct_cxi_tgt_deferred_t *)ucs_mpool_get(&riface->tgt.deferred_pool);
-        ASSERT_NE(nullptr, d);
-        d->cmd = make_sd(ID_A);
-        ucs_queue_push(&riface->tgt.deferred_q, &d->queue);
+        sd.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + i;
+        ASSERT_EQ(UCS_OK, uct_cxi_iface_tgt_post(riface, &sd))
+                << "post " << i << " of " << COUNT;
     }
 
-    /* B must queue behind A even though the ring has plenty of room now. */
-    struct c_target_cmd sd_b = make_sd(ID_B);
-    EXPECT_EQ(UCS_INPROGRESS, uct_cxi_iface_tgt_post(riface, &sd_b));
-    EXPECT_EQ(2u, ucs_queue_length(&riface->tgt.deferred_q));
-    EXPECT_TRUE(read_searches(1).empty())
-            << "a deferred command must not have been submitted early";
+    std::vector<uint16_t> ids;
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+    while ((ids.size() < COUNT) && (ucs_get_time() < deadline)) {
+        const union c_event *ev;
+        while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
+            if ((ev->hdr.event_type == C_EVENT_SEARCH) &&
+                (ev->tgt_long.ptlte_index == riface->tag.pte->ptn)) {
+                EXPECT_EQ(C_RC_NO_MATCH, cxi_event_rc(ev));
+                ids.push_back(ev->tgt_long.buffer_id);
+            }
+        }
+        cxi_eq_ack_events(riface->rx_eq.evtq);
+    }
 
-    uct_cxi_iface_tgt_flush_deferred(riface);
-    EXPECT_TRUE(ucs_queue_is_empty(&riface->tgt.deferred_q));
-    EXPECT_EQ(std::vector<uint16_t>({ID_A, ID_B}), read_searches(2))
-            << "deferred commands must be submitted oldest-first";
+    ASSERT_EQ(COUNT, ids.size());
+    for (unsigned i = 0; i < COUNT; i++) {
+        ASSERT_EQ(UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + i, ids[i])
+                << "commands must reach the NIC in post order";
+    }
 }
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_ovf, cxi)

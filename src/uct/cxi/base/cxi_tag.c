@@ -1133,13 +1133,10 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                     UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) +
                                    buf_idx);
 
-    /* A full target command queue defers the SEARCH_AND_DELETE rather than
-     * failing it (see uct_cxi_iface_tgt_post); this arrival's overflow
-     * reference stays held until the deferred command's own confirmation
-     * releases it, so the payload cannot be reposted over in the meantime.
-     * There is no safe way to confirm exclusive ownership without the
-     * command eventually landing, so only if it cannot even be queued
-     * (allocation failure) is the message dropped rather than handed off
+    /* uct_cxi_iface_tgt_post() waits out a full target command queue. There
+     * is no safe way to confirm exclusive ownership of this message without
+     * the SEARCH_AND_DELETE landing, so only if the queue stays wedged for
+     * the whole timeout is the message dropped rather than handed off
      * racily. */
     status = uct_cxi_iface_tgt_post(iface, &sd);
     if (ucs_unlikely(UCS_STATUS_IS_ERR(status))) {
@@ -2292,14 +2289,6 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
         return UCS_ERR_EXCEEDS_LIMIT;
     }
 
-    /* Commands the command queue had no room for are still waiting: this
-     * APPEND must not overtake them (an older UNLINK of the same
-     * buffer_id would then unlink this new LE). Let UCP retry instead of
-     * queueing, which also pushes back on a producer outrunning the NIC. */
-    if (ucs_unlikely(!ucs_queue_is_empty(&iface->tgt.deferred_q))) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-
     memh = (uct_cxi_mem_handle_t *)iov[0].memh;
     slot = iface->tag.free_list[--iface->tag.free_count];
 
@@ -2366,7 +2355,6 @@ ucs_status_t uct_cxi_iface_tag_recv_cancel(uct_iface_h tl_iface,
     uct_cxi_iface_t        *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
     uct_cxi_tag_ctx_priv_t *priv  = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
     struct c_target_cmd     cmd   = {};
-    ucs_status_t            status;
 
     if (force) {
         /* priv is read here for the last time -- synchronously, while
@@ -2390,9 +2378,6 @@ ucs_status_t uct_cxi_iface_tag_recv_cancel(uct_iface_h tl_iface,
 
     /* The UNLINK must not be lost to a full command queue: for force=1 the
      * cancel is already "assumed successful" by UCP, which will not retry
-     * it. A deferred UNLINK still goes out before any later APPEND, since
-     * uct_cxi_iface_tgt_post() keeps order and tag_recv_zcopy() refuses new
-     * receives while anything is deferred. */
-    status = uct_cxi_iface_tgt_post(iface, &cmd);
-    return UCS_STATUS_IS_ERR(status) ? status : UCS_OK;
+     * it. */
+    return uct_cxi_iface_tgt_post(iface, &cmd);
 }
