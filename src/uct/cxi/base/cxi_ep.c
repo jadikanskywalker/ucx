@@ -141,6 +141,9 @@ void uct_cxi_ep_destroy(uct_ep_h tl_ep)
  * op_pool, and desc_pool are all iface-global.  So if one EP's pending
  * callback hits NO_RESOURCE, no other EP can progress this round either;
  * STOP halts the whole dispatch instead of RC's four-way EP-vs-iface split.
+ * An EP's own adaptive backoff (retry_backoff_until) is the opposite case:
+ * it says nothing about the shared resources, so it only skips that EP's
+ * group (NEXT_GROUP) rather than halting everyone else's queued sends.
  */
 ucs_arbiter_cb_result_t
 uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
@@ -158,7 +161,7 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
          * anything observable before its own gate check — pacing
          * already-queued retries the same as new submissions is the
          * whole point of retry_backoff_until (see cxi_ep.h). */
-        return UCS_ARBITER_CB_RESULT_STOP;
+        return UCS_ARBITER_CB_RESULT_NEXT_GROUP;
     }
 
     status = req->func(req);

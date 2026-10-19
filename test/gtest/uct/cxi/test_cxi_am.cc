@@ -26,7 +26,11 @@
 #include <uct/cxi/base/cxi_iface.h>
 #include <uct/cxi/base/cxi_md.h>
 
+#include <cassini_user_defs.h>
+#include <cxi_prov_hw.h>
+
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 
 
@@ -481,5 +485,59 @@ UCS_TEST_P(test_cxi_am, am_zcopy_noncontiguous_header)
     dereg(sender(), memh);
 }
 
+
+/**
+ * Event routing across the TX and RX event queues.
+ *
+ * An am_bcopy produces an ACK for the sender's command (TX queue) and a PUT
+ * on the receiver's AM portal (RX queue). Both ifaces are drained through
+ * the raw queues, without uct_iface_progress() -- which polls both queues
+ * and would hide a misrouted event -- to check that each event lands on the
+ * queue it belongs to and none on the other.
+ */
+UCS_TEST_P(test_cxi_am, eq_split_routing)
+{
+    static const uint8_t AM_ID = 6;
+    static const size_t  LEN   = 64;
+
+    uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
+    uct_cxi_iface_t *riface = ucs_derived_of(receiver().iface(), uct_cxi_iface_t);
+
+    ASSERT_NE(siface->tx_eq.evtq->eqn, siface->rx_eq.evtq->eqn)
+            << "TX and RX must be distinct hardware queues";
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    auto pack = [](void *dst, void *) -> size_t {
+        memset(dst, 0x77, LEN);
+        return LEN;
+    };
+    ASSERT_EQ(static_cast<ssize_t>(LEN),
+              uct_ep_am_bcopy(ep, AM_ID, +pack, NULL, 0));
+
+    /* The message must show up as a PUT on the receiver's RX queue. */
+    bool        got_put  = false;
+    ucs_time_t  deadline = ucs_get_time() + ucs_time_from_sec(2.0);
+    while (!got_put && (ucs_get_time() < deadline)) {
+        const union c_event *ev;
+        while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
+            got_put |= (ev->hdr.event_type == C_EVENT_PUT);
+        }
+        cxi_eq_ack_events(riface->rx_eq.evtq);
+    }
+    EXPECT_TRUE(got_put) << "AM PUT never arrived on the receiver's RX queue";
+    EXPECT_EQ(NULL, cxi_eq_get_event(riface->tx_eq.evtq))
+            << "the receiver issued nothing, its TX queue must stay empty";
+
+    /* The ACK must be on the sender's TX queue, never its RX queue. The PUT
+     * having landed means the ACK is in flight; give it time to arrive. */
+    usleep(100000);
+    EXPECT_EQ(NULL, cxi_eq_get_event(siface->rx_eq.evtq))
+            << "an initiator completion landed on the RX queue";
+
+    /* The normal path must still complete the op from the TX queue. */
+    flush_ep(sender(), ep);
+}
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_am, cxi)

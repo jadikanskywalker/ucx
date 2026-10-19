@@ -91,7 +91,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     UCT_CHECK_LENGTH(length, 0,
                      C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t), "am_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -232,7 +232,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     size_t               length;
     int                  ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->am.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -256,7 +256,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable = 0;
         cmd.restricted           = 0;
-        cmd.eq                   = iface->eq.evtq->eqn;
+        cmd.eq                   = iface->tx_eq.evtq->eqn;
         cmd.dfa                  = ep->dfa_am;
         cmd.match_bits           = (uint64_t)id;
         cmd.remote_offset        = 0;  /* NIC places at its managed write pointer */
@@ -332,7 +332,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
                      iface->am.buf_size - sizeof(uint64_t),
                      "am_zcopy total");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -356,7 +356,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.event_send_disable    = 1;
         cmd.event_success_disable = 0;
         cmd.restricted            = 0;
-        cmd.eq                    = iface->eq.evtq->eqn;
+        cmd.eq                    = iface->tx_eq.evtq->eqn;
         cmd.dfa                   = ep->dfa_am;
         cmd.remote_offset         = 0;
         cmd.user_ptr              = (uint64_t)(uintptr_t)op;

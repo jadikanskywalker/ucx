@@ -218,4 +218,29 @@ UCS_TEST_P(test_cxi_iface, is_reachable_v2)
 }
 
 
+/**
+ * The iface owns two distinct event queues: a TX queue for initiator
+ * completions, sized from the TX pool caps and never grown or partly
+ * reserved, and an RX queue for everything the NIC reports for our PTEs.
+ */
+UCS_TEST_P(test_cxi_iface, eq_split_layout)
+{
+    uct_cxi_iface_t *iface = ucs_derived_of(get_entity().iface(),
+                                            uct_cxi_iface_t);
+
+    ASSERT_NE(nullptr, iface->rx_eq.evtq);
+    ASSERT_NE(nullptr, iface->tx_eq.evtq);
+    EXPECT_NE(iface->rx_eq.evtq->eqn, iface->tx_eq.evtq->eqn);
+
+    EXPECT_GT(iface->rx_eq.num_events, 0u);
+
+    /* Both pools (default cap 512 each) must fit at once, plus headroom. */
+    EXPECT_GE(iface->tx_eq.num_events, 2 * 512u + UCT_CXI_TX_EQ_HEADROOM);
+
+    EXPECT_FALSE(iface->tx_eq.grow.enabled) << "the TX queue never grows";
+    EXPECT_EQ(0u, iface->tx_eq.reserved_slots)
+            << "no incoming traffic targets the TX queue";
+}
+
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_iface, cxi)

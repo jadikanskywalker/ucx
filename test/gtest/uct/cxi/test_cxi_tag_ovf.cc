@@ -349,7 +349,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(2.0);
         while ((events.size() < 2) && (ucs_get_time() < deadline)) {
             const union c_event *ev;
-            while ((ev = cxi_eq_get_event(riface->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
                 if (ev->tgt_long.ptlte_index != riface->tag.pte->ptn) {
                     continue; /* not this PTE -- ignore for this capture */
                 }
@@ -365,7 +365,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
                 c.start       = ev->tgt_long.start;
                 events.push_back(c);
             }
-            cxi_eq_ack_events(riface->eq.evtq);
+            cxi_eq_ack_events(riface->rx_eq.evtq);
         }
     }
 
@@ -469,7 +469,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(1.0);
         while (ucs_get_time() < deadline) {
             const union c_event *ev;
-            while ((ev = cxi_eq_get_event(riface->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
                 if (ev->tgt_long.ptlte_index != riface->tag.pte->ptn) {
                     continue;
                 }
@@ -485,7 +485,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
                 c.start      = ev->tgt_long.start;
                 sd_events.push_back(c);
             }
-            cxi_eq_ack_events(riface->eq.evtq);
+            cxi_eq_ack_events(riface->rx_eq.evtq);
         }
     }
 
@@ -589,7 +589,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         bool       seen     = false;
         while (!seen && (ucs_get_time() < deadline)) {
             const union c_event *ev;
-            while ((ev = cxi_eq_get_event(riface->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
                 if ((ev->tgt_long.ptlte_index == riface->tag.pte->ptn) &&
                     (ev->hdr.event_type == C_EVENT_PUT) &&
                     (ev->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) &&
@@ -597,7 +597,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
                     seen = true;
                 }
             }
-            cxi_eq_ack_events(riface->eq.evtq);
+            cxi_eq_ack_events(riface->rx_eq.evtq);
         }
         ASSERT_TRUE(seen) << "TAG2's own raw overflow-arrival event never "
                              "seen within 1 s";
@@ -623,7 +623,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(1.0);
         while (ucs_get_time() < deadline) {
             const union c_event *ev;
-            while ((ev = cxi_eq_get_event(riface->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
                 if (ev->tgt_long.ptlte_index != riface->tag.pte->ptn) {
                     continue;
                 }
@@ -639,7 +639,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
                 c.start      = ev->tgt_long.start;
                 sd_events2.push_back(c);
             }
-            cxi_eq_ack_events(riface->eq.evtq);
+            cxi_eq_ack_events(riface->rx_eq.evtq);
         }
     }
 

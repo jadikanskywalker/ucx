@@ -84,7 +84,7 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -101,7 +101,7 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->eq.evtq->eqn;
+        cstate.eq                  = iface->tx_eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)op;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
@@ -169,7 +169,7 @@ uct_cxi_ep_atomic_fetch_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
     uct_cxi_send_desc_t  *desc;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -190,7 +190,7 @@ uct_cxi_ep_atomic_fetch_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.restricted          = 1;
         cstate.write_lac           = desc->lac;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->eq.evtq->eqn;
+        cstate.eq                  = iface->tx_eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)desc;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
@@ -267,7 +267,7 @@ uct_cxi_ep_atomic_cswap_common(uct_ep_h tl_ep, uint64_t compare,
     uct_cxi_send_desc_t  *desc;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -288,7 +288,7 @@ uct_cxi_ep_atomic_cswap_common(uct_ep_h tl_ep, uint64_t compare,
         cstate.restricted          = 1;
         cstate.write_lac           = desc->lac;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->eq.evtq->eqn;
+        cstate.eq                  = iface->tx_eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)desc;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);

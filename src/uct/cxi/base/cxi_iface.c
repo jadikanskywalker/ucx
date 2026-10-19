@@ -62,13 +62,13 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
                                   "\nDefault bufs_grow matches TX command queue depth "
                                   "so one chunk can saturate the cmdq without regrowth.\n"
                                   "MAX_BUFS default (512) is bounded so pool exhaustion\n"
-                                  "reliably triggers UCS_ERR_NO_RESOURCE / pending-retry\n"
-                                  "before outstanding ops can exceed a hardware EQ_SIZE.\n"
-                                  "-1 means \"size this pool to EQ_SIZE\".  Workloads \n"
-                                  "with many concurrently-busy endpoints on one interface\n"
-                                  "should raise this together with TX_OP_MAX_BUFS and\n"
-                                  "EQ_SIZE — per-endpoint size for expected in-flight\n"
-                                  "operation count."),
+                                  "reliably triggers UCS_ERR_NO_RESOURCE / pending-retry.\n"
+                                  "The TX event queue is sized from this cap (see\n"
+                                  "TX_EQ_SIZE), so it cannot overflow. -1 means 512.\n"
+                                  "Workloads with many concurrently-busy endpoints on one\n"
+                                  "interface should raise this together with\n"
+                                  "TX_OP_MAX_BUFS — per-endpoint size for expected\n"
+                                  "in-flight operation count."),
 
     UCT_IFACE_MPOOL_CONFIG_FIELDS("TX_OP_", 512, 256, 16mb, 2.0,
                                   "send-op tracking",
@@ -76,24 +76,32 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
                                   "\nUsed by put/get/AM short and zcopy, and AMO post/fetch,\n"
                                   "for completion tracking (no DMA-registered memory).\n"
                                   "MAX_BUFS default (512) is bounded for the same reason as\n"
-                                  "BCOPY_MAX_BUFS above; -1 means \"size to EQ_SIZE\".\n"
-                                  "Raise together with BCOPY_MAX_BUFS and EQ_SIZE\n"
-                                  "for workloads with many concurrently-busy endpoints."),
+                                  "BCOPY_MAX_BUFS above; -1 means 512.\n"
+                                  "Raise together with BCOPY_MAX_BUFS for workloads\n"
+                                  "with many concurrently-busy endpoints."),
 
     {"EQ_SIZE", "-1",
-     "Event queue depth (number of hardware completion events). -1 (default)\n"
-     "resolves to 1024. TX_OP_MAX_BUFS/BCOPY_MAX_BUFS each independently\n"
-     "default (their own -1 sentinel) to half of whatever this resolves to,\n"
-     "so the common case of neither being set still sums to exactly this\n"
-     "value; an explicitly-set pool cap is used exactly as given, even if\n"
-     "that sums past this value — a reachable raw EQ drop from TX-side\n"
-     "crowding is then a consequence of that explicit combination, not\n"
-     "something silently protected against.",
+     "RX event queue depth (number of hardware events): everything the NIC\n"
+     "reports for this iface's own portal table entries, i.e. incoming\n"
+     "traffic and PTE state changes. -1 (default) resolves to 1024. Rounded\n"
+     "up to a whole number of pages (64 events). Initiator-side completions\n"
+     "use a separate queue, see TX_EQ_SIZE.",
      ucs_offsetof(uct_cxi_iface_config_t, eq_size),
      UCS_CONFIG_TYPE_INT},
 
+    {"TX_EQ_SIZE", "-1",
+     "TX event queue depth: completions (ACK/REPLY) of commands this iface\n"
+     "issued. -1 (default) sizes it from the TX pool caps\n"
+     "(TX_OP_MAX_BUFS + BCOPY_MAX_BUFS, plus the rendezvous and software-Get\n"
+     "tracking limits), which makes overflow impossible because every\n"
+     "in-flight command holds a pool slot. An explicit value below that\n"
+     "minimum is used as given but logged: a dropped completion is not\n"
+     "recoverable.",
+     ucs_offsetof(uct_cxi_iface_config_t, tx_eq_size),
+     UCS_CONFIG_TYPE_INT},
+
     {"EQ_MAX_POLL", "16",
-     "Max events drained from the EQ per iface_progress() call, matching\n"
+     "Max events drained from each EQ (RX and TX) per iface_progress() call, matching\n"
      "the bounded-poll-per-call pattern every other UCX transport uses\n"
      "(e.g. RC/UD/DC's TX/RX_MAX_POLL, TCP's UCT_TCP_MAX_EVENTS) instead of\n"
      "draining to empty. Without this bound, a steady incoming flood could\n"
@@ -104,13 +112,13 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      UCS_CONFIG_TYPE_UINT},
 
     {"EQ_RESERVED_SLOTS_PCT", "5",
-     "Percentage of the EQ reserved so incoming (RX) traffic cannot crowd\n"
-     "out this iface's own TX completions. One-sided: TX completions may\n"
-     "still use the full EQ, this only blocks LPE/RX events from the\n"
-     "reserved portion. A floor, not an exclusive TX partition — safe to\n"
-     "default small since PTE flow control (below) is what actually\n"
-     "prevents data loss regardless of this setting; raise it for\n"
-     "workloads known to be TX-heavy.",
+     "Percentage of the RX EQ reserved so incoming messages cannot crowd\n"
+     "out the events that are not themselves incoming traffic: PTE state\n"
+     "changes and the results of this iface's own target commands. One-\n"
+     "sided: those events may use the full EQ, this only blocks incoming-\n"
+     "message events from the reserved portion. A floor, safe to default\n"
+     "small since PTE flow control is what actually prevents data loss\n"
+     "regardless of this setting.",
      ucs_offsetof(uct_cxi_iface_config_t, eq_reserved_slots_pct),
      UCS_CONFIG_TYPE_UINT},
 
@@ -136,7 +144,7 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      UCS_CONFIG_TYPE_TIME},
 
     {"EQ_DYNAMIC_GROWTH", "y",
-     "Preemptively grow (double) the EQ when its fill level crosses\n"
+     "Preemptively grow (double) the RX EQ when its fill level crosses\n"
      "EQ_GROW_THRESH_PCT, using Cassini's native resize API, instead of\n"
      "waiting to hit EQ_FULL and recovering reactively (see EQ_DRAIN_PCT).\n"
      "Growth stops at EQ_MAX_LEN; sustained pressure past that point falls\n"
@@ -243,7 +251,7 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         struct cxi_pt_alloc_opts pt_opts = {
             .en_flowctrl = 1
         };
-        ret = cxil_alloc_pte(lni, self->eq.evtq, &pt_opts, &self->rma.pte[lac]);
+        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->rma.pte[lac]);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte lac %u: %s", lac, strerror(-ret));
@@ -274,14 +282,14 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         cxi_cq_ring(self->tgt.cmdq);
 
         while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
                 if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
                     ev->tgt_long.initiator.state_change.ptlte_state
                             == C_PTLTE_ENABLED) {
                     enabled = true;
                 }
             }
-            cxi_eq_ack_events(self->eq.evtq);
+            cxi_eq_ack_events(self->rx_eq.evtq);
         }
     }
 
@@ -399,7 +407,7 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
             .use_long_event = 1,   /* force 64-byte events with rlength/start */
             .en_flowctrl    = 1
         };
-        ret = cxil_alloc_pte(lni, self->eq.evtq, &pt_opts, &self->am.pte);
+        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->am.pte);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte AM: %s", strerror(-ret));
@@ -430,14 +438,14 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
         cxi_cq_ring(self->tgt.cmdq);
 
         while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
                 if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
                     ev->tgt_long.initiator.state_change.ptlte_state
                             == C_PTLTE_ENABLED) {
                     enabled = true;
                 }
             }
-            cxi_eq_ack_events(self->eq.evtq);
+            cxi_eq_ack_events(self->rx_eq.evtq);
         }
     }
 
@@ -600,6 +608,69 @@ ucs_status_t uct_cxi_query_devices(uct_md_h md,
 }
 
 /*
+ * uct_cxi_eq_configure -- reset \a eq and fill in the resolved config that
+ * uct_cxi_eq_init() and the poll loop consume. \a num_events is rounded up to
+ * whole pages: the driver requires a page-aligned queue length.
+ */
+static void
+uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
+                     unsigned reserved_slots_pct, int grow_enabled,
+                     const uct_cxi_iface_config_t *config)
+{
+    memset(eq, 0, sizeof(*eq));
+    eq->name               = name;
+    eq->num_events         = ucs_align_up(num_events, ucs_get_page_size() /
+                                                      UCT_CXI_EQ_ENTRY_SIZE);
+    eq->max_poll           = ucs_max(config->eq_max_poll, 1u);
+    eq->drain_pct          = config->eq_drain_pct;
+    eq->reserved_slots_pct = reserved_slots_pct;
+
+    /* Preemptive EQ growth config — see cxi_iface.h / eq_grow_start(). */
+    eq->grow.enabled        = grow_enabled;
+    eq->grow.thresh_pct     = config->eq_grow_thresh_pct;
+    eq->grow.max_len_events = config->eq_max_len;
+}
+
+/*
+ * uct_cxi_iface_tx_eq_events -- TX event queue depth. Every in-flight
+ * command holds one slot of a bounded pool or tracking table and completes
+ * with exactly one event, so the queue is sized to cover all of them at once
+ * and cannot overflow:
+ *   - send ops and bcopy descriptors (op_pool / desc_pool caps),
+ *   - rendezvous Put ACKs (iface->rdzv.ops, at most
+ *     UCT_CXI_RDZV_MAX_OUTSTANDING_MAX),
+ *   - software-issued rendezvous Get REPLYs (rdzv_get_op_pool, capped at
+ *     tag.max_outstanding),
+ *   - the single synchronous get_short,
+ * plus UCT_CXI_TX_EQ_HEADROOM for command-queue error events.
+ */
+static unsigned
+uct_cxi_iface_tx_eq_events(const uct_cxi_iface_config_t *config,
+                           unsigned op_max_bufs, unsigned desc_max_bufs)
+{
+    uint64_t events = (uint64_t)op_max_bufs + desc_max_bufs +
+                      UCT_CXI_RDZV_MAX_OUTSTANDING_MAX +
+                      ucs_min(config->tag_max_outstanding,
+                              UCT_CXI_TAG_MAX_OUTSTANDING_MAX) +
+                      1 + UCT_CXI_TX_EQ_HEADROOM;
+    uint64_t max    = UINT_MAX / UCT_CXI_EQ_ENTRY_SIZE;
+
+    events = ucs_min(events, max);
+    if (config->tx_eq_size == UINT_MAX) {
+        return (unsigned)events;
+    }
+
+    if (config->tx_eq_size < events) {
+        ucs_warn("cxi TX_EQ_SIZE=%u is below the %u events needed to hold "
+                 "every in-flight command (TX_OP_MAX_BUFS=%u, "
+                 "BCOPY_MAX_BUFS=%u); a dropped completion is not "
+                 "recoverable", config->tx_eq_size, (unsigned)events,
+                 op_max_bufs, desc_max_bufs);
+    }
+    return config->tx_eq_size;
+}
+
+/*
  * uct_cxi_eq_init -- allocate one event queue: mmap its ring buffer, pin it
  * for the NIC and create the hardware queue on top of it. The caller must
  * have filled in eq->num_events, eq->reserved_slots_pct and eq->grow.* (the
@@ -736,59 +807,53 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
                             NULL) UCS_STATS_ARG(UCT_CXI_NAME));
 
     /*
-     * Step 1.5: resolve EQ depth, then TX pool caps from it.
+     * Step 1.5: resolve the TX pool caps, then both event queue depths.
      *
-     * EQ_SIZE uses the same -1/UINT_MAX-sentinel convention as
-     * TX_OP_MAX_BUFS/BCOPY_MAX_BUFS below (config table default "-1") —
-     * unset resolves to UCT_CXI_EQ_NUM_EVENTS, explicitly set uses that
-     * value exactly. This is a real sentinel, not a "differs from the
-     * compiled-in default" guess, so a user explicitly setting EQ_SIZE to
-     * the same value the default would have produced is still correctly
-     * seen as "set" — the config table must keep passing -1 through
-     * un-resolved for this check to mean anything; nothing upstream of
-     * here may substitute in the default early.
+     * Each pool cap's -1/UINT_MAX sentinel (config table default is 512, so
+     * only an explicit -1/inf lands here) resolves to half of the default RX
+     * depth. The TX event queue is then sized from the resolved caps (see
+     * uct_cxi_iface_tx_eq_events()), so TX completions can never overflow it
+     * and pool exhaustion — UCS_ERR_NO_RESOURCE / pending-retry — is the only
+     * TX-side backpressure.
      *
-     * Each pool cap keeps its existing, independent meaning for the same
-     * sentinel ("unbounded — size this pool from the EQ") — unset
-     * resolves to half of eq.num_events each, so that the common case of
-     * neither pool being explicitly set still sums to exactly
-     * eq.num_events (matching each in-flight op holding one pool slot
-     * until its single EQ completion event is drained), rather than each
-     * independently claiming the *full* EQ. An explicitly-set pool cap is
-     * used exactly as given, even if that (combined with an explicit
-     * EQ_SIZE) sums past eq.num_events — a reachable raw EQ drop from
-     * TX-side crowding is then a consequence of that explicit, informed
-     * choice, not something silently protected against.
+     * EQ_SIZE uses the same -1/UINT_MAX-sentinel convention — unset resolves
+     * to UCT_CXI_EQ_NUM_EVENTS, explicitly set uses that value exactly. This
+     * is a real sentinel, not a "differs from the compiled-in default"
+     * guess, so a user explicitly setting EQ_SIZE to the same value the
+     * default would have produced is still correctly seen as "set" — the
+     * config table must keep passing -1 through un-resolved for this check to
+     * mean anything; nothing upstream of here may substitute in the default
+     * early. It sizes the RX queue only.
      */
     {
         unsigned eq_cfg   = config->eq_size;
         unsigned op_cfg   = config->op_mp.max_bufs;
         unsigned desc_cfg = config->bcopy_mp.max_bufs;
 
-        self->eq.num_events = (eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
-                              eq_cfg;
         op_max_bufs   = (op_cfg == UINT_MAX) ?
-                        ucs_max(self->eq.num_events / 2, 1u) : op_cfg;
+                        ucs_max(UCT_CXI_EQ_NUM_EVENTS / 2, 1u) : op_cfg;
         desc_max_bufs = (desc_cfg == UINT_MAX) ?
-                        ucs_max(self->eq.num_events / 2, 1u) : desc_cfg;
+                        ucs_max(UCT_CXI_EQ_NUM_EVENTS / 2, 1u) : desc_cfg;
+
+        /* Only the RX queue is ever grown or has PTEs to recover; the TX
+         * queue is fixed-size and reserves no slots for incoming traffic. */
+        uct_cxi_eq_configure(&self->rx_eq, "rx",
+                             (eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
+                                                    eq_cfg,
+                             config->eq_reserved_slots_pct,
+                             config->dynamic_eq_growth, config);
+        uct_cxi_eq_configure(&self->tx_eq, "tx",
+                             uct_cxi_iface_tx_eq_events(config, op_max_bufs,
+                                                        desc_max_bufs),
+                             0, 0, config);
     }
-    self->eq.max_poll = ucs_max(config->eq_max_poll, 1u);
 
     /* PTE flow-control recovery config, resolved once here (setup time,
      * not the hot path) — see cxi_iface.h / iface_progress(). */
-    self->eq.need_to_drain     = 0;
-    self->eq.drain_pct         = config->eq_drain_pct;
     self->eq_flap_limit        = config->eq_flap_limit;
     self->eq_flap_window       = ucs_time_from_sec(config->eq_flap_window);
-    self->eq.reserved_slots_pct = config->eq_reserved_slots_pct;
     memset(&self->am.fc, 0, sizeof(self->am.fc));
     memset(self->rma.fc, 0, sizeof(self->rma.fc));
-
-    /* Preemptive EQ growth config — see cxi_iface.h / eq_grow_start(). */
-    memset(&self->eq.grow, 0, sizeof(self->eq.grow));
-    self->eq.grow.enabled        = config->dynamic_eq_growth;
-    self->eq.grow.thresh_pct     = config->eq_grow_thresh_pct;
-    self->eq.grow.max_len_events = config->eq_max_len;
 
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
@@ -798,10 +863,15 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         goto err;
     }
 
-    /* Steps 3-5: event queue (ring buffer, pinning, hardware queue). */
-    status = uct_cxi_eq_init(&self->eq, lni, self->wait_obj);
+    /* Steps 3-5: event queues (ring buffer, pinning, hardware queue). */
+    status = uct_cxi_eq_init(&self->rx_eq, lni, self->wait_obj);
     if (status != UCS_OK) {
         goto err_destroy_wait_obj;
+    }
+
+    status = uct_cxi_eq_init(&self->tx_eq, lni, self->wait_obj);
+    if (status != UCS_OK) {
+        goto err_cleanup_rx_eq;
     }
 
     /* Step 6: TX communication profile. */
@@ -811,7 +881,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         ucs_error("cxi cxil_alloc_cp vni %u failed: %s",
                   (unsigned)cxi_md->vni, strerror(-ret));
         status = UCS_ERR_IO_ERROR;
-        goto err_cleanup_eq;
+        goto err_cleanup_tx_eq;
     }
 
     /* Step 7: TX command queue. */
@@ -819,7 +889,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     cq_opts.count = UCT_CXI_CMDQ_DEPTH;
     cq_opts.flags = CXI_CQ_IS_TX;
     cq_opts.lcid  = self->tx.cp->lcid;
-    ret = cxil_alloc_cmdq(lni, self->eq.evtq, &cq_opts, &self->tx.cmdq);
+    ret = cxil_alloc_cmdq(lni, self->tx_eq.evtq, &cq_opts, &self->tx.cmdq);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_cmdq tx failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -829,7 +899,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     /* Step 8: target command queue (LE management). */
     memset(&cq_opts, 0, sizeof(cq_opts));
     cq_opts.count = UCT_CXI_CMDQ_DEPTH;
-    ret = cxil_alloc_cmdq(lni, self->eq.evtq, &cq_opts, &self->tgt.cmdq);
+    ret = cxil_alloc_cmdq(lni, self->rx_eq.evtq, &cq_opts, &self->tgt.cmdq);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_cmdq tg failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -867,7 +937,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * Step 12: send-op pool for zcopy/short completion tracking.
      *
      * max_elems = op_max_bufs (resolved in Step 1.5 from TX_OP_MAX_BUFS,
-     * with -1 meaning "size to eq.num_events") so pool exhaustion returns
+     * with -1 meaning 512) so pool exhaustion returns
      * UCS_ERR_NO_RESOURCE — triggering the pending-retry path — before
      * outstanding ops can exceed the hardware EQ depth.
      */
@@ -1085,8 +1155,10 @@ err_destroy_tx_cmdq:
     cxil_destroy_cmdq(self->tx.cmdq);
 err_destroy_cp:
     cxil_destroy_cp(self->tx.cp);
-err_cleanup_eq:
-    uct_cxi_eq_cleanup(&self->eq);
+err_cleanup_tx_eq:
+    uct_cxi_eq_cleanup(&self->tx_eq);
+err_cleanup_rx_eq:
+    uct_cxi_eq_cleanup(&self->rx_eq);
 err_destroy_wait_obj:
     cxil_destroy_wait_obj(self->wait_obj);
 err:
@@ -1101,7 +1173,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
     uct_base_iface_progress_disable(&self->super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
 
-    uct_cxi_eq_abort_resize(&self->eq);
+    uct_cxi_eq_abort_resize(&self->rx_eq);
+    uct_cxi_eq_abort_resize(&self->tx_eq);
 
     ucs_arbiter_cleanup(&self->tx.arbiter);
 
@@ -1171,7 +1244,8 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
         ucs_warn("cxi cxil_destroy_cp failed: %s", strerror(-ret));
     }
 
-    uct_cxi_eq_cleanup(&self->eq);
+    uct_cxi_eq_cleanup(&self->tx_eq);
+    uct_cxi_eq_cleanup(&self->rx_eq);
 
     ret = cxil_destroy_wait_obj(self->wait_obj);
     if (ret != 0) {
@@ -1294,8 +1368,8 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
  * uct_cxi_iface_pte_recover — issue SETSTATE(ENABLED) for one PTE if it's
  * currently DISABLED, subject to a per-PTE flap limit.
  *
- * Called only once the shared EQ has been drained by eq.need_to_drain (see
- * iface_progress()) — never immediately on a raw drop, since re-enabling
+ * Called only once the RX EQ has been drained by need_to_drain (see
+ * uct_cxi_iface_eq_poll()) — never immediately on a raw drop, since re-enabling
  * into a still-full EQ just re-triggers the same disable on the PTE's next
  * blocked event.  cxil_pte_status() is queried directly rather than relying
  * on having seen a STATE_CHANGE event for this PTE, since that notification
@@ -1769,14 +1843,14 @@ static void uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
             }
         } else if (ptlte_state == C_PTLTE_DISABLED) {
             if (sc_reason == C_SC_FC_EQ_FULL) {
-                /* Fresh disable caused by EQ capacity — iface-wide:
-                 * every PTE and every initiator-side completion
-                 * shares this ring. Defer recovery until the EQ has
-                 * actually drained (see the eq.need_to_drain
-                 * countdown below) rather than retrying inline. */
+                /* Fresh disable caused by EQ capacity — affects every
+                 * PTE bound to this queue (all of them, today: they
+                 * share the RX EQ). Defer recovery until the EQ has
+                 * actually drained (see the eq->need_to_drain
+                 * countdown in uct_cxi_iface_eq_poll()) rather than
+                 * retrying inline. */
                 if (eq->need_to_drain == 0) {
-                    eq->need_to_drain = (eq->num_events *
-                                               eq->drain_pct) / 100;
+                    eq->need_to_drain = (eq->num_events * eq->drain_pct) / 100;
                 }
             } else if ((iface->am.pte != NULL) &&
                        (ptlte_index == iface->am.pte->ptn)) {
@@ -1905,7 +1979,7 @@ static unsigned uct_cxi_iface_eq_poll(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
     }
 
     if (ucs_unlikely(cxi_eq_get_drops(eq->evtq))) {
-        ucs_error("cxi EQ drop detected: events lost (EQ full)");
+        ucs_error("cxi %s EQ drop detected: events lost (EQ full)", eq->name);
         if (eq->need_to_drain == 0) {
             eq->need_to_drain = (eq->num_events * eq->drain_pct) / 100;
         }
@@ -1940,7 +2014,10 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
     uct_cxi_iface_t *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
     unsigned         n;
 
-    n = uct_cxi_iface_eq_poll(iface, &iface->eq);
+    /* Each queue gets its own EQ_MAX_POLL budget, so neither a receive flood
+     * nor a burst of completions can starve the other. */
+    n  = uct_cxi_iface_eq_poll(iface, &iface->rx_eq);
+    n += uct_cxi_iface_eq_poll(iface, &iface->tx_eq);
 
     /* Retry any sends queued via uct_ep_pending_add() now that this round
      * of completions may have freed cmdq/op_pool/desc_pool resources.

@@ -32,6 +32,9 @@
  * hardware constant. */
 #define UCT_CXI_EQ_NUM_EVENTS  1024U
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
+/* Extra TX event queue slots beyond the pool-derived worst case: command
+ * queue error events and rounding slack. */
+#define UCT_CXI_TX_EQ_HEADROOM 64U
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
@@ -120,10 +123,11 @@ typedef struct uct_cxi_iface_config {
     unsigned                 am_rx_num_bufs; /**< # AM receive buffers (PRIORITY MEs) */
     size_t                   am_rx_buf_size; /**< Size of each AM receive buffer     */
     size_t                   am_max_zcopy;  /**< Max AM zcopy payload               */
-    unsigned                 eq_size;    /**< Event queue depth. -1 sentinel
-                                              resolves to UCT_CXI_EQ_NUM_EVENTS;
-                                              pool caps derive from whichever
-                                              this resolves to (see iface_open) */
+    unsigned                 eq_size;    /**< RX event queue depth. -1 sentinel
+                                              resolves to UCT_CXI_EQ_NUM_EVENTS */
+    unsigned                 tx_eq_size; /**< TX event queue depth. -1 sentinel
+                                              sizes it from the TX pool caps
+                                              (see iface_open)                 */
     unsigned                 eq_max_poll; /**< Max events drained per
                                               iface_progress() call            */
     unsigned                 eq_reserved_slots_pct; /**< % of EQ reserved so RX
@@ -136,7 +140,7 @@ typedef struct uct_cxi_iface_config {
                                               up on it                              */
     double                    eq_flap_window; /**< Time window for eq_flap_limit,
                                               seconds (UCS_CONFIG_TYPE_TIME)        */
-    int                       dynamic_eq_growth; /**< Grow the EQ preemptively on a
+    int                       dynamic_eq_growth; /**< Grow the RX EQ preemptively on a
                                               hardware fill-threshold crossing,
                                               instead of waiting to hit it        */
     unsigned                  eq_grow_thresh_pct; /**< Fill % that triggers a resize */
@@ -212,17 +216,18 @@ KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
 
 /**
  * Event queue state: the hardware EQ, its backing buffer, and the sizing,
- * drain-gated PTE recovery, and preemptive-growth state that belong to it
- * (and would have to be duplicated per queue if the iface ever owns more
- * than one -- hence a struct rather than loose uct_cxi_iface_t fields).
+ * drain-gated PTE recovery, and preemptive-growth state that belong to it.
+ * The iface owns two (rx_eq, tx_eq), hence a struct rather than loose
+ * uct_cxi_iface_t fields.
  */
 typedef struct uct_cxi_eq {
-    struct cxi_eq *evtq;           /**< Event queue (shared by all CMDQs & PTEs) */
+    const char    *name;           /**< "rx" / "tx", for log messages */
+    struct cxi_eq *evtq;           /**< The hardware event queue */
     void          *buf;            /**< mmap backing buffer for evtq */
     struct cxi_md *md;             /**< cxil_map registration of buf */
     unsigned       num_events;     /**< Runtime EQ depth -- resolved from
-                                        UCX_CXI_EQ_SIZE and TX pool caps at
-                                        iface_open; see UCS_CLASS_INIT_FUNC */
+                                        UCX_CXI_EQ_SIZE / UCX_CXI_TX_EQ_SIZE
+                                        at iface_open; see UCS_CLASS_INIT_FUNC */
     unsigned       max_poll;       /**< Max events drained per
                                         iface_progress() call -- resolved
                                         from UCX_CXI_EQ_MAX_POLL. Bounds
@@ -312,10 +317,17 @@ typedef struct uct_cxi_iface {
         struct cxi_cq   *cmdq;             /**< Target command queue for LE management */
     } tgt;
 
-    /* ── Event queue (single EQ; event_type dispatches to handler) ─── */
+    /* ── Event queues; event_type dispatches to the handler ─────────────
+     * Two queues share one wait object:
+     *  - tx_eq: completions (ACK/REPLY) of commands issued on tx.cmdq. Sized
+     *    from the TX pool caps, so it cannot overflow; never grown.
+     *  - rx_eq: everything the NIC reports for our own PTEs (incoming
+     *    PUT/GET/..., STATE_CHANGE, command-queue events of tgt.cmdq).
+     *    Sized by EQ_SIZE; the only queue that can fill from the network,
+     *    so the only one with PTE flow-control recovery and growth. */
     struct cxil_wait_obj *wait_obj;        /**< Interrupt / epoll fd for progress */
-    uct_cxi_eq_t          eq;              /**< The one event queue shared by all
-                                                CMDQs & PTEs; see uct_cxi_eq_t */
+    uct_cxi_eq_t          rx_eq;
+    uct_cxi_eq_t          tx_eq;
 
     /* ── PTE flow-control recovery (drain-gated re-enable) ──────────── */
     unsigned   eq_flap_limit;    /**< Resolved from config at iface_open */

@@ -321,7 +321,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
             .use_long_event = 1,
             .en_flowctrl    = 1
         };
-        ret = cxil_alloc_pte(lni, self->eq.evtq, &pt_opts, &self->tag.pte);
+        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->tag.pte);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte TAG: %s", strerror(-ret));
@@ -355,14 +355,14 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         cxi_cq_ring(self->tgt.cmdq);
 
         while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
                 if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
                     ev->tgt_long.initiator.state_change.ptlte_state
                             == C_PTLTE_ENABLED) {
                     enabled = true;
                 }
             }
-            cxi_eq_ack_events(self->eq.evtq);
+            cxi_eq_ack_events(self->rx_eq.evtq);
         }
     }
 
@@ -504,7 +504,7 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
             .is_matching = 1,
             .en_flowctrl = 1
         };
-        ret = cxil_alloc_pte(lni, self->eq.evtq, &pt_opts, &self->rdzv.pte);
+        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->rdzv.pte);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte RDZV: %s", strerror(-ret));
@@ -551,14 +551,14 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         cxi_cq_ring(self->tgt.cmdq);
 
         while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->eq.evtq)) != NULL) {
+            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
                 if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
                     ev->tgt_long.initiator.state_change.ptlte_state
                             == C_PTLTE_ENABLED) {
                     enabled = true;
                 }
             }
-            cxi_eq_ack_events(self->eq.evtq);
+            cxi_eq_ack_events(self->rx_eq.evtq);
         }
     }
 
@@ -1235,7 +1235,7 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
         cmd.lac                = 0; /* LAC 0 only -- see design plan scoping */
         cmd.event_send_disable = 1;
         cmd.restricted         = 0;
-        cmd.eq                 = iface->eq.evtq->eqn;
+        cmd.eq                 = iface->tx_eq.evtq->eqn;
         cmd.dfa                = dfa;
         cmd.remote_offset      = event->tgt_long.remote_offset;
         cmd.local_addr         = local_addr;
@@ -1826,7 +1826,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, "tag_eager_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -1877,7 +1877,7 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     size_t                length;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -1901,7 +1901,7 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable  = 0;
         cmd.restricted             = 0;
-        cmd.eq                     = iface->eq.evtq->eqn;
+        cmd.eq                     = iface->tx_eq.evtq->eqn;
         cmd.dfa                    = ep->dfa_tag;
         cmd.match_bits             = tag;
         cmd.header_data            = imm;
@@ -1944,7 +1944,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
 
     UCT_CHECK_IOV_SIZE(iovcnt, 1ul, "tag_eager_zcopy");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -1964,7 +1964,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.event_send_disable     = 1;
         cmd.event_success_disable  = 0;
         cmd.restricted             = 0;
-        cmd.eq                     = iface->eq.evtq->eqn;
+        cmd.eq                     = iface->tx_eq.evtq->eqn;
         cmd.dfa                    = ep->dfa_tag;
         cmd.match_bits             = tag;
         cmd.header_data            = imm;
@@ -2094,7 +2094,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM);
     }
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_ep_fc_blocked(ep, &iface->tag.fc)) {
         return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
     }
 
@@ -2145,7 +2145,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         cmd.lac                    = memh->cxi_md->lac;
         cmd.event_send_disable     = 1;
         cmd.restricted             = 0;
-        cmd.eq                     = iface->eq.evtq->eqn;
+        cmd.eq                     = iface->tx_eq.evtq->eqn;
         cmd.dfa                    = ep->dfa_tag;
         cmd.match_bits             = tag;
         cmd.local_addr              = local_addr;

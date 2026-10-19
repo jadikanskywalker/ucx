@@ -98,7 +98,7 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_RES, "get_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -119,7 +119,7 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
         cmd.lac                = iface->tx.get_short_mh.cxi_md->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
-        cmd.eq                 = iface->eq.evtq->eqn;
+        cmd.eq                 = iface->tx_eq.evtq->eqn;
         cmd.dfa                = ep->dfa_rma[rkey_p->lac];
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = iface->tx.get_short_mh.iova_offset +
@@ -194,7 +194,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
               (unsigned long)(rkey_p->iova + remote_addr),
               (unsigned)rkey_p->lac);
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -211,7 +211,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
-        cstate.eq                  = iface->eq.evtq->eqn;
+        cstate.eq                  = iface->tx_eq.evtq->eqn;
         cstate.user_ptr            = (uint64_t)(uintptr_t)op;
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
@@ -309,7 +309,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
     size_t                length;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -332,7 +332,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
         cmd.lac                = desc->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
-        cmd.eq                 = iface->eq.evtq->eqn;
+        cmd.eq                 = iface->tx_eq.evtq->eqn;
         cmd.dfa                = ep->dfa_rma[rkey_p->lac];
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = desc->iova;
@@ -385,7 +385,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
 
     UCT_CHECK_LENGTH(length, 0, iface->tx.max_bcopy, "get_bcopy");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -406,7 +406,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
         cmd.event_send_disable = 1;
-        cmd.eq                 = iface->eq.evtq->eqn;
+        cmd.eq                 = iface->tx_eq.evtq->eqn;
         cmd.local_addr         = desc->iova;
         cmd.request_len        = (uint32_t)length;
         cmd.user_ptr           = (uint64_t)(uintptr_t)desc;
@@ -487,7 +487,7 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -506,7 +506,7 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
         cmd.lac                = local_mh->cxi_md->lac;
         cmd.event_send_disable = 1;
         cmd.restricted         = 1;
-        cmd.eq                 = iface->eq.evtq->eqn;
+        cmd.eq                 = iface->tx_eq.evtq->eqn;
         cmd.dfa                = ep->dfa_rma[rkey_p->lac];
         cmd.remote_offset      = rkey_p->iova + remote_addr;
         cmd.local_addr         = local_mh->iova_offset +
@@ -556,7 +556,7 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     uct_cxi_send_op_t    *op;
     int                   ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, NULL)) {
+    if (uct_cxi_ep_fc_blocked(ep, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -572,7 +572,7 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
         struct c_full_dma_cmd cmd = {};
         cmd.command.opcode     = C_CMD_GET;
         cmd.event_send_disable = 1;
-        cmd.eq                 = iface->eq.evtq->eqn;
+        cmd.eq                 = iface->tx_eq.evtq->eqn;
         cmd.local_addr         = local_mh->iova_offset +
                                  (uint64_t)(uintptr_t)iov[0].buffer;
         cmd.request_len        = (uint32_t)uct_iov_get_length(iov);

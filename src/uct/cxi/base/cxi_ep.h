@@ -144,14 +144,9 @@ void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
  * uct_cxi_ep_fc_blocked — true if this send should be deferred to the
  * pending/arbiter retry path rather than attempted now.
  *
- * Four independent reasons, all gate identically (return
+ * Three independent reasons, all gate identically (return
  * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion — no new
  * caller-visible status):
- *   - iface->eq.need_to_drain: the shared EQ is being drained back down
- *     after a drop, before any disabled PTE is re-checked (see cxi_iface.c).
- *     New local sends are held back to stop refilling it out from under
- *     that drain. Iface-wide — applies regardless of which PTE this op
- *     targets, since EQ capacity is the iface's shared resource.
  *   - pte_fc->exhausted: the *specific* PTE this op targets has hit
  *     matching-resource exhaustion (AM only — pass NULL for RMA/AMO ops,
  *     which never populate this; see uct_cxi_pte_fc_t). Unrelated PTEs'
@@ -160,13 +155,15 @@ void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
  *     concurrency cap (see uct_cxi_ep_tx_complete).
  *   - ep->retry_backoff_until: this EP's adaptive retry-cadence backoff,
  *     set after a C_RC_PT_DISABLED-class completion.
+ *
+ * Deliberately not gated on the RX EQ being drained after a drop: with
+ * separate TX and RX event queues, local sends only produce TX completions
+ * and can no longer refill the RX queue out from under that drain.
  */
 static UCS_F_ALWAYS_INLINE int
-uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
-                       const uct_cxi_pte_fc_t *pte_fc)
+uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_pte_fc_t *pte_fc)
 {
-    return ucs_unlikely((iface->eq.need_to_drain > 0) ||
-                         ((pte_fc != NULL) && pte_fc->exhausted) ||
+    return ucs_unlikely(((pte_fc != NULL) && pte_fc->exhausted) ||
                          (ep->outstanding >= ep->max_outstanding) ||
                          (ep->retry_backoff_until > ucs_get_time()));
 }
