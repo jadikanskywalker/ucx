@@ -70,9 +70,10 @@ uct_cxi_tag_ep_iface(uct_cxi_ep_t *ep)
     return ucs_derived_of(ep->super.super.iface, uct_cxi_iface_t);
 }
 
-/* Plain host-memory pool -- no DMA registration needed, data is always
- * copied out of the overflow ring via memcpy before this pool is touched. */
-static ucs_mpool_ops_t uct_cxi_tag_unexp_mpool_ops = {
+/* Plain host-memory pools -- the NIC never DMAs into or out of these
+ * (software-Get tracking and parked rendezvous confirmations), so no
+ * registration is needed. */
+static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
     .obj_init      = NULL,
@@ -218,24 +219,6 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
      * Never fails to init. */
     ucs_queue_head_init(&self->tag.rndv_unexp_pending_q);
 
-    /* Unexpected-message copy-out pool: plain host memory (see
-     * uct_cxi_tag_unexp_mpool_ops), sized to hold one full eager message. */
-    {
-        ucs_mpool_params_t mp_params;
-        unsigned           grow = ucs_min(64u, config->tag_unexp_max_bufs);
-
-        ucs_mpool_params_reset(&mp_params);
-        mp_params.elem_size       = self->tag.buf_size;
-        mp_params.elems_per_chunk = ucs_max(grow, 1u);
-        mp_params.max_elems       = config->tag_unexp_max_bufs;
-        mp_params.ops             = &uct_cxi_tag_unexp_mpool_ops;
-        mp_params.name            = "cxi-tag-unexp";
-        status = ucs_mpool_init(&mp_params, &self->tag.unexp_pool);
-        if (status != UCS_OK) {
-            goto err_free_rndv_peer_cache;
-        }
-    }
-
     /* Software-issued (get_issued==0) rendezvous Get tracking pool -- see
      * uct_cxi_rdzv_get_op_t in cxi_tag.h. Capped the same as
      * max_outstanding: never more outstanding software Gets than
@@ -248,11 +231,11 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         mp_params.elem_size       = sizeof(uct_cxi_rdzv_get_op_t);
         mp_params.elems_per_chunk = ucs_max(grow, 1u);
         mp_params.max_elems       = self->tag.max_outstanding;
-        mp_params.ops             = &uct_cxi_tag_unexp_mpool_ops;
+        mp_params.ops             = &uct_cxi_tag_host_mpool_ops;
         mp_params.name            = "cxi-tag-rdzv-get-op";
         status = ucs_mpool_init(&mp_params, &self->tag.rdzv_get_op_pool);
         if (status != UCS_OK) {
-            goto err_cleanup_unexp_pool;
+            goto err_free_rndv_peer_cache;
         }
     }
 
@@ -268,7 +251,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         mp_params.elem_size       = sizeof(uct_cxi_rndv_unexp_pending_t);
         mp_params.elems_per_chunk = ucs_max(grow, 1u);
         mp_params.max_elems       = self->tag.max_outstanding;
-        mp_params.ops             = &uct_cxi_tag_unexp_mpool_ops;
+        mp_params.ops             = &uct_cxi_tag_host_mpool_ops;
         mp_params.name            = "cxi-tag-rndv-unexp-pending";
         status = ucs_mpool_init(&mp_params, &self->tag.rndv_unexp_pending_pool);
         if (status != UCS_OK) {
@@ -286,7 +269,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                                  "cxi-tag-rx-buf");
         if (ret != 0) {
             status = UCS_ERR_NO_MEMORY;
-            goto err_cleanup_unexp_pool;
+            goto err_free_rndv_peer_cache;
         }
         status = uct_cxi_do_map(lni, self->tag.rx_base, total,
                                 UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
@@ -294,7 +277,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         if (status != UCS_OK) {
             ucs_free(self->tag.rx_base);
             self->tag.rx_base = NULL;
-            goto err_cleanup_unexp_pool;
+            goto err_free_rndv_peer_cache;
         }
     }
 
@@ -399,8 +382,6 @@ err_unmap_rx:
     ucs_mpool_cleanup(&self->tag.rndv_unexp_pending_pool, 1);
 err_cleanup_rdzv_get_op_pool:
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
-err_cleanup_unexp_pool:
-    ucs_mpool_cleanup(&self->tag.unexp_pool, 1);
 err_free_rndv_peer_cache:
     kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
 err_free_cancel_ctx:
@@ -441,9 +422,8 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
     ucs_free(self->tag.ovf_refcnt);
 
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
-    ucs_mpool_cleanup(&self->tag.unexp_pool, 1);
     /* Pending entries are dropped silently, no rndv_cb invocation at
-     * teardown -- matches unexp_pool/rdzv_get_op_pool's own cleanup. */
+     * teardown -- matches rdzv_get_op_pool's own cleanup. */
     ucs_mpool_cleanup(&self->tag.rndv_unexp_pending_pool, 1);
     kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     ucs_free(self->tag.cancel_ctx);
@@ -783,8 +763,6 @@ uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
     uint32_t len      = event->tgt_long.mlength;
     uint64_t tag      = event->tgt_long.match_bits;
     uint64_t imm      = event->tgt_long.header_data;
-    void    *data;
-    void    *elem;
     void    *context = NULL;
 
     if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
@@ -806,35 +784,31 @@ uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
         return;
     }
 
-    /* Copy out before releasing the reference below -- releasing first
-     * can trigger a repost (uct_cxi_iface_post_tag_ovf_le()), making this
-     * exact memory eligible for the NIC to overwrite with a new arrival
-     * before we've read it. */
-    data = uct_cxi_iface_tag_ovf_data(iface, buf_idx, event->tgt_long.start);
-    elem = (len > 0) ? ucs_mpool_get(&iface->tag.unexp_pool) : NULL;
-    if (ucs_unlikely((elem == NULL) && (len > 0))) {
-        ucs_error("cxi TAG overflow: unexp_pool exhausted, dropping "
-                 "unexpected message tag=0x%lx len=%u",
-                 (unsigned long)tag, len);
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
-        return;
-    }
-    if (len > 0) {
-        memcpy(elem, data, len);
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
-    }
-
     ucs_info("cxi TAG [SEARCH-DELETE-MATCH] tag=0x%lx len=%u buf_idx=%d",
              (unsigned long)tag, len, buf_idx);
 
-    /* No UCT_CB_PARAM_FLAG_DESC offered -- eager_cb must copy out
-     * synchronously if it wants to keep the data, matching this same
-     * transport's existing AM convention. We reclaim our own buffer right
-     * away regardless of the returned status. */
-    (void)iface->tag.eager_cb(iface->tag.eager_arg, elem, len,
-                              UCT_CB_PARAM_FLAG_FIRST, tag, imm, &context);
-    if (elem != NULL) {
-        ucs_mpool_put(elem);
+    /* Hand eager_cb the payload where it already sits, in the overflow ring.
+     * No UCT_CB_PARAM_FLAG_DESC is offered, so by the uct_tag_unexp_eager_cb_t
+     * contract eager_cb must copy out synchronously whatever it wants to keep
+     * (UCP does: it unpacks into a matched receive, or copies into its own
+     * receive descriptor); the pointer is not retained after it returns. This
+     * arrival's overflow reference is still held during the call, so no
+     * repost can overwrite the payload, even if eager_cb re-enters progress.
+     * Release only afterwards: releasing first can trigger a repost
+     * (uct_cxi_iface_post_tag_ovf_le()), making this exact memory eligible
+     * for the NIC to overwrite with a new arrival.
+     *
+     * Nothing after the call may read \a event: a re-entrant progress call
+     * from eager_cb can recycle its slot in the event queue. */
+    (void)iface->tag.eager_cb(iface->tag.eager_arg,
+                              (len > 0) ? uct_cxi_iface_tag_ovf_data(
+                                      iface, buf_idx, event->tgt_long.start) :
+                                          NULL,
+                              len, UCT_CB_PARAM_FLAG_FIRST, tag, imm,
+                              &context);
+
+    if (len > 0) {
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
     }
 }
 

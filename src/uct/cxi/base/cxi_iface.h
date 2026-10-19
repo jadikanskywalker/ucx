@@ -22,6 +22,7 @@
 
 #include <libcxi/libcxi.h>
 #include <cassini_user_defs.h>
+#include <cxi_prov_hw.h>
 
 
 #define UCT_CXI_NAME "cxi"
@@ -157,13 +158,11 @@ typedef struct uct_cxi_iface_config {
     unsigned                  tag_ovf_num_bufs; /**< # overflow-ring buffers        */
     size_t                    tag_ovf_buf_size; /**< Size of each overflow buffer   */
     size_t                    tag_eager_max;    /**< Max eager bcopy/zcopy payload;
-                                              also sizes unexp_pool elements and the
-                                              overflow ring buffers if larger       */
+                                              also sizes the overflow ring
+                                              buffers if larger                     */
     unsigned                  tag_max_outstanding; /**< Max simultaneously-posted
                                               priority LEs (hard ceiling 65535 --
                                               buffer_id is uint16_t)                */
-    unsigned                  tag_unexp_max_bufs; /**< Cap on the unexpected-message
-                                              copy-out pool                        */
 } uct_cxi_iface_config_t;
 
 
@@ -459,9 +458,6 @@ typedef struct uct_cxi_iface {
         int32_t              *ovf_refcnt;          /**< [num_bufs] */
         uint8_t              *ovf_repost_pending; /**< [num_bufs] */
 
-        ucs_mpool_t           unexp_pool;  /**< Copy-out buffers for unexpected
-                                                messages handed to eager_cb/rndv_cb */
-
         /* uct_cxi_rdzv_get_op_t pool for software-issued (get_issued==0)
          * rendezvous Gets -- see cxi_tag.h. Capped the same as
          * max_outstanding: can never have more outstanding software Gets
@@ -577,28 +573,46 @@ static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
 }
 
 
-UCS_CLASS_DECLARE(uct_cxi_iface_t, uct_md_h, uct_worker_h,
-                  const uct_iface_params_t*, const uct_iface_config_t*)
-
-ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface,
-                                  uct_iface_attr_t *iface_attr);
-
 BEGIN_C_DECLS
+
+/** Slow path of uct_cxi_iface_tgt_post(); \a ret is the failed emit's result. */
+ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
+                                         const void *cmd, int ret);
+
+END_C_DECLS
 
 /**
  * Submit a 64-byte target command (struct c_target_cmd or struct
  * c_set_state_cmd) on the target command queue.
  *
  * A full queue is transient -- it only means the NIC has not consumed what
- * was already rung -- so this retries in place until there is room, for at
- * most UCT_CXI_TGT_CMDQ_TIMEOUT. Callers (event handlers that cannot hand a
- * failure back to anyone) can therefore treat UCS_OK as "the NIC has it".
- * Returns UCS_ERR_TIMED_OUT if the queue stays full for the whole timeout
- * (a wedged NIC), or UCS_ERR_IO_ERROR on any other emit failure.
+ * was already rung -- so on failure this waits in place until there is room,
+ * for at most UCT_CXI_TGT_CMDQ_TIMEOUT_SEC. Callers (event handlers that
+ * cannot hand a failure back to anyone) can therefore treat UCS_OK as "the
+ * NIC has it". Returns UCS_ERR_TIMED_OUT if the queue stays full for the
+ * whole timeout (a wedged NIC), or UCS_ERR_IO_ERROR on any other emit
+ * failure.
  */
-ucs_status_t uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd);
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd)
+{
+    int ret = cxi_cq_emit_target(iface->tgt.cmdq, cmd);
 
-END_C_DECLS
+    if (ucs_likely(ret == 0)) {
+        cxi_cq_ring(iface->tgt.cmdq);
+        return UCS_OK;
+    }
+
+    return uct_cxi_iface_tgt_post_wait(iface, cmd, ret);
+}
+
+UCS_CLASS_DECLARE(uct_cxi_iface_t, uct_md_h, uct_worker_h,
+                  const uct_iface_params_t*, const uct_iface_config_t*)
+
+ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface,
+                                  uct_iface_attr_t *iface_attr);
+
+
 ucs_status_t uct_cxi_iface_flush(uct_iface_h tl_iface, unsigned flags,
                                   uct_completion_t *comp);
 ucs_status_t uct_cxi_iface_get_device_address(uct_iface_h tl_iface,

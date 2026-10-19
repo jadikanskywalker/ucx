@@ -218,12 +218,6 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, tag_max_outstanding),
      UCS_CONFIG_TYPE_UINT},
 
-    {"TAG_UNEXP_MAX_BUFS", "512",
-     "Maximum number of buffered unexpected tagged messages awaiting\n"
-     "delivery to UCP's software tag matching.",
-     ucs_offsetof(uct_cxi_iface_config_t, tag_unexp_max_bufs),
-     UCS_CONFIG_TYPE_UINT},
-
     {NULL}
 };
 
@@ -331,11 +325,12 @@ err_destroy_pte:
 }
 
 /*
- * uct_cxi_iface_tgt_post -- submit one target command, waiting for room.
+ * uct_cxi_iface_tgt_post_wait -- slow path of uct_cxi_iface_tgt_post(): the
+ * first emit failed with \a ret, wait for the target command queue to have
+ * room and submit \a cmd.
  *
- * cxi_cq_emit_target() fails synchronously with -ENOSPC when the ring has no
- * room. That is transient: every command is rung as soon as it is emitted, so
- * a full ring just means the NIC has not consumed it yet, and it does not
+ * -ENOSPC is transient: every command is rung as soon as it is emitted, so a
+ * full ring just means the NIC has not consumed it yet, and it does not
  * depend on anything we would do while waiting (a full event queue makes the
  * NIC drop events, it does not stall the command queue). Callers cannot
  * recover from a lost command -- a dropped SEARCH_AND_DELETE loses an
@@ -345,34 +340,30 @@ err_destroy_pte:
  * Single-threaded progress means nothing can interleave with the wait, so
  * command order is preserved.
  */
-ucs_status_t uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd)
+ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
+                                         const void *cmd, int ret)
 {
-    ucs_time_t deadline = 0;
-    int        ret;
+    ucs_time_t deadline = ucs_get_time() +
+                          ucs_time_from_sec(UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
 
-    for (;;) {
-        ret = cxi_cq_emit_target(iface->tgt.cmdq, cmd);
-        if (ucs_likely(ret == 0)) {
-            cxi_cq_ring(iface->tgt.cmdq);
-            return UCS_OK;
-        }
-
-        if (ret != -ENOSPC) {
-            ucs_error("cxi target command emit failed: %s", strerror(-ret));
-            return UCS_ERR_IO_ERROR;
-        }
-
-        if (deadline == 0) {
-            deadline = ucs_get_time() +
-                       ucs_time_from_sec(UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
-        } else if (ucs_get_time() > deadline) {
+    while (ret == -ENOSPC) {
+        if (ucs_get_time() > deadline) {
             ucs_error("cxi target command queue stayed full for %.1f s",
                       UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
             return UCS_ERR_TIMED_OUT;
         }
 
         ucs_compiler_fence();
+        ret = cxi_cq_emit_target(iface->tgt.cmdq, cmd);
     }
+
+    if (ret != 0) {
+        ucs_error("cxi target command emit failed: %s", strerror(-ret));
+        return UCS_ERR_IO_ERROR;
+    }
+
+    cxi_cq_ring(iface->tgt.cmdq);
+    return UCS_OK;
 }
 
 /*
@@ -1669,12 +1660,100 @@ static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface, uct_cxi_eq_t 
 }
 
 /*
+ * uct_cxi_iface_handle_state_change -- a PTE changed state (flow control
+ * disabled it, or it was re-enabled). Rare slow path, kept out of line so its
+ * locals add nothing to the inlined event dispatch in
+ * uct_cxi_iface_progress().
+ */
+static UCS_F_NOINLINE void
+uct_cxi_iface_handle_state_change(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
+                                  const union c_event *event)
+{
+    /* Two distinct things produce this event, and ptlte_state alone
+     * cannot tell them apart — both report DISABLED identically:
+     *   - A fresh, NIC-initiated disable (return_code == C_RC_OK).
+     *   - The completion of our *own* SETSTATE(ENABLED) attempt,
+     *     rejected (C_RC_NO_MATCH) if drop_count moved between our
+     *     cxil_pte_status() read and the command actually landing
+     *     in hardware — a real race at sustained high message
+     *     rates, not a bug in the read/issue sequence. sc_reason
+     *     is not meaningful on a rejection completion (observed:
+     *     nonsensical values outside the documented enum) — only
+     *     return_code distinguishes the two cases. */
+    uint8_t  ptlte_state =
+            event->tgt_long.initiator.state_change.ptlte_state;
+    uint8_t  sc_reason =
+            event->tgt_long.initiator.state_change.sc_reason;
+    int      rc          = cxi_event_rc(event);
+    uint16_t ptlte_index = event->tgt_long.ptlte_index;
+
+    ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
+             "sc_reason=%u sc_nic_auto=%u rc=%d",
+             (unsigned)ptlte_index,
+             (unsigned)ptlte_state, (unsigned)sc_reason,
+             (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto,
+             rc);
+
+    if (rc != C_RC_OK) {
+        /* Our own SETSTATE(ENABLED) was rejected — drop_count
+         * moved between our cxil_pte_status() read and the
+         * command landing in hardware (a real race at sustained
+         * high message rates). This is NOT caused by EQ
+         * pressure — the rejection generates no EQ traffic of
+         * its own — so retry immediately with a fresh read
+         * rather than waiting on drain progress that has
+         * nothing to do with this PTE's drop_count. */
+        struct cxil_pte  *pte;
+        uct_cxi_pte_fc_t *fc = uct_cxi_iface_pte_by_index(
+                iface, ptlte_index, &pte);
+        if (fc != NULL) {
+            uct_cxi_iface_pte_recover(iface, pte, fc);
+        }
+    } else if (ptlte_state == C_PTLTE_DISABLED) {
+        if (sc_reason == C_SC_FC_EQ_FULL) {
+            /* Fresh disable caused by EQ capacity — affects every
+             * PTE bound to this queue (all of them, today: they
+             * share the RX EQ). Defer recovery until the EQ has
+             * actually drained (see the eq->need_to_drain
+             * countdown in uct_cxi_iface_eq_poll()) rather than
+             * retrying inline. */
+            if (eq->need_to_drain == 0) {
+                eq->need_to_drain = (eq->num_events * eq->drain_pct) / 100;
+            }
+        } else if ((iface->am.pte != NULL) &&
+                   (ptlte_index == iface->am.pte->ptn)) {
+            /* Fresh disable for a non-EQ-capacity reason on the
+             * AM PTE — matching-resource exhaustion (N=4 fixed
+             * rotating buffers all simultaneously full; RMA/AMO
+             * can't reach this path, see uct_cxi_pte_fc_t).
+             * Independent of EQ-fill: gate new AM sends via
+             * am.fc.exhausted (uct_cxi_ep_fc_blocked) and
+             * attempt recovery right away rather than waiting on
+             * drain progress, which doesn't free buffer/LE
+             * capacity. */
+            iface->am.fc.exhausted = 1;
+            uct_cxi_iface_pte_recover(iface, iface->am.pte,
+                                      &iface->am.fc);
+        }
+    } else if (ptlte_state == C_PTLTE_ENABLED) {
+        /* Successful re-enable clears matching-resource
+         * EXHAUSTED for the AM PTE. (DRAINING clears separately
+         * via eq.need_to_drain reaching 0, not here.) */
+        if ((iface->am.pte != NULL) &&
+            (ptlte_index == iface->am.pte->ptn)) {
+            iface->am.fc.exhausted = 0;
+        }
+    }
+}
+
+/*
  * uct_cxi_iface_handle_event -- dispatch one event drained from \a eq.
  * Handlers are keyed on the event type (and PTE index), not on which queue
  * delivered it; \a eq only selects the per-queue drain/growth state.
  */
-static void uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
-                                       const union c_event *event)
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
+                           const union c_event *event)
 {
     uct_cxi_send_op_t *op;
 
@@ -1846,81 +1925,7 @@ static void uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         }
 
     } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
-        /* Two distinct things produce this event, and ptlte_state alone
-         * cannot tell them apart — both report DISABLED identically:
-         *   - A fresh, NIC-initiated disable (return_code == C_RC_OK).
-         *   - The completion of our *own* SETSTATE(ENABLED) attempt,
-         *     rejected (C_RC_NO_MATCH) if drop_count moved between our
-         *     cxil_pte_status() read and the command actually landing
-         *     in hardware — a real race at sustained high message
-         *     rates, not a bug in the read/issue sequence. sc_reason
-         *     is not meaningful on a rejection completion (observed:
-         *     nonsensical values outside the documented enum) — only
-         *     return_code distinguishes the two cases. */
-        uint8_t  ptlte_state =
-                event->tgt_long.initiator.state_change.ptlte_state;
-        uint8_t  sc_reason =
-                event->tgt_long.initiator.state_change.sc_reason;
-        int      rc          = cxi_event_rc(event);
-        uint16_t ptlte_index = event->tgt_long.ptlte_index;
-
-        ucs_warn("cxi PTE state change: ptn=%u ptlte_state=%u "
-                 "sc_reason=%u sc_nic_auto=%u rc=%d",
-                 (unsigned)ptlte_index,
-                 (unsigned)ptlte_state, (unsigned)sc_reason,
-                 (unsigned)event->tgt_long.initiator.state_change.sc_nic_auto,
-                 rc);
-
-        if (rc != C_RC_OK) {
-            /* Our own SETSTATE(ENABLED) was rejected — drop_count
-             * moved between our cxil_pte_status() read and the
-             * command landing in hardware (a real race at sustained
-             * high message rates). This is NOT caused by EQ
-             * pressure — the rejection generates no EQ traffic of
-             * its own — so retry immediately with a fresh read
-             * rather than waiting on drain progress that has
-             * nothing to do with this PTE's drop_count. */
-            struct cxil_pte  *pte;
-            uct_cxi_pte_fc_t *fc = uct_cxi_iface_pte_by_index(
-                    iface, ptlte_index, &pte);
-            if (fc != NULL) {
-                uct_cxi_iface_pte_recover(iface, pte, fc);
-            }
-        } else if (ptlte_state == C_PTLTE_DISABLED) {
-            if (sc_reason == C_SC_FC_EQ_FULL) {
-                /* Fresh disable caused by EQ capacity — affects every
-                 * PTE bound to this queue (all of them, today: they
-                 * share the RX EQ). Defer recovery until the EQ has
-                 * actually drained (see the eq->need_to_drain
-                 * countdown in uct_cxi_iface_eq_poll()) rather than
-                 * retrying inline. */
-                if (eq->need_to_drain == 0) {
-                    eq->need_to_drain = (eq->num_events * eq->drain_pct) / 100;
-                }
-            } else if ((iface->am.pte != NULL) &&
-                       (ptlte_index == iface->am.pte->ptn)) {
-                /* Fresh disable for a non-EQ-capacity reason on the
-                 * AM PTE — matching-resource exhaustion (N=4 fixed
-                 * rotating buffers all simultaneously full; RMA/AMO
-                 * can't reach this path, see uct_cxi_pte_fc_t).
-                 * Independent of EQ-fill: gate new AM sends via
-                 * am.fc.exhausted (uct_cxi_ep_fc_blocked) and
-                 * attempt recovery right away rather than waiting on
-                 * drain progress, which doesn't free buffer/LE
-                 * capacity. */
-                iface->am.fc.exhausted = 1;
-                uct_cxi_iface_pte_recover(iface, iface->am.pte,
-                                          &iface->am.fc);
-            }
-        } else if (ptlte_state == C_PTLTE_ENABLED) {
-            /* Successful re-enable clears matching-resource
-             * EXHAUSTED for the AM PTE. (DRAINING clears separately
-             * via eq.need_to_drain reaching 0, not here.) */
-            if ((iface->am.pte != NULL) &&
-                (ptlte_index == iface->am.pte->ptn)) {
-                iface->am.fc.exhausted = 0;
-            }
-        }
+        uct_cxi_iface_handle_state_change(iface, eq, event);
     } else if ((event->hdr.event_type == C_EVENT_UNLINK) &&
                (iface->tag.pte != NULL) &&
                (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
@@ -1991,7 +1996,8 @@ static void uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
  * uct_cxi_iface_eq_poll -- drain up to eq->max_poll events from \a eq, then
  * run the per-queue drop, preemptive-growth and ack bookkeeping.
  */
-static unsigned uct_cxi_iface_eq_poll(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
+static UCS_F_ALWAYS_INLINE unsigned
+uct_cxi_iface_eq_poll(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
 {
     const union c_event *event;
     unsigned             n = 0;

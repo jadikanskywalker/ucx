@@ -20,11 +20,20 @@
  * Unexpected-message receive context -- filled by the test eager_cb when a
  * tagged message arrives with no matching priority LE posted.
  */
+struct uct_cxi_tag_unexp_msg {
+    uct_tag_t             tag;
+    uint64_t              imm;
+    std::vector<uint8_t>  data;
+};
+
 struct uct_cxi_tag_unexp_ctx {
     volatile bool        fired;
     uct_tag_t             tag;
     uint64_t              imm;
     std::vector<uint8_t>  data;
+    /* Every message delivered so far, in delivery order -- for tests that
+     * send several before the receiver progresses. */
+    std::vector<uct_cxi_tag_unexp_msg> all;
 };
 
 static ucs_status_t
@@ -36,6 +45,7 @@ uct_cxi_tag_eager_cb(void *arg, void *data, size_t length, unsigned flags,
     ctx->imm = imm;
     ctx->data.assign(static_cast<uint8_t *>(data),
                      static_cast<uint8_t *>(data) + length);
+    ctx->all.push_back({stag, imm, ctx->data});
     ctx->fired = true;
     return UCS_OK;
 }

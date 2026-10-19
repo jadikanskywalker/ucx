@@ -249,6 +249,107 @@ UCS_TEST_P(test_cxi_tag, unexpected_bcopy)
     flush_ep(sender(), ep);
 }
 
+/**
+ * Several unexpected eager messages of very different sizes sharing the
+ * overflow ring, none consumed before all have landed.
+ *
+ * eager_cb is handed each payload where it sits in the ring (no staging
+ * copy), so every message must still arrive intact and with its own tag and
+ * immediate even though later arrivals are landing next to it, and the large
+ * ones push the ring through buffer rotations (auto-unlink and repost).
+ */
+UCS_TEST_P(test_cxi_tag, unexpected_burst_sizes)
+{
+    static const uct_tag_t TAG_BASE = 0x7700000000000000ULL;
+    /* bcopy is limited to the bounce buffer size, zcopy goes up to the eager
+     * limit. */
+    static const size_t    BCOPY_SIZES[] = {1, 100, 1024, 8192};
+    static const size_t    ZCOPY_SIZES[] = {100 * 1024, 400 * 1024};
+
+    struct sent_msg {
+        uct_tag_t            tag;
+        std::vector<uint8_t> data;
+        uct_mem_h            memh;
+    };
+    std::vector<sent_msg> sent;
+
+    auto make_msg = [&](size_t len) {
+        sent_msg m;
+        m.tag  = TAG_BASE + sent.size();
+        m.memh = NULL;
+        m.data.resize(len);
+        for (size_t i = 0; i < len; i++) {
+            /* Unique per message and per position. */
+            m.data[i] = static_cast<uint8_t>(sent.size() * 37 + i * 7 + 1);
+        }
+        return m;
+    };
+
+    sender().connect_to_iface(0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    for (size_t len : BCOPY_SIZES) {
+        sent.push_back(make_msg(len));
+        sent_msg &m = sent.back();
+        struct { const uint8_t *src; size_t len; } arg = {m.data.data(), len};
+        auto pack = [](void *dst, void *a) -> size_t {
+            auto *p = static_cast<decltype(arg) *>(a);
+            memcpy(dst, p->src, p->len);
+            return p->len;
+        };
+        ASSERT_EQ(static_cast<ssize_t>(len),
+                  uct_ep_tag_eager_bcopy(ep, m.tag, m.tag ^ 0xFF, +pack, &arg,
+                                         0));
+    }
+
+    for (size_t len : ZCOPY_SIZES) {
+        sent.push_back(make_msg(len));
+        sent_msg &m = sent.back();
+        m.memh = reg(sender(), m.data.data(), len);
+        uct_iov_t iov;
+        iov.buffer = m.data.data();
+        iov.length = len;
+        iov.memh   = m.memh;
+        iov.stride = 0;
+        iov.count  = 1;
+        ASSERT_EQ(UCS_INPROGRESS,
+                  uct_ep_tag_eager_zcopy(ep, m.tag, m.tag ^ 0xFF, &iov, 1, 0,
+                                         NULL));
+    }
+
+    /* Let everything land as genuinely unexpected before the receiver looks. */
+    usleep(200000);
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(10.0);
+    while ((m_unexp.all.size() < sent.size()) && (ucs_get_time() < deadline)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    ASSERT_EQ(sent.size(), m_unexp.all.size());
+
+    for (const sent_msg &m : sent) {
+        const uct_cxi_tag_unexp_msg *got = NULL;
+        for (const uct_cxi_tag_unexp_msg &r : m_unexp.all) {
+            if (r.tag == m.tag) {
+                got = &r;
+            }
+        }
+        ASSERT_NE(nullptr, got) << "message with tag 0x" << std::hex << m.tag
+                                << " never delivered";
+        EXPECT_EQ(m.tag ^ 0xFF, got->imm);
+        EXPECT_EQ(m.data, got->data)
+                << "payload mismatch for " << std::dec << m.data.size()
+                << "-byte message";
+    }
+
+    flush_ep(sender(), ep);
+    for (sent_msg &m : sent) {
+        if (m.memh != NULL) {
+            dereg(sender(), m.memh);
+        }
+    }
+}
+
 
 /* -------------------------------------------------------------------------
  * Delayed match: message lands in overflow BEFORE a receive is posted for
