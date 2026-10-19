@@ -97,7 +97,7 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
                               int restart_seq)
 {
     struct c_target_cmd le = {};
-    int                 ret;
+    ucs_status_t        status;
 
     le.command.opcode         = C_CMD_TGT_APPEND;
     le.ptl_list               = C_PTL_LIST_OVERFLOW;
@@ -129,12 +129,12 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
     le.ignore_bits            = UINT64_MAX;
     le.match_bits             = 0;
 
-    ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi TAG overflow LE APPEND buf %d: %d", buf_idx, ret);
-        return UCS_ERR_IO_ERROR;
+    status = uct_cxi_iface_tgt_post(self, &le);
+    if (ucs_unlikely(UCS_STATUS_IS_ERR(status))) {
+        ucs_error("cxi TAG overflow LE APPEND buf %d: %s", buf_idx,
+                  ucs_status_string(status));
+        return status;
     }
-    cxi_cq_ring(self->tgt.cmdq);
     ucs_debug("cxi TAG overflow LE APPEND buf=%d ptn=%u start=0x%lx "
              "len=%zu restart_seq=%d", buf_idx, self->tag.pte->ptn,
              (unsigned long)le.start, self->tag.buf_size, restart_seq);
@@ -1048,7 +1048,7 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     int      buf_idx = (int)event->tgt_long.buffer_id;
     uint64_t tag      = event->tgt_long.match_bits;
     struct c_target_cmd sd = {};
-    int      ret;
+    ucs_status_t status;
 
     if (event->tgt_long.mlength > 0) {
         iface->tag.ovf_refcnt[buf_idx]++;
@@ -1133,22 +1133,23 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                     UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) +
                                    buf_idx);
 
-    ret = cxi_cq_emit_target(iface->tgt.cmdq, &sd);
-    if (ucs_unlikely(ret != 0)) {
-        /* Command-queue exhaustion -- rare, and there is no safe way to
-         * confirm exclusive ownership without the SEARCH_AND_DELETE
-         * actually landing, so the message is dropped rather than handed
-         * off racily. Matches this function's own unexp_pool-exhaustion
-         * precedent elsewhere in this file: rare-resource-pressure data
-         * loss, not a new failure mode. */
-        ucs_error("cxi TAG SEARCH_AND_DELETE emit failed: %d -- dropping "
-                 "unexpected message tag=0x%lx", ret, (unsigned long)tag);
+    /* A full target command queue defers the SEARCH_AND_DELETE rather than
+     * failing it (see uct_cxi_iface_tgt_post); this arrival's overflow
+     * reference stays held until the deferred command's own confirmation
+     * releases it, so the payload cannot be reposted over in the meantime.
+     * There is no safe way to confirm exclusive ownership without the
+     * command eventually landing, so only if it cannot even be queued
+     * (allocation failure) is the message dropped rather than handed off
+     * racily. */
+    status = uct_cxi_iface_tgt_post(iface, &sd);
+    if (ucs_unlikely(UCS_STATUS_IS_ERR(status))) {
+        ucs_error("cxi TAG SEARCH_AND_DELETE post failed: %s -- dropping "
+                 "unexpected message tag=0x%lx", ucs_status_string(status),
+                 (unsigned long)tag);
         if (event->tgt_long.mlength > 0) {
             uct_cxi_iface_tag_ovf_release(iface, buf_idx);
         }
-        return;
     }
-    cxi_cq_ring(iface->tgt.cmdq);
 }
 
 /*
@@ -2291,6 +2292,14 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
         return UCS_ERR_EXCEEDS_LIMIT;
     }
 
+    /* Commands the command queue had no room for are still waiting: this
+     * APPEND must not overtake them (an older UNLINK of the same
+     * buffer_id would then unlink this new LE). Let UCP retry instead of
+     * queueing, which also pushes back on a producer outrunning the NIC. */
+    if (ucs_unlikely(!ucs_queue_is_empty(&iface->tgt.deferred_q))) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
     memh = (uct_cxi_mem_handle_t *)iov[0].memh;
     slot = iface->tag.free_list[--iface->tag.free_count];
 
@@ -2357,7 +2366,7 @@ ucs_status_t uct_cxi_iface_tag_recv_cancel(uct_iface_h tl_iface,
     uct_cxi_iface_t        *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
     uct_cxi_tag_ctx_priv_t *priv  = (uct_cxi_tag_ctx_priv_t *)ctx->priv;
     struct c_target_cmd     cmd   = {};
-    int                     ret;
+    ucs_status_t            status;
 
     if (force) {
         /* priv is read here for the last time -- synchronously, while
@@ -2379,10 +2388,11 @@ ucs_status_t uct_cxi_iface_tag_recv_cancel(uct_iface_h tl_iface,
     cmd.ptlte_index    = iface->tag.pte->ptn;
     cmd.buffer_id      = priv->slot;
 
-    ret = cxi_cq_emit_target(iface->tgt.cmdq, &cmd);
-    if (ucs_unlikely(ret != 0)) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-    cxi_cq_ring(iface->tgt.cmdq);
-    return UCS_OK;
+    /* The UNLINK must not be lost to a full command queue: for force=1 the
+     * cancel is already "assumed successful" by UCP, which will not retry
+     * it. A deferred UNLINK still goes out before any later APPEND, since
+     * uct_cxi_iface_tgt_post() keeps order and tag_recv_zcopy() refuses new
+     * receives while anything is deferred. */
+    status = uct_cxi_iface_tgt_post(iface, &cmd);
+    return UCS_STATUS_IS_ERR(status) ? status : UCS_OK;
 }
