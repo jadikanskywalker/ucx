@@ -292,6 +292,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     /* Per-peer unexpected-rndv header cache -- see uct_cxi_rndv_peer_hdr_t
      * in cxi_iface.h. Growable, starts empty; never fails to init. */
     kh_init_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
+    kh_init_inplace(uct_cxi_eager_pair_hash, &self->tag.eager_pairs);
 
     /* Software-issued (get_issued==0) rendezvous Get tracking pool -- see
      * uct_cxi_rdzv_get_op_t in cxi_tag.h. Capped the same as
@@ -444,6 +445,7 @@ err_unmap_rx:
 err_cleanup_rdzv_get_op_pool:
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
 err_free_rndv_peer_cache:
+    kh_destroy_inplace(uct_cxi_eager_pair_hash, &self->tag.eager_pairs);
     kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
 err_free_cancel_ctx:
     ucs_free(self->tag.cancel_ctx);
@@ -484,6 +486,7 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
 
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
     uct_cxi_iface_tag_unexp_cleanup(self);
+    kh_destroy_inplace(uct_cxi_eager_pair_hash, &self->tag.eager_pairs);
     kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     ucs_free(self->tag.cancel_ctx);
     ucs_free(self->tag.free_list);
@@ -1403,6 +1406,107 @@ static void uct_cxi_unexp_rndv_lost(uct_cxi_iface_t *iface,
     uct_cxi_iface_unexp_progress(iface);
 }
 
+/* -------------------------------------------------------------------------
+ * Pairing the two events of an unexpected eager message
+ * -------------------------------------------------------------------------
+ */
+
+static void uct_cxi_tag_found_eager(uct_cxi_iface_t *iface,
+                                    const union c_event *event);
+static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
+                                             const union c_event *event);
+
+/*
+ * A match event (a posted receive's delayed match, or our SEARCH_AND_DELETE's
+ * find) of an eager message with data is about to be handled: it copies from
+ * the overflow buffer, so it may only be once the message's arrival event has
+ * been seen -- the Put that was written after its data (see
+ * uct_cxi_eager_pair_t). Returns 1 if it has, and the match goes on. If not,
+ * the event is kept for uct_cxi_eager_arrived() to carry on with, and 0 is
+ * returned.
+ */
+static int uct_cxi_eager_match_ready(uct_cxi_iface_t *iface,
+                                     const union c_event *event, int is_found)
+{
+    uct_cxi_eager_pair_t *pair;
+    khiter_t              k;
+    int                   ret;
+
+    k = kh_get(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs,
+               event->tgt_long.start);
+    if (k != kh_end(&iface->tag.eager_pairs)) {
+        pair = &kh_value(&iface->tag.eager_pairs, k);
+        if (ucs_likely(!pair->parked)) {
+            kh_del(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs, k);
+            return 1;
+        }
+        ucs_error("cxi TAG a second match for the unexpected eager message "
+                  "at 0x%lx", (unsigned long)event->tgt_long.start);
+        return 0;
+    }
+
+    k = kh_put(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs,
+               event->tgt_long.start, &ret);
+    if (ucs_unlikely(ret == UCS_KH_PUT_FAILED)) {
+        ucs_error("cxi TAG cannot wait for the arrival of the unexpected "
+                  "eager message at 0x%lx: out of memory",
+                  (unsigned long)event->tgt_long.start);
+        return 1;
+    }
+
+    pair           = &kh_value(&iface->tag.eager_pairs, k);
+    pair->parked   = 1;
+    pair->is_found = is_found;
+    pair->event    = *event;
+    ucs_debug("cxi TAG [EAGER-MATCH-EARLY] start=0x%lx %s before its arrival",
+              (unsigned long)event->tgt_long.start,
+              is_found ? "found" : "delayed match");
+    return 0;
+}
+
+/*
+ * The arrival event of an unexpected eager message with data has been
+ * handled. If its match came first, carry on with it now; if not, note the
+ * arrival for the match.
+ */
+static void uct_cxi_eager_arrived(uct_cxi_iface_t *iface,
+                                  const union c_event *event)
+{
+    uct_cxi_eager_pair_t pair;
+    khiter_t             k;
+    int                  ret;
+
+    k = kh_get(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs,
+               event->tgt_long.start);
+    if (k == kh_end(&iface->tag.eager_pairs)) {
+        k = kh_put(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs,
+                   event->tgt_long.start, &ret);
+        if (ucs_unlikely(ret == UCS_KH_PUT_FAILED)) {
+            ucs_error("cxi TAG cannot note the arrival of the unexpected "
+                      "eager message at 0x%lx: out of memory",
+                      (unsigned long)event->tgt_long.start);
+            return;
+        }
+        kh_value(&iface->tag.eager_pairs, k).parked = 0;
+        return;
+    }
+
+    pair = kh_value(&iface->tag.eager_pairs, k);
+    kh_del(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs, k);
+    if (!pair.parked) {
+        ucs_error("cxi TAG a second arrival of the unexpected eager message "
+                  "at 0x%lx", (unsigned long)event->tgt_long.start);
+        return;
+    }
+
+    /* The handlers may call into UCP; nothing of ours is referenced after. */
+    if (pair.is_found) {
+        uct_cxi_tag_found_eager(iface, &pair.event);
+    } else {
+        uct_cxi_tag_eager_match_complete(iface, &pair.event);
+    }
+}
+
 /*
  * uct_cxi_iface_tag_handle_search_delete_confirm_eager -- the "found and
  * deleted" confirmation of our SEARCH_AND_DELETE for an unexpected eager
@@ -1412,9 +1516,8 @@ static void uct_cxi_unexp_rndv_lost(uct_cxi_iface_t *iface,
  * must hear of it first, and this waits behind it. The test costs one load
  * when no rendezvous is held.
  */
-void
-uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
-                                                     const union c_event *event)
+static void uct_cxi_tag_found_eager(uct_cxi_iface_t *iface,
+                                    const union c_event *event)
 {
     if (ucs_unlikely(iface->tag.unexp_held != 0) &&
         (cxi_event_rc(event) == C_RC_OK) &&
@@ -1431,6 +1534,18 @@ uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
     }
 
     uct_cxi_iface_tag_report_unexp_eager(iface, event);
+}
+
+void
+uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
+                                                     const union c_event *event)
+{
+    if ((cxi_event_rc(event) == C_RC_OK) && (event->tgt_long.mlength > 0) &&
+        !uct_cxi_eager_match_ready(iface, event, 1)) {
+        return; /* its arrival is yet to come: see uct_cxi_eager_arrived() */
+    }
+
+    uct_cxi_tag_found_eager(iface, event);
 }
 
 /*
@@ -1628,6 +1743,8 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     if (event->tgt_long.rendezvous) {
         /* The address read goes out alongside the SEARCH_AND_DELETE. */
         uct_cxi_iface_unexp_progress(iface);
+    } else if (event->tgt_long.mlength > 0) {
+        uct_cxi_eager_arrived(iface, event);
     }
 }
 
@@ -1784,7 +1901,7 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
 }
 
 /*
- * uct_cxi_iface_tag_handle_eager_match -- a plain eager match, either
+ * uct_cxi_tag_eager_match_complete -- a plain eager match, either
  * direct (C_EVENT_PUT, ptl_list==PRIORITY) or via delayed correlation
  * (C_EVENT_PUT_OVERFLOW). Never called for a rendezvous-flagged event --
  * see iface_progress()'s own dispatch.
@@ -1835,8 +1952,8 @@ uct_cxi_iface_tag_match_lookup(uct_cxi_iface_t *iface,
  * released regardless, since the normal path below that would otherwise do
  * it never runs on this branch.
  */
-void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
-                                          const union c_event *event)
+static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
+                                             const union c_event *event)
 {
     int                      slot;
     uct_tag_context_t      *ctx;
@@ -1906,6 +2023,26 @@ void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
 
     ctx->tag_consumed_cb(ctx);
     ctx->completed_cb(ctx, stag, imm, mlength, NULL, status);
+}
+
+/*
+ * uct_cxi_iface_tag_handle_eager_match -- see uct_cxi_tag_eager_match_complete()
+ * above. A delayed match with data waits for the message's arrival event first
+ * (uct_cxi_eager_match_ready()): the NIC raises the match from its command
+ * pipeline and the arrival from its message pipeline, so the match can be
+ * seen before the payload is in the overflow buffer (seen on hardware: stale
+ * ring contents copied for the first message into a fresh ring).
+ */
+void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
+                                          const union c_event *event)
+{
+    if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
+        (event->tgt_long.mlength > 0) &&
+        !uct_cxi_eager_match_ready(iface, event, 0)) {
+        return; /* its arrival is yet to come: see uct_cxi_eager_arrived() */
+    }
+
+    uct_cxi_tag_eager_match_complete(iface, event);
 }
 
 /*

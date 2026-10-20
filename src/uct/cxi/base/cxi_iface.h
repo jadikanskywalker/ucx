@@ -285,6 +285,27 @@ typedef struct uct_cxi_rndv_peer_hdr {
 KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
 
 /**
+ * One unexpected eager message with data, as far as its two events are
+ * concerned: the Put into the overflow list (arrival), and the event that
+ * takes it out of the list (a posted receive matched it, or our
+ * SEARCH_AND_DELETE found it). They are produced by different pipelines of the
+ * NIC and either can be seen first; the data is only known to be in the
+ * overflow buffer once the arrival has been, so whichever comes first waits
+ * for the other (iface->tag.eager_pairs, keyed by the message's address in
+ * the overflow buffer, which both carry). Same as libfabric's
+ * match_put_event().
+ */
+typedef struct uct_cxi_eager_pair {
+    uint8_t       parked;    /**< 0: the arrival was seen and waits for its
+                                  match; 1: a match was seen and waits for
+                                  its arrival, and is kept in `event` */
+    uint8_t       is_found;  /**< parked: the SEARCH_AND_DELETE's find, not a
+                                  posted receive's match */
+    union c_event event;
+} uct_cxi_eager_pair_t;
+KHASH_MAP_INIT_INT64(uct_cxi_eager_pair_hash, uct_cxi_eager_pair_t)
+
+/**
  * Event queue state: the hardware EQ, its backing buffer, and the sizing,
  * drain-gated PTE recovery, and preemptive-growth state that belong to it.
  * The iface owns two (rx_eq, tx_eq), hence a struct rather than loose
@@ -558,6 +579,10 @@ typedef struct uct_cxi_iface {
          * handle_rndv_hdr_announce() (cxi_tag.c), the receive-side handler
          * for each peer's one-time control-message announce. */
         khash_t(uct_cxi_rndv_peer_hash) rndv_peer_cache;
+
+        /* Unexpected eager messages with data that have had one of their
+         * two events, see uct_cxi_eager_pair_t. */
+        khash_t(uct_cxi_eager_pair_hash) eager_pairs;
 
         /* Unexpected messages our SEARCH_AND_DELETE has taken off the
          * hardware list and that are waiting to be reported to UCP -- see
