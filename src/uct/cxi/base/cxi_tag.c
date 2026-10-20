@@ -94,6 +94,12 @@ static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
  * it, as every message in it is an unexpected arrival we are yet to report.
  * Registered because each entry is also the landing buffer of its own address
  * read. Only LAC 0 can be reached by the senders' RMA PTEs.
+ *
+ * With them, the streams (one per sender and tag that has an entry, so at
+ * most as many as entries) and the table to find a stream by that key,
+ * sized for all of them so that it never has to grow. (khash still
+ * rehashes, with a temporary allocation, when deleted keys pile up; a put
+ * that fails then is reported, as a stream that could not be made.)
  */
 static ucs_status_t
 uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
@@ -105,22 +111,46 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
     unsigned     i;
     int          ret;
 
-    /* The fields the scans of unexp_q compare share the first cache line. */
+    /* The fields that are looked at along a stream's chain share the first
+     * cache line. */
     UCS_STATIC_ASSERT(ucs_offsetof(uct_cxi_unexp_report_t, flags) <
                       UCS_SYS_CACHE_LINE_SIZE);
 
-    ucs_queue_head_init(&self->tag.unexp_q);
-    self->tag.unexp_held     = 0;
-    self->tag.unexp_busy     = 0;
-    self->tag.unexp_ents     = NULL;
-    self->tag.unexp_free     = NULL;
-    self->tag.unexp_ents_len = 0;
+    kh_init_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
+    ucs_list_head_init(&self->tag.unexp_wait);
+    self->tag.unexp_held        = 0;
+    self->tag.unexp_seq         = 0;
+    self->tag.unexp_ents        = NULL;
+    self->tag.unexp_free        = NULL;
+    self->tag.unexp_ents_len    = 0;
+    self->tag.unexp_stream_pool = NULL;
+    self->tag.unexp_stream_free = NULL;
+
+    self->tag.unexp_stream_pool = ucs_calloc(self->tag.max_outstanding,
+                                             sizeof(uct_cxi_unexp_stream_t),
+                                             "cxi-tag-unexp-streams");
+    if (self->tag.unexp_stream_pool == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_streams;
+    }
+    for (i = 0; i < self->tag.max_outstanding; i++) {
+        self->tag.unexp_stream_pool[i].next_free =
+                (i + 1 < self->tag.max_outstanding) ?
+                &self->tag.unexp_stream_pool[i + 1] : NULL;
+    }
+    self->tag.unexp_stream_free = &self->tag.unexp_stream_pool[0];
+    if (kh_resize(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams,
+                  2 * self->tag.max_outstanding) < 0) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_streams;
+    }
 
     ret = ucs_posix_memalign((void **)&self->tag.unexp_ents, page, len,
                              "cxi-tag-unexp-reports");
     if (ret != 0) {
         self->tag.unexp_ents = NULL;
-        return UCS_ERR_NO_MEMORY;
+        status               = UCS_ERR_NO_MEMORY;
+        goto err_streams;
     }
     memset(self->tag.unexp_ents, 0, len);
 
@@ -151,6 +181,10 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
 err_free:
     ucs_free(self->tag.unexp_ents);
     self->tag.unexp_ents = NULL;
+err_streams:
+    ucs_free(self->tag.unexp_stream_pool);
+    self->tag.unexp_stream_pool = NULL;
+    kh_destroy_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
     return status;
 }
 
@@ -166,6 +200,10 @@ static void uct_cxi_iface_tag_unexp_cleanup(uct_cxi_iface_t *self)
     self->tag.unexp_ents     = NULL;
     self->tag.unexp_free     = NULL;
     self->tag.unexp_ents_len = 0;
+    ucs_free(self->tag.unexp_stream_pool);
+    self->tag.unexp_stream_pool = NULL;
+    self->tag.unexp_stream_free = NULL;
+    kh_destroy_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
 }
 
 /*
@@ -957,19 +995,106 @@ uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
  * -------------------------------------------------------------------------
  */
 
-#define UCT_CXI_UNEXP_BLOCKED_MAX  8
-
 static void uct_cxi_unexp_read_comp(uct_cxi_send_op_t *op, ucs_status_t status);
 
-/* Take an entry for \a event, with \a flags already seen, and put it at the
- * end of the queue. NULL if all are in use. */
+/* The stream of \a initiator's messages with \a tag, NULL if none of them is
+ * held. */
+static uct_cxi_unexp_stream_t *
+uct_cxi_unexp_stream_find(uct_cxi_iface_t *iface, uint32_t initiator,
+                          uint64_t tag)
+{
+    uct_cxi_unexp_key_t key = {};
+    khiter_t            k;
+
+    key.tag       = tag;
+    key.initiator = initiator;
+    k = kh_get(uct_cxi_unexp_stream_hash, &iface->tag.unexp_streams, key);
+    return (k == kh_end(&iface->tag.unexp_streams)) ? NULL :
+           kh_value(&iface->tag.unexp_streams, k);
+}
+
+/* As above, making the stream if there is none. NULL if all are in use. */
+static uct_cxi_unexp_stream_t *
+uct_cxi_unexp_stream_get(uct_cxi_iface_t *iface, uint32_t initiator,
+                         uint64_t tag)
+{
+    uct_cxi_unexp_stream_t *stream = uct_cxi_unexp_stream_find(iface, initiator,
+                                                               tag);
+    uct_cxi_unexp_key_t     key    = {};
+    khiter_t                k;
+    int                     ret;
+
+    if (stream != NULL) {
+        return stream;
+    }
+
+    stream = iface->tag.unexp_stream_free;
+    if (stream == NULL) {
+        return NULL;
+    }
+
+    key.tag       = tag;
+    key.initiator = initiator;
+    k = kh_put(uct_cxi_unexp_stream_hash, &iface->tag.unexp_streams, key,
+               &ret);
+    if (ucs_unlikely(ret == UCS_KH_PUT_FAILED)) {
+        return NULL;
+    }
+
+    iface->tag.unexp_stream_free = stream->next_free;
+    kh_value(&iface->tag.unexp_streams, k) = stream;
+    ucs_list_head_init(&stream->entries);
+    stream->tag       = tag;
+    stream->initiator = initiator;
+    stream->num_early = 0;
+    stream->busy      = 0;
+    return stream;
+}
+
+/* Give back a stream with nothing left in it, unless it is being advanced:
+ * that is the end of that, and the one to do it. */
+static void uct_cxi_unexp_stream_put(uct_cxi_iface_t *iface,
+                                     uct_cxi_unexp_stream_t *stream)
+{
+    uct_cxi_unexp_key_t key = {};
+    khiter_t            k;
+
+    if (stream->busy || !ucs_list_is_empty(&stream->entries)) {
+        return;
+    }
+
+    key.tag       = stream->tag;
+    key.initiator = stream->initiator;
+    k = kh_get(uct_cxi_unexp_stream_hash, &iface->tag.unexp_streams, key);
+    ucs_assert(k != kh_end(&iface->tag.unexp_streams));
+    kh_del(uct_cxi_unexp_stream_hash, &iface->tag.unexp_streams, k);
+
+    stream->next_free            = iface->tag.unexp_stream_free;
+    iface->tag.unexp_stream_free = stream;
+}
+
+/* Take an entry for \a event, with \a flags already seen, and put it in the
+ * chain of its stream where \a seq, the number of its arrival, puts it: at the
+ * end, unless a later arrival has an entry already (an eager message is held
+ * only when its SEARCH_AND_DELETE finds it, which can be after the arrival of
+ * a rendezvous that was sent after it). NULL if all entries or streams are in
+ * use. */
 static uct_cxi_unexp_report_t *
 uct_cxi_unexp_alloc(uct_cxi_iface_t *iface, const union c_event *event,
-                    int is_rndv, uint8_t flags)
+                    int is_rndv, uint8_t flags, uint64_t seq)
 {
+    ucs_list_link_t        *pos;
     uct_cxi_unexp_report_t *e = iface->tag.unexp_free;
+    uct_cxi_unexp_stream_t *stream;
 
     if (e == NULL) {
+        return NULL;
+    }
+
+    stream = uct_cxi_unexp_stream_get(iface,
+                                      event->tgt_long.initiator.initiator.process,
+                                      event->tgt_long.match_bits);
+    if (stream == NULL) {
         return NULL;
     }
 
@@ -979,28 +1104,42 @@ uct_cxi_unexp_alloc(uct_cxi_iface_t *iface, const union c_event *event,
     e->op.handler         = uct_cxi_unexp_read_comp;
     e->iface              = iface;
     e->event              = *event;
-    e->initiator          = event->tgt_long.initiator.initiator.process;
-    e->tag                = event->tgt_long.match_bits;
+    e->stream             = stream;
+    e->initiator          = stream->initiator;
+    e->tag                = stream->tag;
     e->rendezvous_id      = event->tgt_long.rendezvous_id;
     e->is_rndv            = is_rndv;
     e->state              = is_rndv ? UCT_CXI_UNEXP_NEW : UCT_CXI_UNEXP_READY;
     e->flags              = flags;
     e->value              = 0;
-    ucs_queue_push(&iface->tag.unexp_q, &e->queue);
+    e->seq                = seq;
+    ucs_list_head_init(&e->wait);
+    pos = stream->entries.prev;
+    while ((pos != &stream->entries) &&
+           (ucs_container_of(pos, uct_cxi_unexp_report_t, link)->seq > seq)) {
+        pos = pos->prev;
+    }
+    ucs_list_insert_after(pos, &e->link);
+    stream->num_early += !(flags & UCT_CXI_UNEXP_ARRIVED);
     iface->tag.unexp_held += is_rndv;
     return e;
 }
 
-/* Take an entry off the queue; it is not free until uct_cxi_unexp_free(). */
-static void uct_cxi_unexp_dequeue(uct_cxi_iface_t *iface,
-                                  uct_cxi_unexp_report_t *e,
-                                  ucs_queue_iter_t iter)
+/* Take an entry off its chain; it is not free until uct_cxi_unexp_free(), and
+ * its stream, if now empty, is the caller's to give back. */
+static void uct_cxi_unexp_unlink(uct_cxi_iface_t *iface,
+                                 uct_cxi_unexp_report_t *e)
 {
-    ucs_queue_del_iter(&iface->tag.unexp_q, iter);
+    ucs_list_del(&e->link);
+    e->stream->num_early -= !(e->flags & UCT_CXI_UNEXP_ARRIVED);
     iface->tag.unexp_held -= e->is_rndv;
+    if (!ucs_list_is_empty(&e->wait)) {
+        ucs_list_del(&e->wait);
+        ucs_list_head_init(&e->wait);
+    }
 }
 
-/* Give back an entry that is off the queue. */
+/* Give back an entry that is off its chain. */
 static void uct_cxi_unexp_free(uct_cxi_iface_t *iface,
                                uct_cxi_unexp_report_t *e)
 {
@@ -1008,62 +1147,74 @@ static void uct_cxi_unexp_free(uct_cxi_iface_t *iface,
     iface->tag.unexp_free = e;
 }
 
+/* The arrival of an entry is seen. */
+static void uct_cxi_unexp_set_arrived(uct_cxi_unexp_report_t *e)
+{
+    e->stream->num_early -= !(e->flags & UCT_CXI_UNEXP_ARRIVED);
+    e->flags             |= UCT_CXI_UNEXP_ARRIVED;
+}
+
 /* A rendezvous that is not ours, now that it has arrived: nothing is left to
  * wait for, but its address read, if one is on its way. */
 static void uct_cxi_unexp_discard(uct_cxi_iface_t *iface,
-                                  uct_cxi_unexp_report_t *e,
-                                  ucs_queue_iter_t iter)
+                                  uct_cxi_unexp_report_t *e)
 {
-    uct_cxi_unexp_dequeue(iface, e, iter);
+    uct_cxi_unexp_unlink(iface, e);
     if (e->state != UCT_CXI_UNEXP_READING) {
         uct_cxi_unexp_free(iface, e);
     } /* else uct_cxi_unexp_read_comp() frees it: the read cannot be undone */
 }
 
 /*
- * The entry of the rendezvous \a event is about, that has not had the
- * event(s) in \a absent yet: the oldest one, as the sender reuses a
- * rendezvous_id only after the message with it was pulled, and by then a
- * lost one has had all it will have (and is off the queue).
+ * The entry of the rendezvous \a event is about in \a stream, that has not
+ * had the event(s) in \a absent yet: the oldest one, as the sender reuses a
+ * rendezvous_id only after the message with it was pulled, and by then a lost
+ * one has had all it will have (and is off the chain). A stream is short, and
+ * an event is for an entry at or near its head when events come in the order
+ * of the messages: this is not a scan of everything held.
  */
 static uct_cxi_unexp_report_t *
-uct_cxi_unexp_find(uct_cxi_iface_t *iface, const union c_event *event,
-                   unsigned absent, ucs_queue_iter_t *iter_p)
+uct_cxi_unexp_find(uct_cxi_unexp_stream_t *stream, const union c_event *event,
+                   unsigned absent)
 {
-    uint32_t                initiator = event->tgt_long.initiator.initiator.process;
-    uint8_t                 id        = event->tgt_long.rendezvous_id;
+    uint8_t                 id = event->tgt_long.rendezvous_id;
     uct_cxi_unexp_report_t *e;
-    ucs_queue_iter_t        iter;
 
-    ucs_queue_for_each_safe(e, iter, &iface->tag.unexp_q, queue) {
-        if (e->is_rndv && (e->initiator == initiator) &&
-            (e->rendezvous_id == id) && !(e->flags & absent)) {
-            *iter_p = iter;
+    if ((absent == UCT_CXI_UNEXP_ARRIVED) && (stream->num_early == 0)) {
+        return NULL; /* every one of them has arrived already */
+    }
+
+    ucs_list_for_each(e, &stream->entries, link) {
+        if (e->is_rndv && (e->rendezvous_id == id) && !(e->flags & absent)) {
             return e;
         }
     }
     return NULL;
 }
 
-/* The same message stream as far as ordering goes: one sender, one tag. */
-static UCS_F_ALWAYS_INLINE int
-uct_cxi_unexp_same_stream(const uct_cxi_unexp_report_t *e, uint32_t initiator,
-                          uint64_t tag)
-{
-    return (e->initiator == initiator) &&
-           (e->tag == tag);
-}
-
-/* Is anything of this sender's stream with this tag waiting to be reported? */
-static UCS_F_ALWAYS_INLINE int
-uct_cxi_unexp_is_held(uct_cxi_iface_t *iface, uint32_t initiator,
-                      uint64_t tag)
+/* The first entry of \a stream that is not a tombstone, NULL if none. */
+static uct_cxi_unexp_report_t *
+uct_cxi_unexp_head(uct_cxi_unexp_stream_t *stream)
 {
     uct_cxi_unexp_report_t *e;
 
-    ucs_queue_for_each(e, &iface->tag.unexp_q, queue) {
-        if (!(e->flags & UCT_CXI_UNEXP_LOST) &&
-            uct_cxi_unexp_same_stream(e, initiator, tag)) {
+    ucs_list_for_each(e, &stream->entries, link) {
+        if (!(e->flags & UCT_CXI_UNEXP_LOST)) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* Is an entry of \a stream that is arrived earlier than \a seq still held (not
+ * a tombstone)? Then a message with that number must wait behind it. */
+static int uct_cxi_unexp_has_older(uct_cxi_unexp_stream_t *stream,
+                                   uint64_t seq)
+{
+    uct_cxi_unexp_report_t *e;
+
+    ucs_list_for_each(e, &stream->entries, link) {
+        if (!(e->flags & UCT_CXI_UNEXP_LOST) && (e->seq < seq)) {
             return 1;
         }
     }
@@ -1135,91 +1286,49 @@ static ucs_status_t uct_cxi_unexp_start_read(uct_cxi_iface_t *iface,
     return UCS_OK;
 }
 
-/* Post the address read of every rendezvous that has not had it posted and
- * can: whose sender is known, and that is not already known to be lost. */
-static void uct_cxi_unexp_start_reads(uct_cxi_iface_t *iface)
-{
-    uct_cxi_unexp_report_t *e;
-    ucs_queue_iter_t        iter;
-
-    ucs_queue_for_each_safe(e, iter, &iface->tag.unexp_q, queue) {
-        ucs_status_t status;
-
-        if (!e->is_rndv || (e->state != UCT_CXI_UNEXP_NEW) ||
-            (e->flags & UCT_CXI_UNEXP_LOST)) {
-            continue;
-        }
-
-        status = uct_cxi_unexp_start_read(iface, e);
-        if (status == UCS_OK) {
-            e->state = UCT_CXI_UNEXP_READING;
-        } else if (status != UCS_ERR_NO_ELEM) {
-            ucs_error("cxi TAG cannot read the source address of an "
-                      "unexpected rendezvous: %s",
-                      ucs_status_string(status));
-            e->state = UCT_CXI_UNEXP_FAILED;
-        }
-        /* NO_ELEM: the announce handler brings us back. */
-    }
-}
-
 /*
- * The first entry that can be reported now: ready itself (a rendezvous: ours,
- * and with its address), and with nothing of the same stream (sender and tag)
- * ahead of it that is not. A lost one is nobody's to wait for. Entries of other
- * streams do not wait for one another. Only a few waiting streams are
- * tracked: past that, nothing behind them is reported until they are, which
- * is slower, not wrong.
+ * Post the address read of the rendezvous \a e if it can be: not yet posted,
+ * its sender known, and it is not known to be lost. If the sender is not
+ * known (its announce is not seen), the entry waits for the announce handler.
  */
-static uct_cxi_unexp_report_t *
-uct_cxi_unexp_next_ready(uct_cxi_iface_t *iface, ucs_queue_iter_t *iter_p)
+static void uct_cxi_unexp_start(uct_cxi_iface_t *iface,
+                                uct_cxi_unexp_report_t *e)
 {
-    struct {
-        uint32_t initiator;
-        uint64_t tag;
-    }                       blocked[UCT_CXI_UNEXP_BLOCKED_MAX];
-    unsigned                num_blocked = 0;
-    uct_cxi_unexp_report_t *e;
-    ucs_queue_iter_t        iter;
+    ucs_status_t status;
 
-    ucs_queue_for_each_safe(e, iter, &iface->tag.unexp_q, queue) {
-        unsigned i;
-        int      is_blocked = 0;
-
-        for (i = 0; i < num_blocked; i++) {
-            if ((blocked[i].initiator == e->initiator) &&
-                (blocked[i].tag == e->tag)) {
-                is_blocked = 1;
-                break;
-            }
-        }
-        if (is_blocked || (e->flags & UCT_CXI_UNEXP_LOST)) {
-            continue;
-        }
-
-        if (!e->is_rndv ||
-            (((e->flags & (UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED)) ==
-              (UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED)) &&
-             ((e->state == UCT_CXI_UNEXP_READY) ||
-              (e->state == UCT_CXI_UNEXP_FAILED)))) {
-            *iter_p = iter;
-            return e;
-        }
-
-        if (num_blocked == UCT_CXI_UNEXP_BLOCKED_MAX) {
-            return NULL;
-        }
-        blocked[num_blocked].initiator = e->initiator;
-        blocked[num_blocked].tag       = e->tag;
-        num_blocked++;
+    if (!e->is_rndv || (e->state != UCT_CXI_UNEXP_NEW) ||
+        (e->flags & UCT_CXI_UNEXP_LOST) || !ucs_list_is_empty(&e->wait)) {
+        return;
     }
 
-    return NULL;
+    status = uct_cxi_unexp_start_read(iface, e);
+    if (status == UCS_OK) {
+        e->state = UCT_CXI_UNEXP_READING;
+    } else if (status == UCS_ERR_NO_ELEM) {
+        ucs_list_add_tail(&iface->tag.unexp_wait, &e->wait);
+    } else {
+        ucs_error("cxi TAG cannot read the source address of an unexpected "
+                  "rendezvous: %s", ucs_status_string(status));
+        e->state = UCT_CXI_UNEXP_FAILED;
+    }
+}
+
+/* Can \a e be reported to UCP, as far as it itself goes? A rendezvous must be
+ * ours, and have its address (or know it can not get it). */
+static UCS_F_ALWAYS_INLINE int
+uct_cxi_unexp_is_ready(const uct_cxi_unexp_report_t *e)
+{
+    return !e->is_rndv ||
+           (((e->flags & (UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED)) ==
+             (UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED)) &&
+            ((e->state == UCT_CXI_UNEXP_READY) ||
+             (e->state == UCT_CXI_UNEXP_FAILED)));
 }
 
 /*
- * Report \a e to UCP and give it back. The entry is released first and the
- * report made from copies, as the callback may re-enter progress.
+ * Report \a e, which is off its stream's chain, to UCP and give it back. The
+ * entry is released first and the report made from copies, as the callback
+ * may re-enter progress.
  *
  * For a rendezvous, rndv_cb gets what UCP's later pull needs:
  *   - header/header_length: this sender's cached {ep_id, md_index} (its
@@ -1277,26 +1386,33 @@ static void uct_cxi_unexp_report(uct_cxi_iface_t *iface,
                              addr, event.tgt_long.rlength, &rkey);
 }
 
-void uct_cxi_iface_unexp_progress(uct_cxi_iface_t *iface)
+/*
+ * Report what can be of \a stream, in order: the entry at the head of its
+ * chain, if it is ready, and then the next, until one is not. Anything behind
+ * an entry that is not ready waits for it, and only these are looked at: other
+ * streams do not wait for this one.
+ *
+ * A report can call into UCP, which may make progress again on this interface
+ * and bring events for this stream: while busy the stream is not advanced
+ * again nor given back, and this loop picks up what they did.
+ */
+static void uct_cxi_unexp_advance(uct_cxi_iface_t *iface,
+                                  uct_cxi_unexp_stream_t *stream)
 {
     uct_cxi_unexp_report_t *e;
-    ucs_queue_iter_t        iter;
 
-    /* A report can call into UCP, which may make progress again on this
-     * interface: whatever that adds is for this call to get to. */
-    if (iface->tag.unexp_busy) {
+    if (stream->busy) {
         return;
     }
-    iface->tag.unexp_busy = 1;
 
-    uct_cxi_unexp_start_reads(iface);
-    while ((e = uct_cxi_unexp_next_ready(iface, &iter)) != NULL) {
-        uct_cxi_unexp_dequeue(iface, e, iter);
+    stream->busy = 1;
+    while (((e = uct_cxi_unexp_head(stream)) != NULL) &&
+           uct_cxi_unexp_is_ready(e)) {
+        uct_cxi_unexp_unlink(iface, e);
         uct_cxi_unexp_report(iface, e);
-        uct_cxi_unexp_start_reads(iface);
     }
-
-    iface->tag.unexp_busy = 0;
+    stream->busy = 0;
+    uct_cxi_unexp_stream_put(iface, stream);
 }
 
 /* An address read is over. */
@@ -1307,36 +1423,86 @@ static void uct_cxi_unexp_read_comp(uct_cxi_send_op_t *op, ucs_status_t status)
     e->state = (status == UCS_OK) ? UCT_CXI_UNEXP_READY :
                                     UCT_CXI_UNEXP_FAILED;
     if (e->flags & UCT_CXI_UNEXP_LOST) {
-        /* Its message went to a receive; this read was for nothing. */
+        /* Its message went to a receive; this read was for nothing. It is
+         * off its chain, which may be gone too. */
         uct_cxi_unexp_free(e->iface, e);
         return;
     }
-    uct_cxi_iface_unexp_progress(e->iface);
+    uct_cxi_unexp_advance(e->iface, e->stream);
+}
+
+/* Advance the stream of the rendezvous \a event is about, if there is one. */
+static void uct_cxi_unexp_advance_event(uct_cxi_iface_t *iface,
+                                        const union c_event *event)
+{
+    uct_cxi_unexp_stream_t *stream =
+            uct_cxi_unexp_stream_find(iface,
+                                      event->tgt_long.initiator.initiator.process,
+                                      event->tgt_long.match_bits);
+
+    if (stream != NULL) {
+        uct_cxi_unexp_advance(iface, stream);
+    }
+}
+
+/*
+ * The announce of \a initiator has been seen: post the address reads of its
+ * rendezvous that were waiting for it. The wait list is looked at again from
+ * the start after each, as a failed read is reported, which can call into UCP.
+ */
+static void uct_cxi_unexp_announced(uct_cxi_iface_t *iface, uint32_t initiator)
+{
+    uct_cxi_unexp_report_t *e;
+
+    for (;;) {
+        ucs_list_for_each(e, &iface->tag.unexp_wait, wait) {
+            if (e->initiator == initiator) {
+                break;
+            }
+        }
+        if (&e->wait == &iface->tag.unexp_wait) {
+            return;
+        }
+
+        ucs_list_del(&e->wait);
+        ucs_list_head_init(&e->wait);
+        uct_cxi_unexp_start(iface, e);
+        if (e->state == UCT_CXI_UNEXP_FAILED) {
+            uct_cxi_unexp_advance(iface, e->stream);
+        }
+    }
 }
 
 /* The rendezvous \a event is about has arrived in the overflow list. */
 static void uct_cxi_unexp_rndv_arrived(uct_cxi_iface_t *iface,
-                                       const union c_event *event)
+                                       const union c_event *event,
+                                       uint64_t seq)
 {
-    ucs_queue_iter_t        iter;
-    uct_cxi_unexp_report_t *e = uct_cxi_unexp_find(iface, event,
-                                                   UCT_CXI_UNEXP_ARRIVED,
-                                                   &iter);
+    uct_cxi_unexp_stream_t *stream =
+            uct_cxi_unexp_stream_find(iface,
+                                      event->tgt_long.initiator.initiator.process,
+                                      event->tgt_long.match_bits);
+    uct_cxi_unexp_report_t *e = (stream == NULL) ? NULL :
+            uct_cxi_unexp_find(stream, event, UCT_CXI_UNEXP_ARRIVED);
 
     if (e == NULL) {
-        if (ucs_unlikely(uct_cxi_unexp_alloc(iface, event, 1,
-                                             UCT_CXI_UNEXP_ARRIVED) == NULL)) {
+        e = uct_cxi_unexp_alloc(iface, event, 1, UCT_CXI_UNEXP_ARRIVED, seq);
+        if (ucs_unlikely(e == NULL)) {
             ucs_error("cxi TAG no free entry to track an unexpected "
                       "rendezvous, tag=0x%lx initiator=0x%x",
                       (unsigned long)event->tgt_long.match_bits,
                       (unsigned)event->tgt_long.initiator.initiator.process);
+            return;
         }
+        uct_cxi_unexp_start(iface, e);
         return;
     }
 
-    e->flags |= UCT_CXI_UNEXP_ARRIVED;
+    uct_cxi_unexp_set_arrived(e);
     if (e->flags & UCT_CXI_UNEXP_LOST) {
-        uct_cxi_unexp_discard(iface, e, iter); /* the tombstone */
+        uct_cxi_unexp_discard(iface, e); /* the tombstone */
+    } else {
+        uct_cxi_unexp_start(iface, e);
     }
 }
 
@@ -1345,23 +1511,30 @@ static void uct_cxi_unexp_rndv_arrived(uct_cxi_iface_t *iface,
 static void uct_cxi_unexp_rndv_owned(uct_cxi_iface_t *iface,
                                      const union c_event *event)
 {
-    ucs_queue_iter_t        iter;
-    uct_cxi_unexp_report_t *e = uct_cxi_unexp_find(iface, event,
-                                                   UCT_CXI_UNEXP_OWNED |
-                                                   UCT_CXI_UNEXP_LOST, &iter);
+    uct_cxi_unexp_stream_t *stream =
+            uct_cxi_unexp_stream_find(iface,
+                                      event->tgt_long.initiator.initiator.process,
+                                      event->tgt_long.match_bits);
+    uct_cxi_unexp_report_t *e = (stream == NULL) ? NULL :
+            uct_cxi_unexp_find(stream, event,
+                               UCT_CXI_UNEXP_OWNED | UCT_CXI_UNEXP_LOST);
 
     if (e != NULL) {
         e->flags |= UCT_CXI_UNEXP_OWNED;
-    } else if (ucs_unlikely(uct_cxi_unexp_alloc(iface, event, 1,
-                                                UCT_CXI_UNEXP_OWNED) == NULL)) {
-        ucs_error("cxi TAG no free entry to hold an unexpected rendezvous, "
-                  "tag=0x%lx initiator=0x%x -- dropped",
-                  (unsigned long)event->tgt_long.match_bits,
-                  (unsigned)event->tgt_long.initiator.initiator.process);
-        return;
+    } else {
+        e = uct_cxi_unexp_alloc(iface, event, 1, UCT_CXI_UNEXP_OWNED,
+                                iface->tag.unexp_seq++);
+        if (ucs_unlikely(e == NULL)) {
+            ucs_error("cxi TAG no free entry to hold an unexpected "
+                      "rendezvous, tag=0x%lx initiator=0x%x -- dropped",
+                      (unsigned long)event->tgt_long.match_bits,
+                      (unsigned)event->tgt_long.initiator.initiator.process);
+            return;
+        }
     }
 
-    uct_cxi_iface_unexp_progress(iface);
+    uct_cxi_unexp_start(iface, e);
+    uct_cxi_unexp_advance(iface, e->stream);
 }
 
 /*
@@ -1373,10 +1546,13 @@ static void uct_cxi_unexp_rndv_owned(uct_cxi_iface_t *iface,
 static void uct_cxi_unexp_rndv_lost(uct_cxi_iface_t *iface,
                                     const union c_event *event)
 {
-    ucs_queue_iter_t        iter;
-    uct_cxi_unexp_report_t *e = uct_cxi_unexp_find(iface, event,
-                                                   UCT_CXI_UNEXP_OWNED |
-                                                   UCT_CXI_UNEXP_LOST, &iter);
+    uct_cxi_unexp_stream_t *stream =
+            uct_cxi_unexp_stream_find(iface,
+                                      event->tgt_long.initiator.initiator.process,
+                                      event->tgt_long.match_bits);
+    uct_cxi_unexp_report_t *e = (stream == NULL) ? NULL :
+            uct_cxi_unexp_find(stream, event,
+                               UCT_CXI_UNEXP_OWNED | UCT_CXI_UNEXP_LOST);
 
     if (e == NULL) {
         ucs_debug("cxi TAG [UNEXP-LOST-FIRST] tag=0x%lx id=%u: claimed before "
@@ -1384,7 +1560,8 @@ static void uct_cxi_unexp_rndv_lost(uct_cxi_iface_t *iface,
                   (unsigned long)event->tgt_long.match_bits,
                   (unsigned)event->tgt_long.rendezvous_id);
         if (ucs_unlikely(uct_cxi_unexp_alloc(iface, event, 1,
-                                             UCT_CXI_UNEXP_LOST) == NULL)) {
+                                             UCT_CXI_UNEXP_LOST,
+                                             iface->tag.unexp_seq++) == NULL)) {
             ucs_error("cxi TAG no free entry to note a rendezvous claimed by "
                       "a receive, tag=0x%lx initiator=0x%x",
                       (unsigned long)event->tgt_long.match_bits,
@@ -1398,12 +1575,13 @@ static void uct_cxi_unexp_rndv_lost(uct_cxi_iface_t *iface,
               (unsigned long)event->tgt_long.match_bits,
               (unsigned)event->tgt_long.rendezvous_id, (unsigned)e->state,
               (unsigned)e->flags);
+    stream = e->stream;
     if (e->flags & UCT_CXI_UNEXP_ARRIVED) {
-        uct_cxi_unexp_discard(iface, e, iter);
+        uct_cxi_unexp_discard(iface, e);
     }
 
     /* What was held behind it is free to go. */
-    uct_cxi_iface_unexp_progress(iface);
+    uct_cxi_unexp_advance(iface, stream);
 }
 
 /* -------------------------------------------------------------------------
@@ -1412,7 +1590,7 @@ static void uct_cxi_unexp_rndv_lost(uct_cxi_iface_t *iface,
  */
 
 static void uct_cxi_tag_found_eager(uct_cxi_iface_t *iface,
-                                    const union c_event *event);
+                                    const union c_event *event, uint64_t seq);
 static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
                                              const union c_event *event);
 
@@ -1421,12 +1599,14 @@ static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
  * find) of an eager message with data is about to be handled: it copies from
  * the overflow buffer, so it may only be once the message's arrival event has
  * been seen -- the Put that was written after its data (see
- * uct_cxi_eager_pair_t). Returns 1 if it has, and the match goes on. If not,
+ * uct_cxi_eager_pair_t). Returns 1 if it has, and the match goes on, with the
+ * number of the arrival in *seq_p. If not,
  * the event is kept for uct_cxi_eager_arrived() to carry on with, and 0 is
  * returned.
  */
 static int uct_cxi_eager_match_ready(uct_cxi_iface_t *iface,
-                                     const union c_event *event, int is_found)
+                                     const union c_event *event, int is_found,
+                                     uint64_t *seq_p)
 {
     uct_cxi_eager_pair_t *pair;
     khiter_t              k;
@@ -1437,6 +1617,7 @@ static int uct_cxi_eager_match_ready(uct_cxi_iface_t *iface,
     if (k != kh_end(&iface->tag.eager_pairs)) {
         pair = &kh_value(&iface->tag.eager_pairs, k);
         if (ucs_likely(!pair->parked)) {
+            *seq_p = pair->seq;
             kh_del(uct_cxi_eager_pair_hash, &iface->tag.eager_pairs, k);
             return 1;
         }
@@ -1451,6 +1632,7 @@ static int uct_cxi_eager_match_ready(uct_cxi_iface_t *iface,
         ucs_error("cxi TAG cannot wait for the arrival of the unexpected "
                   "eager message at 0x%lx: out of memory",
                   (unsigned long)event->tgt_long.start);
+        *seq_p = iface->tag.unexp_seq++;
         return 1;
     }
 
@@ -1470,7 +1652,7 @@ static int uct_cxi_eager_match_ready(uct_cxi_iface_t *iface,
  * arrival for the match.
  */
 static void uct_cxi_eager_arrived(uct_cxi_iface_t *iface,
-                                  const union c_event *event)
+                                  const union c_event *event, uint64_t seq)
 {
     uct_cxi_eager_pair_t pair;
     khiter_t             k;
@@ -1488,6 +1670,7 @@ static void uct_cxi_eager_arrived(uct_cxi_iface_t *iface,
             return;
         }
         kh_value(&iface->tag.eager_pairs, k).parked = 0;
+        kh_value(&iface->tag.eager_pairs, k).seq    = seq;
         return;
     }
 
@@ -1501,7 +1684,7 @@ static void uct_cxi_eager_arrived(uct_cxi_iface_t *iface,
 
     /* The handlers may call into UCP; nothing of ours is referenced after. */
     if (pair.is_found) {
-        uct_cxi_tag_found_eager(iface, &pair.event);
+        uct_cxi_tag_found_eager(iface, &pair.event, seq);
     } else {
         uct_cxi_tag_eager_match_complete(iface, &pair.event);
     }
@@ -1511,26 +1694,32 @@ static void uct_cxi_eager_arrived(uct_cxi_iface_t *iface,
  * uct_cxi_iface_tag_handle_search_delete_confirm_eager -- the "found and
  * deleted" confirmation of our SEARCH_AND_DELETE for an unexpected eager
  * message (see uct_cxi_iface_tag_report_unexp_eager() above for the event).
- * Reported at once, unless an unexpected rendezvous with the same tag from
- * the same sender is still waiting for its address: it arrived first, so UCP
- * must hear of it first, and this waits behind it. The test costs one load
- * when no rendezvous is held.
+ * Reported at once, unless an unexpected message with the same tag from the
+ * same sender that arrived before it is still held (a rendezvous waiting for
+ * its address): UCP must hear of that first, and this waits behind it, in the
+ * place its arrival number \a seq gives it. The test costs one load when no
+ * rendezvous is held.
  */
 static void uct_cxi_tag_found_eager(uct_cxi_iface_t *iface,
-                                    const union c_event *event)
+                                    const union c_event *event, uint64_t seq)
 {
     if (ucs_unlikely(iface->tag.unexp_held != 0) &&
-        (cxi_event_rc(event) == C_RC_OK) &&
-        uct_cxi_unexp_is_held(iface,
-                              event->tgt_long.initiator.initiator.process,
-                              event->tgt_long.match_bits)) {
-        if (uct_cxi_unexp_alloc(iface, event, 0,
-                                UCT_CXI_UNEXP_ARRIVED |
-                                UCT_CXI_UNEXP_OWNED) != NULL) {
-            return;
+        (cxi_event_rc(event) == C_RC_OK)) {
+        uct_cxi_unexp_stream_t *stream =
+                uct_cxi_unexp_stream_find(
+                        iface, event->tgt_long.initiator.initiator.process,
+                        event->tgt_long.match_bits);
+
+        if ((stream != NULL) && uct_cxi_unexp_has_older(stream, seq)) {
+            if (uct_cxi_unexp_alloc(iface, event, 0,
+                                    UCT_CXI_UNEXP_ARRIVED |
+                                    UCT_CXI_UNEXP_OWNED, seq) != NULL) {
+                return;
+            }
+            ucs_warn("cxi TAG no free entry to hold an unexpected eager "
+                     "message behind an unexpected rendezvous: reporting it "
+                     "out of order");
         }
-        ucs_warn("cxi TAG no free entry to hold an unexpected eager message "
-                 "behind an unexpected rendezvous: reporting it out of order");
     }
 
     uct_cxi_iface_tag_report_unexp_eager(iface, event);
@@ -1540,12 +1729,17 @@ void
 uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
                                                      const union c_event *event)
 {
-    if ((cxi_event_rc(event) == C_RC_OK) && (event->tgt_long.mlength > 0) &&
-        !uct_cxi_eager_match_ready(iface, event, 1)) {
+    uint64_t seq;
+
+    if ((cxi_event_rc(event) != C_RC_OK) || (event->tgt_long.mlength == 0)) {
+        /* No data in the overflow buffer to wait for, and no record of its
+         * arrival: it counts as the latest. */
+        seq = iface->tag.unexp_seq++;
+    } else if (!uct_cxi_eager_match_ready(iface, event, 1, &seq)) {
         return; /* its arrival is yet to come: see uct_cxi_eager_arrived() */
     }
 
-    uct_cxi_tag_found_eager(iface, event);
+    uct_cxi_tag_found_eager(iface, event, seq);
 }
 
 /*
@@ -1585,7 +1779,7 @@ void uct_cxi_iface_handle_rndv_hdr_announce(uct_cxi_iface_t *iface,
              (unsigned long)hdr->ep_id, (unsigned)hdr->md_index,
              (unsigned long)hdr->table_iova);
 
-    uct_cxi_iface_unexp_progress(iface);
+    uct_cxi_unexp_announced(iface, initiator);
 }
 
 /*
@@ -1646,6 +1840,7 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
 {
     int      buf_idx = (int)event->tgt_long.buffer_id;
     uint64_t tag      = event->tgt_long.match_bits;
+    uint64_t seq      = iface->tag.unexp_seq++; /* the order of arrivals */
     struct c_target_cmd sd = {};
     ucs_status_t status;
 
@@ -1708,7 +1903,7 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
      * outcome of a SEARCH_AND_DELETE. Which message that is, and of which
      * kind, is read from the event itself (see that macro's doc comment). */
     if (event->tgt_long.rendezvous) {
-        uct_cxi_unexp_rndv_arrived(iface, event);
+        uct_cxi_unexp_rndv_arrived(iface, event, seq);
     }
 
     sd.command.opcode = C_CMD_TGT_SEARCH_AND_DELETE;
@@ -1741,10 +1936,11 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     }
 
     if (event->tgt_long.rendezvous) {
-        /* The address read goes out alongside the SEARCH_AND_DELETE. */
-        uct_cxi_iface_unexp_progress(iface);
+        /* Its address read went out alongside the SEARCH_AND_DELETE; what
+         * waited for this arrival can go on. */
+        uct_cxi_unexp_advance_event(iface, event);
     } else if (event->tgt_long.mlength > 0) {
-        uct_cxi_eager_arrived(iface, event);
+        uct_cxi_eager_arrived(iface, event, seq);
     }
 }
 
@@ -2036,9 +2232,11 @@ static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event)
 {
+    uint64_t seq;
+
     if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
         (event->tgt_long.mlength > 0) &&
-        !uct_cxi_eager_match_ready(iface, event, 0)) {
+        !uct_cxi_eager_match_ready(iface, event, 0, &seq)) {
         return; /* its arrival is yet to come: see uct_cxi_eager_arrived() */
     }
 

@@ -296,6 +296,8 @@ KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
  * match_put_event().
  */
 typedef struct uct_cxi_eager_pair {
+    uint64_t      seq;       /**< when the arrival was handled, in the numbering
+                                  of tag.unexp_seq (set by the arrival) */
     uint8_t       parked;    /**< 0: the arrival was seen and waits for its
                                   match; 1: a match was seen and waits for
                                   its arrival, and is kept in `event` */
@@ -304,6 +306,37 @@ typedef struct uct_cxi_eager_pair {
     union c_event event;
 } uct_cxi_eager_pair_t;
 KHASH_MAP_INIT_INT64(uct_cxi_eager_pair_hash, uct_cxi_eager_pair_t)
+
+/**
+ * The unexpected messages held for the report to UCP that come from one sender
+ * with one tag, in the order they arrived (see uct_cxi_unexp_report_t in
+ * cxi_tag.h). That is the order UCP is told of them in: messages of other
+ * streams are not ordered against these. A stream exists while it has an
+ * entry, and is found by (sender, tag) in iface->tag.unexp_streams.
+ */
+typedef struct uct_cxi_unexp_stream {
+    ucs_list_link_t              entries;   /**< uct_cxi_unexp_report_t.link */
+    uint64_t                     tag;
+    uint32_t                     initiator;
+    unsigned                     num_early; /**< entries still to have their
+                                                 ARRIVED event */
+    int                          busy;      /**< being advanced */
+    struct uct_cxi_unexp_stream *next_free;
+} uct_cxi_unexp_stream_t;
+
+typedef struct uct_cxi_unexp_key {
+    uint64_t tag;
+    uint32_t initiator;
+} uct_cxi_unexp_key_t;
+
+#define uct_cxi_unexp_key_hash(_k) \
+    kh_int64_hash_func((_k).tag ^ ((uint64_t)(_k).initiator * \
+                                   0x9e3779b97f4a7c15ull))
+#define uct_cxi_unexp_key_equal(_a, _b) \
+    (((_a).tag == (_b).tag) && ((_a).initiator == (_b).initiator))
+KHASH_INIT(uct_cxi_unexp_stream_hash, uct_cxi_unexp_key_t,
+           uct_cxi_unexp_stream_t *, 1, uct_cxi_unexp_key_hash,
+           uct_cxi_unexp_key_equal)
 
 /**
  * Event queue state: the hardware EQ, its backing buffer, and the sizing,
@@ -584,22 +617,28 @@ typedef struct uct_cxi_iface {
          * two events, see uct_cxi_eager_pair_t. */
         khash_t(uct_cxi_eager_pair_hash) eager_pairs;
 
-        /* Unexpected messages our SEARCH_AND_DELETE has taken off the
-         * hardware list and that are waiting to be reported to UCP -- see
-         * uct_cxi_unexp_report_t in cxi_tag.h. unexp_q is in arrival order;
-         * unexp_ents is a registered array of tag.max_outstanding entries
-         * (each is also the landing buffer of its own address read), with
-         * unexp_free their free list. unexp_held counts the rendezvous
-         * entries in unexp_q, so the eager path only looks at the queue when
-         * it is not 0. */
-        ucs_queue_head_t      unexp_q;
+        /* Unexpected messages held for the report to UCP -- see
+         * uct_cxi_unexp_report_t in cxi_tag.h. unexp_ents is a registered
+         * array of tag.max_outstanding entries (each is also the landing
+         * buffer of its own address read), with unexp_free their free list.
+         * They are chained per (sender, tag) in unexp_streams, found by that
+         * key, with unexp_stream_pool the streams' storage and
+         * unexp_stream_free their free list. unexp_wait holds the rendezvous
+         * whose sender's announce is not seen yet. unexp_held counts the
+         * rendezvous entries in the chains, so the eager path only looks for
+         * a stream when it is not 0. */
+        khash_t(uct_cxi_unexp_stream_hash) unexp_streams;
+        uct_cxi_unexp_stream_t *unexp_stream_pool;
+        uct_cxi_unexp_stream_t *unexp_stream_free;
+        ucs_list_link_t       unexp_wait;
         struct uct_cxi_unexp_report *unexp_ents;
         struct uct_cxi_unexp_report *unexp_free;
         uct_cxi_mem_handle_t  unexp_ents_mh;
         size_t                unexp_ents_len;   /**< registered bytes */
         unsigned              unexp_held;
-        int                   unexp_busy;       /**< uct_cxi_iface_unexp_progress()
-                                                     is running */
+        uint64_t              unexp_seq;        /**< numbers the unexpected arrivals
+                                                     as they are handled: the
+                                                     order of a stream's chain */
 
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;

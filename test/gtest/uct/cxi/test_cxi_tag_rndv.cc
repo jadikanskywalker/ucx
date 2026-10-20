@@ -975,7 +975,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
         for (unsigned i = 0; i < REPEATS; i++) {
             const uct_tag_t tag1      = TAGS[0] + (i << 8);
             const uct_tag_t eager_tag = (t == 0) ? tag1 : TAGS[1] + (i << 8);
-            const uct_tag_t tag2      = TAGS[0] + (i << 8) + 0x10000;
+            /* Same tag for all three in the first round: one stream. */
+            const uct_tag_t tag2      = (t == 0) ? tag1 :
+                                        TAGS[0] + (i << 8) + 0x10000;
             const size_t    before    = m_ctx.order.size();
             const char     *what      = t ? "other tag" : "same tag";
             unexp_rndv_send rs[2];
@@ -1020,12 +1022,13 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
             for (unsigned k = 0; k < 3; k++) {
                 const unexp_arrival &a = m_ctx.order[before + k];
 
-                if (a.rndv && (a.tag == tag1)) {
+                if (a.rndv && (a.tag == tag1) && (a.id == 0x1000 + i)) {
                     pos_r1 = k;
                 } else if (!a.rndv && (a.tag == eager_tag)) {
                     pos_eager = k;
                     EXPECT_EQ(0xE000 + i, a.id);
-                } else if (a.rndv && (a.tag == tag2)) {
+                } else if (a.rndv && (a.tag == tag2) &&
+                           (a.id == 0x2000 + i)) {
                     pos_r2 = k;
                 }
             }
@@ -1037,13 +1040,18 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
                         << "round " << i << ": the eager message was "
                         << "reported ahead of the rendezvous with its tag "
                         << "that was sent before it";
+                EXPECT_LT(pos_eager, pos_r2)
+                        << "round " << i << ": the rendezvous sent after the "
+                        << "eager message with its tag was reported ahead "
+                        << "of it";
             }
 
             /* Complete both rendezvous like UCP would. */
             for (unsigned r = 0; r < 2; r++) {
                 const rndv_arrival_record *rec = NULL;
                 for (size_t k = m_ctx.records.size(); k-- > 0;) {
-                    if (m_ctx.records[k].tag == rtag[r]) {
+                    if ((m_ctx.records[k].tag == rtag[r]) &&
+                        (m_ctx.records[k].req_id == 0x1000 * (r + 1) + i)) {
                         rec = &m_ctx.records[k];
                         break;
                     }
@@ -1496,6 +1504,76 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, search_delete_finds_the_other_kind)
             dereg(receiver(), rx_memh);
             dereg(sender(), tx_memh);
         }
+    }
+    flush_ep(sender(), sep);
+}
+
+/*
+ * Several streams at once: rendezvous with a few different tags sent
+ * interleaved, an eager message among them for each tag. Each stream has to be
+ * reported in the order it was sent (its own tag, same sender), whatever the
+ * others do, every message once, and the pull of each has to give its data.
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, many_streams_each_in_order)
+{
+    static const unsigned TAGS    = 8;
+    static const unsigned PER_TAG = 8;
+    static const size_t   PAY_LEN = 1024;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h sep = sender().ep(0);
+    uct_ep_h rep = receiver().ep(0);
+
+    std::vector<unexp_rndv_send *> sends;
+    for (unsigned n = 0; n < PER_TAG; n++) {
+        for (unsigned t = 0; t < TAGS; t++) {
+            const uct_tag_t tag = 0xA5A5000000000000ULL | t;
+            unexp_rndv_send *rs = new unexp_rndv_send();
+            rs->buf.assign(PAY_LEN, (uint8_t)(t * PER_TAG + n + 1));
+            rs->memh = reg(sender(), rs->buf.data(), PAY_LEN);
+            init_rndv_send_ctx(rs->ctx);
+
+            uct_iov_t siov;
+            siov.buffer = rs->buf.data();
+            siov.length = PAY_LEN;
+            siov.memh   = rs->memh;
+            siov.stride = 0;
+            siov.count  = 1;
+            /* req_id: the tag and the position in its stream */
+            std::vector<uint8_t> hdr = pack_rndv_hdr(0x66, t * 1000 + n, 4);
+            ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
+                    sep, tag, hdr.data(), hdr.size(), &siov, 1, 0,
+                    &rs->ctx.super)));
+            sends.push_back(rs);
+        }
+    }
+
+    poll_until_count(TAGS * PER_TAG);
+    ASSERT_EQ(TAGS * PER_TAG, m_ctx.records.size());
+
+    unsigned next[TAGS] = {};
+    for (size_t i = 0; i < m_ctx.records.size(); i++) {
+        const unsigned t = m_ctx.records[i].tag & 0xff;
+        ASSERT_LT(t, TAGS);
+        EXPECT_EQ(t * 1000 + next[t], m_ctx.records[i].req_id)
+                << "tag " << t << " reported out of its stream's order";
+        next[t]++;
+    }
+
+    for (size_t i = 0; i < m_ctx.records.size(); i++) {
+        const unsigned t = m_ctx.records[i].tag & 0xff;
+        const unsigned n = m_ctx.records[i].req_id % 1000;
+        std::vector<uint8_t> dst(PAY_LEN, 0);
+        uct_mem_h            dmemh = reg(receiver(), dst.data(), PAY_LEN);
+        pull_and_verify(rep, m_ctx.records[i], dst, dmemh,
+                        sends[n * TAGS + t]->buf);
+        dereg(receiver(), dmemh);
+    }
+    for (size_t i = 0; i < sends.size(); i++) {
+        poll_until(sends[i]->ctx.fired);
+        dereg(sender(), sends[i]->memh);
+        delete sends[i];
     }
     flush_ep(sender(), sep);
 }
