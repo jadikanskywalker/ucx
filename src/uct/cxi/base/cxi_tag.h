@@ -471,27 +471,62 @@ typedef struct uct_cxi_rndv_hdr_wire {
 } UCS_S_PACKED uct_cxi_rndv_hdr_wire_t;
 
 /*
- * uct_cxi_rndv_unexp_pending_t -- a SEARCH_AND_DELETE confirmation for a
- * genuinely-unexpected rendezvous arrival whose initiator's one-time header
- * announce (uct_cxi_ep_send_rndv_hdr_announce) hasn't been processed yet.
- * The announce and the rendezvous Put are two independent wire sends with
- * no guaranteed relative arrival order (same reasoning that already rules
- * out C_CMD_CQ_FENCE elsewhere in this transport as a target-arrival-order
- * fix), so a cache miss in uct_cxi_iface_tag_handle_search_delete_confirm_
- * rndv() is a legitimate race, not an error: this struct parks everything
- * needed to complete the rndv_cb call later, once uct_cxi_iface_handle_
- * rndv_hdr_announce() populates iface->tag.rndv_peer_cache for this
- * initiator and drains iface->tag.rndv_unexp_pending_q.
+ * uct_cxi_unexp_report_t -- an unexpected message that our SEARCH_AND_DELETE
+ * has taken off the hardware list, held until it can be reported to UCP in
+ * order (iface->tag.unexp_q).
+ *
+ * A rendezvous cannot be reported at once: UCP needs the sender's source
+ * address, which the hardware does not give us (the events' remote_offset is
+ * 0 for an unexpected message), so it is read from the sender's address
+ * table (iface->rdzv.addr_table) with an 8-byte RMA Get, and reported when
+ * that completes. That is a round trip, and UCP matches unexpected messages
+ * in the order they are reported, so a later message with the same tag from
+ * the same sender must not be reported ahead of it: it is held behind it, in
+ * this queue (an eager one, or another rendezvous, whose own read may finish
+ * first). Messages with other tags, or from other senders, are never held:
+ * ordering them is not something UCP or the network promises, and a receive
+ * with a wildcard tag is UCP's to order.
+ *
+ * Also needed: the sender's one-time announce (ep_id, md_index, and where its
+ * table is) may not have been processed yet. The announce and the Put are
+ * independent sends with no guaranteed arrival order, so a rendezvous whose
+ * sender is not known yet simply waits (state NEW) for it.
+ *
+ * `op` must be first, as for uct_cxi_rdzv_get_op_t: the read's REPLY goes
+ * through the generic dispatch, which calls op->handler for an op without an
+ * ep. The entries are registered memory because `value` is where that read
+ * lands. The whole confirmation event is kept so that the report can be made
+ * later exactly as if it were made on arrival.
  */
-typedef struct uct_cxi_rndv_unexp_pending {
-    ucs_queue_elem_t queue;         /* intrusive link */
-    uint32_t         initiator;    /* event->tgt_long.initiator.initiator.process */
-    uint64_t         tag;          /* event->tgt_long.match_bits */
-    uint64_t         remote_offset;
-    uint32_t         rlength;
-    uint64_t         header_data;  /* req_id -- see uct_cxi_rndv_hdr_wire_t */
-    uint8_t          rendezvous_id;
-} uct_cxi_rndv_unexp_pending_t;
+#define UCT_CXI_UNEXP_NEW      0  /* rendezvous: address read not posted yet */
+#define UCT_CXI_UNEXP_READING  1  /* rendezvous: address read in flight */
+#define UCT_CXI_UNEXP_READY    2  /* eager, or rendezvous with its address */
+#define UCT_CXI_UNEXP_FAILED   3  /* rendezvous: the address read failed */
+
+typedef struct uct_cxi_unexp_report {
+    /* What the scans of iface->tag.unexp_q read: all in the first cache line */
+    uct_cxi_send_op_t            op;        /* must be first */
+    uint64_t                     tag;       /* event's match_bits */
+    ucs_queue_elem_t             queue;     /* iface->tag.unexp_q, arrival order */
+    uint32_t                     initiator; /* event's initiator.process */
+    uint8_t                      rendezvous_id; /* event's rendezvous_id */
+    uint8_t                      is_rndv;
+    uint8_t                      state;
+
+    uint64_t                     value;     /* landing: the source address */
+    uct_cxi_iface_t             *iface;
+    struct uct_cxi_unexp_report *next_free; /* free list */
+    union c_event                event;     /* the confirmation event */
+} UCS_V_ALIGNED(UCS_SYS_CACHE_LINE_SIZE) uct_cxi_unexp_report_t;
+
+
+/*
+ * uct_cxi_iface_unexp_progress -- start the address reads that can start, and
+ * report to UCP, in order, everything that is ready: the work to do when
+ * something that held a report up has changed (a sender's announce arrived,
+ * an address read completed).
+ */
+void uct_cxi_iface_unexp_progress(uct_cxi_iface_t *iface);
 
 /*
  * uct_cxi_iface_handle_rndv_hdr_announce -- receive-side handler for the
@@ -499,7 +534,8 @@ typedef struct uct_cxi_rndv_unexp_pending {
  * (cxi_am.c). Called from cxi_iface.c's AM dispatch when event->tgt_long.
  * match_bits has UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG set, before ever reaching
  * uct_iface_invoke_am(). Populates iface->tag.rndv_peer_cache for this
- * initiator, then drains iface->tag.rndv_unexp_pending_q for it.
+ * initiator, then reports whatever of its rendezvous was waiting for it
+ * (uct_cxi_iface_unexp_progress).
  */
 void uct_cxi_iface_handle_rndv_hdr_announce(uct_cxi_iface_t *iface,
                                              const union c_event *event,

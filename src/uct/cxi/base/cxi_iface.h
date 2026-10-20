@@ -47,8 +47,10 @@
 #define UCT_CXI_FC_UNITS(_len) \
     ((unsigned)(((_len) + UCT_CXI_FC_UNIT - 1) / UCT_CXI_FC_UNIT))
 
-/* How long uct_cxi_iface_tgt_post() waits for room in a full target command
- * queue before giving up. The NIC normally frees room within microseconds. */
+/* How long a command posted from an event handler (uct_cxi_iface_tgt_post(),
+ * the address read of an unexpected rendezvous) waits for room in a full
+ * command queue before giving up. The NIC normally frees room within
+ * microseconds. */
 #define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
 
 
@@ -275,6 +277,9 @@ struct uct_cxi_rdzv_op;
  */
 typedef struct uct_cxi_rndv_peer_hdr {
     uint64_t ep_id;
+    uint64_t table_iova; /**< IOVA of the sender's rendezvous address table
+                              (rdzv.addr_table): slot i holds the source
+                              address of its rendezvous with id i */
     uint8_t  md_index;
 } uct_cxi_rndv_peer_hdr_t;
 KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
@@ -554,14 +559,22 @@ typedef struct uct_cxi_iface {
          * for each peer's one-time control-message announce. */
         khash_t(uct_cxi_rndv_peer_hash) rndv_peer_cache;
 
-        /* Genuinely-unexpected rendezvous SEARCH_AND_DELETE confirmations
-         * that raced ahead of their initiator's one-time header announce
-         * (no ordering guarantee between the two -- see uct_cxi_rndv_unexp_
-         * pending_t's own doc comment in cxi_tag.h). Drained by
-         * uct_cxi_iface_handle_rndv_hdr_announce() once that initiator's
-         * rndv_peer_cache entry is populated. */
-        ucs_queue_head_t      rndv_unexp_pending_q;
-        ucs_mpool_t           rndv_unexp_pending_pool;
+        /* Unexpected messages our SEARCH_AND_DELETE has taken off the
+         * hardware list and that are waiting to be reported to UCP -- see
+         * uct_cxi_unexp_report_t in cxi_tag.h. unexp_q is in arrival order;
+         * unexp_ents is a registered array of tag.max_outstanding entries
+         * (each is also the landing buffer of its own address read), with
+         * unexp_free their free list. unexp_held counts the rendezvous
+         * entries in unexp_q, so the eager path only looks at the queue when
+         * it is not 0. */
+        ucs_queue_head_t      unexp_q;
+        struct uct_cxi_unexp_report *unexp_ents;
+        struct uct_cxi_unexp_report *unexp_free;
+        uct_cxi_mem_handle_t  unexp_ents_mh;
+        size_t                unexp_ents_len;   /**< registered bytes */
+        unsigned              unexp_held;
+        int                   unexp_busy;       /**< uct_cxi_iface_unexp_progress()
+                                                     is running */
 
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;
@@ -601,6 +614,20 @@ typedef struct uct_cxi_iface {
         uint32_t              *free_ids;   /**< Stack of free indices into ops[] */
         uint32_t               free_count;
         uint32_t               max_outstanding;
+
+        /* Source addresses of the outstanding rendezvous sends, by id:
+         * addr_table[id] is the IOVA of the buffer that rendezvous exposes.
+         * Registered, so a peer can read it with an ordinary RMA Get (its
+         * base address reaches the peer in this ep's one-time announce). The
+         * hardware does not tell a target the source address of a
+         * rendezvous it takes off the unexpected list -- the event's
+         * remote_offset is 0 there -- so a target that needs it reads the
+         * slot. Written once per rendezvous send, before its Put. Sized for
+         * every possible 8-bit id, so that a read can never fall outside
+         * it. */
+        uint64_t              *addr_table;
+        uct_cxi_mem_handle_t   addr_table_mh;
+        size_t                 addr_table_len;   /**< registered bytes */
 
         uct_cxi_pte_fc_t      fc;         /**< Recovery state for rdzv.pte */
     } rdzv;

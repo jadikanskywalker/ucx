@@ -18,7 +18,7 @@
  * per-send header (ep_id/req_id/md_index) is delivered via req_id riding
  * header_data on every rendezvous Put plus a one-time-per-ep control-
  * message announce for ep_id/md_index (see uct_cxi_ep_send_rndv_hdr_
- * announce, cxi_am.c, and uct_cxi_rndv_unexp_pending_t, cxi_tag.h, for the
+ * announce, cxi_am.c, and uct_cxi_unexp_report_t, cxi_tag.h, for the
  * announce-vs-Put race this implies). cancel_unmatched below only exercises
  * the sender-side cancel bookkeeping for this path; dedicated coverage of
  * rndv_cb's own data/header correctness is tracked separately.
@@ -328,7 +328,7 @@ UCS_TEST_P(test_cxi_tag_rndv, cancel_unmatched)
      * overflow ring and goes through the real unexpected-rendezvous
      * SEARCH_AND_DELETE/rndv_cb path (see test_cxi_tag.h's uct_cxi_tag_
      * rndv_cb stub), possibly racing this same ep's header announce (see
-     * uct_cxi_rndv_unexp_pending_t in cxi_tag.h) -- either way, no receive
+     * uct_cxi_unexp_report_t in cxi_tag.h) -- either way, no receive
      * is ever posted to complete the data pull and no Get is ever issued
      * against this exposure, so cancelling here still exercises pure
      * sender-side bookkeeping removal with no hardware race possible. */
@@ -559,8 +559,7 @@ _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_rndv, cxi)
  * that captures the reconstructed header and unpacks rkey_buf immediately
  * (both are only valid for the duration of the callback -- rkey_buf in
  * particular points at a stack uct_cxi_rkey_t inside the transport, see
- * uct_cxi_iface_tag_handle_search_delete_confirm_rndv/uct_cxi_iface_rndv_
- * unexp_pending_drain in cxi_tag.c), so a real generic uct_ep_get_zcopy pull
+ * uct_cxi_unexp_report in cxi_tag.c), so a real generic uct_ep_get_zcopy pull
  * can be driven later, from the test body, exactly as UCP itself would.
  * -------------------------------------------------------------------------
  */
@@ -577,17 +576,32 @@ struct rndv_arrival_record {
     uct_rkey_bundle_t rkey_bundle;
 };
 
+/* One unexpected message as UCP is told about it, in the order it is told. */
+struct unexp_arrival {
+    bool      rndv;
+    uct_tag_t tag;
+    uint64_t  id;     /* rendezvous: req_id; eager: first 8 payload bytes */
+};
+
 struct rndv_arrival_ctx {
     uct_component_h                  component;
     std::vector<rndv_arrival_record> records;
+    std::vector<unexp_arrival>       order;   /* eager and rendezvous alike */
 };
 
 ucs_status_t unexp_rndv_eager_cb(void *arg, void *data, size_t length,
                                  unsigned flags, uct_tag_t stag, uint64_t imm,
                                  void **context)
 {
-    /* Unused by these tests -- present only because create_entity()
-     * requires a real callback (see test_cxi_tag.h's identical stub). */
+    /* Only the order of arrival is of interest, see unexp_arrival. The
+     * payload is not kept: eager_cb must not retain the pointer. */
+    rndv_arrival_ctx *ctx = static_cast<rndv_arrival_ctx *>(arg);
+    unexp_arrival     a   = {false, stag, 0};
+
+    if (length >= sizeof(a.id)) {
+        memcpy(&a.id, data, sizeof(a.id));
+    }
+    ctx->order.push_back(a);
     return UCS_OK;
 }
 
@@ -621,6 +635,8 @@ ucs_status_t unexp_rndv_cb(void *arg, unsigned flags, uint64_t stag,
     EXPECT_UCS_OK(uct_rkey_unpack(ctx->component, rkey_buf, &rec.rkey_bundle));
 
     ctx->records.push_back(rec);
+    unexp_arrival a = {true, stag, rec.req_id};
+    ctx->order.push_back(a);
     return UCS_OK;
 }
 
@@ -678,6 +694,21 @@ protected:
                 << timeout_sec << " s";
     }
 
+    /** Poll sender + receiver progress until @a n unexpected messages of
+     * either kind have been reported, or timeout. */
+    void poll_until_count_arrivals(size_t n, double timeout_sec = 5.0)
+    {
+        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(timeout_sec);
+        while ((m_ctx.order.size() < n) && (ucs_get_time() < deadline)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        ASSERT_GE(m_ctx.order.size(), n)
+                << "only " << m_ctx.order.size() << "/" << n
+                << " unexpected messages reported after " << timeout_sec
+                << " s";
+    }
+
     /** Drive the actual data pull for one captured arrival, exactly as UCP
      * itself would once a matching receive is posted: a generic
      * uct_ep_get_zcopy on the receiver's own ep back to the sender, using
@@ -733,7 +764,7 @@ protected:
 /*
  * Single unexpected rendezvous send, no receive ever posted -- the "cold
  * start" case: this ep's very first rndv send, so the header announce and
- * the rendezvous Put race (see uct_cxi_rndv_unexp_pending_t in cxi_tag.h).
+ * the rendezvous Put race (see uct_cxi_unexp_report_t in cxi_tag.h).
  * Verifies rndv_cb reports the real header/tag/length, and that the actual
  * payload arrives correctly through UCP's own generic pull mechanism
  * (cxi_rma.c's is_rndv rkey routing), independently of this transport's
@@ -804,8 +835,8 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, cold_start)
  * send correctly -- the core correctness property the one-time announce
  * design depends on. All N sends are issued back to back before any
  * progress() call, so the first few arrivals likely race this ep's single
- * announce (see uct_cxi_rndv_unexp_pending_t's pending-queue path,
- * cxi_tag.c) while the rest hit an already-populated cache -- both cases
+ * announce (an unexpected rendezvous waits for it, see uct_cxi_unexp_report_t
+ * in cxi_tag.h) while the rest hit an already-populated cache -- both cases
  * are exercised without needing to force either one explicitly.
  */
 UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
@@ -893,6 +924,201 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
         dereg(sender(), tx_memh[i]);
     }
 
+    flush_ep(sender(), sep);
+}
+
+
+/*
+ * What a test needs to keep of an unexpected rendezvous send, until it has
+ * pulled the data like UCP would and the send has completed: no receive is
+ * ever posted for these, so they are only ever reported through rndv_cb.
+ */
+struct unexp_rndv_send {
+    std::vector<uint8_t>  buf;
+    uct_mem_h             memh;
+    uct_cxi_rndv_send_ctx ctx;
+};
+
+/*
+ * UCP matches unexpected messages in the order it is told of them, so an
+ * unexpected rendezvous must be reported before a message with the same tag
+ * that the same sender sent after it. The rendezvous is reported a round
+ * trip late (its source address has to be read from the sender); an eager
+ * message behind it is not delayed by anything, and so is reported first
+ * unless it is held back.
+ *
+ * Only messages with the same tag are ordered: other tags are not held up
+ * (what UCP does with a receive that matches several is its own affair). So
+ * the eager message is sent once with the same tag, where the order is
+ * checked, and once with another, where all that is checked is that
+ * everything gets reported.
+ *
+ * A rendezvous, an eager message and another rendezvous (with a tag of its
+ * own) are sent back to back without waiting for any of them, as UCP lets a
+ * sender do. The last matters: when it arrives the eager message is already
+ * waiting behind the first rendezvous, and the interface looks at what can be
+ * reported -- it must not be tempted by the eager message.
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
+{
+    static const uct_tag_t TAGS[]   = {0xAAA0000000000001ULL,
+                                       0xBBB0000000000002ULL};
+    static const size_t    PAY_LEN  = 4096;
+    static const unsigned  REPEATS  = 20;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h sep = sender().ep(0);
+    uct_ep_h rep = receiver().ep(0);
+
+    for (unsigned t = 0; t < 2; t++) {
+        for (unsigned i = 0; i < REPEATS; i++) {
+            const uct_tag_t tag1      = TAGS[0] + (i << 8);
+            const uct_tag_t eager_tag = (t == 0) ? tag1 : TAGS[1] + (i << 8);
+            const uct_tag_t tag2      = TAGS[0] + (i << 8) + 0x10000;
+            const size_t    before    = m_ctx.order.size();
+            const char     *what      = t ? "other tag" : "same tag";
+            unexp_rndv_send rs[2];
+            uct_tag_t       rtag[2] = {tag1, tag2};
+
+            for (unsigned r = 0; r < 2; r++) {
+                rs[r].buf.assign(PAY_LEN, (uint8_t)(0x5C + r));
+                rs[r].memh = reg(sender(), rs[r].buf.data(), PAY_LEN);
+                init_rndv_send_ctx(rs[r].ctx);
+            }
+
+            /* rendezvous, eager, rendezvous */
+            for (unsigned k = 0; k < 3; k++) {
+                if (k == 1) {
+                    uint64_t marker = 0xE000 + i;
+                    ASSERT_UCS_OK(uct_ep_tag_eager_short(sep, eager_tag,
+                                                         &marker,
+                                                         sizeof(marker)));
+                    continue;
+                }
+
+                unsigned  r = k / 2;
+                uct_iov_t siov;
+                siov.buffer = rs[r].buf.data();
+                siov.length = PAY_LEN;
+                siov.memh   = rs[r].memh;
+                siov.stride = 0;
+                siov.count  = 1;
+                std::vector<uint8_t> hdr = pack_rndv_hdr(0x77,
+                                                         0x1000 * (r + 1) + i,
+                                                         3);
+                ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
+                        sep, rtag[r], hdr.data(), hdr.size(), &siov, 1, 0,
+                        &rs[r].ctx.super)));
+            }
+
+            poll_until_count_arrivals(before + 3);
+            ASSERT_EQ(before + 3, m_ctx.order.size());
+
+            /* Where each of the three was reported, -1 if it was not. */
+            int pos_r1 = -1, pos_eager = -1, pos_r2 = -1;
+            for (unsigned k = 0; k < 3; k++) {
+                const unexp_arrival &a = m_ctx.order[before + k];
+
+                if (a.rndv && (a.tag == tag1)) {
+                    pos_r1 = k;
+                } else if (!a.rndv && (a.tag == eager_tag)) {
+                    pos_eager = k;
+                    EXPECT_EQ(0xE000 + i, a.id);
+                } else if (a.rndv && (a.tag == tag2)) {
+                    pos_r2 = k;
+                }
+            }
+            EXPECT_TRUE((pos_r1 >= 0) && (pos_eager >= 0) && (pos_r2 >= 0))
+                    << "round " << i << " (" << what << "): not all three "
+                    << "messages were reported once";
+            if (t == 0) {
+                EXPECT_LT(pos_r1, pos_eager)
+                        << "round " << i << ": the eager message was "
+                        << "reported ahead of the rendezvous with its tag "
+                        << "that was sent before it";
+            }
+
+            /* Complete both rendezvous like UCP would. */
+            for (unsigned r = 0; r < 2; r++) {
+                const rndv_arrival_record *rec = NULL;
+                for (size_t k = m_ctx.records.size(); k-- > 0;) {
+                    if (m_ctx.records[k].tag == rtag[r]) {
+                        rec = &m_ctx.records[k];
+                        break;
+                    }
+                }
+                ASSERT_NE(nullptr, rec);
+
+                std::vector<uint8_t> dst(PAY_LEN, 0);
+                uct_mem_h dmemh = reg(receiver(), dst.data(), PAY_LEN);
+
+                pull_and_verify(rep, *rec, dst, dmemh, rs[r].buf);
+                poll_until(rs[r].ctx.fired);
+                dereg(receiver(), dmemh);
+                dereg(sender(), rs[r].memh);
+            }
+        }
+    }
+    flush_ep(sender(), sep);
+}
+
+/*
+ * Many unexpected rendezvous at once, all with the same tag. Each is reported
+ * only after its own address read, and the reads need not finish in the order
+ * they were posted: they must still be reported in the order sent, and each
+ * with the right source address (every payload is checked through its own
+ * pull).
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, many_rendezvous_reported_in_send_order)
+{
+    static const unsigned N       = 64;
+    static const size_t   PAY_LEN = 2048;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h sep = sender().ep(0);
+    uct_ep_h rep = receiver().ep(0);
+
+    std::vector<unexp_rndv_send *> sends;
+    for (unsigned i = 0; i < N; i++) {
+        unexp_rndv_send *rs = new unexp_rndv_send();
+        rs->buf.assign(PAY_LEN, (uint8_t)(i + 1));
+        rs->memh = reg(sender(), rs->buf.data(), PAY_LEN);
+        init_rndv_send_ctx(rs->ctx);
+
+        uct_iov_t siov;
+        siov.buffer = rs->buf.data();
+        siov.length = PAY_LEN;
+        siov.memh   = rs->memh;
+        siov.stride = 0;
+        siov.count  = 1;
+        std::vector<uint8_t> hdr = pack_rndv_hdr(0x88, i, 5);
+
+        ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
+                sep, 0xC0DE000000000000ULL, hdr.data(), hdr.size(), &siov,
+                1, 0, &rs->ctx.super)));
+        sends.push_back(rs);
+    }
+
+    poll_until_count(N);
+    ASSERT_EQ(N, m_ctx.records.size());
+    for (unsigned i = 0; i < N; i++) {
+        EXPECT_EQ(i, m_ctx.records[i].req_id) << "reported out of send order";
+        EXPECT_EQ(0xC0DE000000000000ULL, m_ctx.records[i].tag);
+    }
+
+    for (unsigned i = 0; i < N; i++) {
+        std::vector<uint8_t> dst(PAY_LEN, 0);
+        uct_mem_h            dmemh = reg(receiver(), dst.data(), PAY_LEN);
+        pull_and_verify(rep, m_ctx.records[i], dst, dmemh, sends[i]->buf);
+        poll_until(sends[i]->ctx.fired);
+        dereg(receiver(), dmemh);
+    }
+    for (unsigned i = 0; i < N; i++) {
+        dereg(sender(), sends[i]->memh);
+        delete sends[i];
+    }
     flush_ep(sender(), sep);
 }
 

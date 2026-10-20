@@ -164,8 +164,9 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
 
 /*
  * uct_cxi_ep_send_rndv_hdr_announce -- one-time-per-ep control message
- * carrying {ep_id, md_index} to the peer, over the same unrestricted IDC
- * path as uct_cxi_ep_am_short() above, but with UCT_CXI_RNDV_HDR_ANNOUNCE_
+ * carrying {ep_id, md_index, where our rendezvous address table is} to the
+ * peer, over the same unrestricted IDC path as uct_cxi_ep_am_short() above,
+ * but with UCT_CXI_RNDV_HDR_ANNOUNCE_
  * FLAG set in match_bits instead of a real am_id -- the receiver's AM
  * dispatch (cxi_iface.c) checks that bit before ever calling
  * uct_iface_invoke_am(), routing this to uct_cxi_iface_handle_rndv_hdr_
@@ -195,8 +196,11 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     }
     fcbits = uct_cxi_fc_pb_bits(ep, iface);
 
-    payload.ep_id    = ep_id;
-    payload.md_index = md_index;
+    memset(&payload, 0, sizeof(payload));
+    payload.ep_id      = ep_id;
+    payload.md_index   = md_index;
+    payload.table_iova = iface->rdzv.addr_table_mh.iova_offset +
+                         (uint64_t)(uintptr_t)iface->rdzv.addr_table;
 
     {
         struct c_cstate_cmd cstate    = {};
@@ -234,8 +238,9 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     uct_cxi_idc_track_commit(ep, iface);
     uct_cxi_fc_debit(ep, credited, units);
     uct_cxi_fc_pb_sent(ep, fcbits);
-    ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u",
-             ep, (unsigned long)ep_id, (unsigned)md_index);
+    ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u "
+             "table_iova=0x%lx", ep, (unsigned long)ep_id,
+             (unsigned)md_index, (unsigned long)payload.table_iova);
     return UCS_OK;
 }
 

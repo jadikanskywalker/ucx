@@ -88,6 +88,87 @@ static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
  */
 
 /*
+ * uct_cxi_iface_tag_unexp_init -- the entries that hold unexpected messages
+ * until they are reported (see uct_cxi_unexp_report_t in cxi_tag.h): one
+ * registered array of tag.max_outstanding, the same bound as the pools beside
+ * it, as every message in it is an unexpected arrival we are yet to report.
+ * Registered because each entry is also the landing buffer of its own address
+ * read. Only LAC 0 can be reached by the senders' RMA PTEs.
+ */
+static ucs_status_t
+uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
+{
+    size_t       page = ucs_get_page_size();
+    size_t       len  = ucs_align_up(self->tag.max_outstanding *
+                                     sizeof(uct_cxi_unexp_report_t), page);
+    ucs_status_t status;
+    unsigned     i;
+    int          ret;
+
+    /* The fields the scans of unexp_q compare share the first cache line. */
+    UCS_STATIC_ASSERT(ucs_offsetof(uct_cxi_unexp_report_t, state) <
+                      UCS_SYS_CACHE_LINE_SIZE);
+
+    ucs_queue_head_init(&self->tag.unexp_q);
+    self->tag.unexp_held     = 0;
+    self->tag.unexp_busy     = 0;
+    self->tag.unexp_ents     = NULL;
+    self->tag.unexp_free     = NULL;
+    self->tag.unexp_ents_len = 0;
+
+    ret = ucs_posix_memalign((void **)&self->tag.unexp_ents, page, len,
+                             "cxi-tag-unexp-reports");
+    if (ret != 0) {
+        self->tag.unexp_ents = NULL;
+        return UCS_ERR_NO_MEMORY;
+    }
+    memset(self->tag.unexp_ents, 0, len);
+
+    status = uct_cxi_do_map(lni, self->tag.unexp_ents, len,
+                            UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
+                            &self->tag.unexp_ents_mh);
+    if (status != UCS_OK) {
+        goto err_free;
+    }
+    if (self->tag.unexp_ents_mh.cxi_md->lac != 0) {
+        ucs_error("cxi unexpected-report entries landed on lac %u; only lac "
+                  "0 is supported",
+                  (unsigned)self->tag.unexp_ents_mh.cxi_md->lac);
+        uct_cxi_do_unmap(&self->tag.unexp_ents_mh);
+        status = UCS_ERR_UNSUPPORTED;
+        goto err_free;
+    }
+
+    self->tag.unexp_ents_len = len;
+    for (i = 0; i < self->tag.max_outstanding; i++) {
+        self->tag.unexp_ents[i].next_free =
+                (i + 1 < self->tag.max_outstanding) ?
+                &self->tag.unexp_ents[i + 1] : NULL;
+    }
+    self->tag.unexp_free = &self->tag.unexp_ents[0];
+    return UCS_OK;
+
+err_free:
+    ucs_free(self->tag.unexp_ents);
+    self->tag.unexp_ents = NULL;
+    return status;
+}
+
+/* Entries still held are dropped silently, no callback at teardown. */
+static void uct_cxi_iface_tag_unexp_cleanup(uct_cxi_iface_t *self)
+{
+    if (self->tag.unexp_ents == NULL) {
+        return;
+    }
+
+    uct_cxi_do_unmap(&self->tag.unexp_ents_mh);
+    ucs_free(self->tag.unexp_ents);
+    self->tag.unexp_ents     = NULL;
+    self->tag.unexp_free     = NULL;
+    self->tag.unexp_ents_len = 0;
+}
+
+/*
  * uct_cxi_iface_post_tag_ovf_le -- append one overflow-list LE for ring
  * buffer buf_idx. Mirrors uct_cxi_iface_post_am_le's shape (contiguous
  * ring, buffer_id-indexed, manage_local), but with the flags that make
@@ -214,11 +295,6 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
      * in cxi_iface.h. Growable, starts empty; never fails to init. */
     kh_init_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
 
-    /* Unexpected-rendezvous confirmations parked awaiting their initiator's
-     * header announce -- see uct_cxi_rndv_unexp_pending_t in cxi_tag.h.
-     * Never fails to init. */
-    ucs_queue_head_init(&self->tag.rndv_unexp_pending_q);
-
     /* Software-issued (get_issued==0) rendezvous Get tracking pool -- see
      * uct_cxi_rdzv_get_op_t in cxi_tag.h. Capped the same as
      * max_outstanding: never more outstanding software Gets than
@@ -239,24 +315,11 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         }
     }
 
-    /* Pending pool for unexpected-rendezvous confirmations that raced ahead
-     * of their initiator's header announce -- see uct_cxi_rndv_unexp_
-     * pending_t in cxi_tag.h. Same capacity reasoning as rdzv_get_op_pool
-     * (bounded by outstanding priority-LE receives). */
-    {
-        ucs_mpool_params_t mp_params;
-        unsigned           grow = ucs_min(64u, self->tag.max_outstanding);
-
-        ucs_mpool_params_reset(&mp_params);
-        mp_params.elem_size       = sizeof(uct_cxi_rndv_unexp_pending_t);
-        mp_params.elems_per_chunk = ucs_max(grow, 1u);
-        mp_params.max_elems       = self->tag.max_outstanding;
-        mp_params.ops             = &uct_cxi_tag_host_mpool_ops;
-        mp_params.name            = "cxi-tag-rndv-unexp-pending";
-        status = ucs_mpool_init(&mp_params, &self->tag.rndv_unexp_pending_pool);
-        if (status != UCS_OK) {
-            goto err_cleanup_rdzv_get_op_pool;
-        }
+    /* Unexpected messages held before they are reported -- see
+     * uct_cxi_unexp_report_t in cxi_tag.h. */
+    status = uct_cxi_iface_tag_unexp_init(self, lni);
+    if (status != UCS_OK) {
+        goto err_cleanup_rdzv_get_op_pool;
     }
 
     /* Overflow ring: one contiguous allocation, single cxil_map -- same
@@ -379,7 +442,7 @@ err_unmap_rx:
     uct_cxi_do_unmap(&self->tag.rx_mh);
     ucs_free(self->tag.rx_base);
     self->tag.rx_base = NULL;
-    ucs_mpool_cleanup(&self->tag.rndv_unexp_pending_pool, 1);
+    uct_cxi_iface_tag_unexp_cleanup(self);
 err_cleanup_rdzv_get_op_pool:
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
 err_free_rndv_peer_cache:
@@ -422,15 +485,75 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
     ucs_free(self->tag.ovf_refcnt);
 
     ucs_mpool_cleanup(&self->tag.rdzv_get_op_pool, 1);
-    /* Pending entries are dropped silently, no rndv_cb invocation at
-     * teardown -- matches rdzv_get_op_pool's own cleanup. */
-    ucs_mpool_cleanup(&self->tag.rndv_unexp_pending_pool, 1);
+    uct_cxi_iface_tag_unexp_cleanup(self);
     kh_destroy_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     ucs_free(self->tag.cancel_ctx);
     ucs_free(self->tag.free_list);
     ucs_free(self->tag.ctx);
 }
 
+
+/*
+ * uct_cxi_iface_rdzv_table_init -- the address table (see iface->rdzv.
+ * addr_table in cxi_iface.h): one registered slot for every possible 8-bit
+ * rendezvous id, so a read by a peer can never fall outside it. LAC 0 only,
+ * as that is all the RMA PTE a peer reads it through serves.
+ */
+static ucs_status_t
+uct_cxi_iface_rdzv_table_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
+{
+    size_t       page = ucs_get_page_size();
+    size_t       len  = ucs_align_up(UCT_CXI_RDZV_MAX_OUTSTANDING_MAX *
+                                     sizeof(uint64_t), page);
+    ucs_status_t status;
+    int          ret;
+
+    self->rdzv.addr_table     = NULL;
+    self->rdzv.addr_table_len = 0;
+
+    ret = ucs_posix_memalign((void **)&self->rdzv.addr_table, page, len,
+                             "cxi-rdzv-addr-table");
+    if (ret != 0) {
+        self->rdzv.addr_table = NULL;
+        return UCS_ERR_NO_MEMORY;
+    }
+    memset(self->rdzv.addr_table, 0, len);
+
+    status = uct_cxi_do_map(lni, self->rdzv.addr_table, len,
+                            UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
+                            &self->rdzv.addr_table_mh);
+    if (status != UCS_OK) {
+        goto err_free;
+    }
+    if (self->rdzv.addr_table_mh.cxi_md->lac != 0) {
+        ucs_error("cxi rendezvous address table landed on lac %u; only lac "
+                  "0 is supported",
+                  (unsigned)self->rdzv.addr_table_mh.cxi_md->lac);
+        uct_cxi_do_unmap(&self->rdzv.addr_table_mh);
+        status = UCS_ERR_UNSUPPORTED;
+        goto err_free;
+    }
+
+    self->rdzv.addr_table_len = len;
+    return UCS_OK;
+
+err_free:
+    ucs_free(self->rdzv.addr_table);
+    self->rdzv.addr_table = NULL;
+    return status;
+}
+
+static void uct_cxi_iface_rdzv_table_cleanup(uct_cxi_iface_t *self)
+{
+    if (self->rdzv.addr_table == NULL) {
+        return;
+    }
+
+    uct_cxi_do_unmap(&self->rdzv.addr_table_mh);
+    ucs_free(self->rdzv.addr_table);
+    self->rdzv.addr_table     = NULL;
+    self->rdzv.addr_table_len = 0;
+}
 
 /*
  * uct_cxi_iface_open_rdzv_pte -- rendezvous source-exposure PTE. Matching
@@ -478,6 +601,11 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         self->rdzv.free_ids[i] = i;
     }
     self->rdzv.free_count = self->rdzv.max_outstanding;
+
+    status = uct_cxi_iface_rdzv_table_init(self, lni);
+    if (status != UCS_OK) {
+        goto err_free_ids;
+    }
 
     {
         struct cxi_pt_alloc_opts pt_opts = {
@@ -590,6 +718,7 @@ err_destroy_pte:
     cxil_destroy_pte(self->rdzv.pte);
     self->rdzv.pte = NULL;
 err_free_ids:
+    uct_cxi_iface_rdzv_table_cleanup(self);
     ucs_free(self->rdzv.free_ids);
     self->rdzv.free_ids = NULL;
 err_free_ops:
@@ -618,6 +747,7 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self)
             ucs_warn("cxi cxil_destroy_pte RDZV failed: %s", strerror(-ret));
         }
     }
+    uct_cxi_iface_rdzv_table_cleanup(self);
     ucs_free(self->rdzv.free_ids);
     self->rdzv.free_ids = NULL;
     ucs_free(self->rdzv.ops);
@@ -716,7 +846,12 @@ uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
 }
 
 /*
- * uct_cxi_iface_tag_handle_search_delete_confirm_eager -- the "found and
+ * uct_cxi_iface_tag_report_unexp_eager -- report an unexpected eager message
+ * to UCP: the work of uct_cxi_iface_tag_handle_search_delete_confirm_eager()
+ * (below), done at once or, if the message has to wait behind an unexpected
+ * rendezvous of the same sender, later from a copy of the same event.
+ *
+ * The "found and
  * deleted" confirmation for our own SEARCH_AND_DELETE: a
  * C_EVENT_PUT_OVERFLOW on the tag PTE whose buffer_id falls in the
  * reserved SEARCH_AND_DELETE range (see UCT_CXI_TAG_SEARCH_DELETE_
@@ -754,9 +889,9 @@ uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
  * deleted), so this is also where the arrival's own overflow-buffer
  * reference is released.
  */
-void
-uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
-                                               const union c_event *event)
+static void
+uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
+                                     const union c_event *event)
 {
     int      buf_idx = (int)event->tgt_long.buffer_id -
                        UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE;
@@ -812,77 +947,336 @@ uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
     }
 }
 
-/*
- * uct_cxi_iface_rndv_unexp_pending_push -- park a genuinely-unexpected
- * rendezvous SEARCH_AND_DELETE confirmation that arrived before its
- * initiator's one-time header announce was processed (see uct_cxi_rndv_
- * unexp_pending_t's doc comment in cxi_tag.h). Drained later by
- * uct_cxi_iface_rndv_unexp_pending_drain() once that announce lands.
+/* -------------------------------------------------------------------------
+ * Held unexpected reports (see uct_cxi_unexp_report_t in cxi_tag.h)
+ * -------------------------------------------------------------------------
  */
-static ucs_status_t
-uct_cxi_iface_rndv_unexp_pending_push(uct_cxi_iface_t *iface,
-                                      const union c_event *event)
-{
-    uct_cxi_rndv_unexp_pending_t *p =
-            ucs_mpool_get(&iface->tag.rndv_unexp_pending_pool);
 
-    if (ucs_unlikely(p == NULL)) {
-        return UCS_ERR_NO_RESOURCE;
+#define UCT_CXI_UNEXP_BLOCKED_MAX  8
+
+static void uct_cxi_unexp_read_comp(uct_cxi_send_op_t *op, ucs_status_t status);
+
+/* Take an entry for \a event and put it at the end of the queue. NULL if all
+ * are in use. */
+static uct_cxi_unexp_report_t *
+uct_cxi_unexp_alloc(uct_cxi_iface_t *iface, const union c_event *event,
+                    int is_rndv)
+{
+    uct_cxi_unexp_report_t *e = iface->tag.unexp_free;
+
+    if (e == NULL) {
+        return NULL;
     }
 
-    p->initiator      = event->tgt_long.initiator.initiator.process;
-    p->tag             = event->tgt_long.match_bits;
-    p->remote_offset   = event->tgt_long.remote_offset;
-    p->rlength         = event->tgt_long.rlength;
-    p->header_data     = event->tgt_long.header_data;
-    p->rendezvous_id   = event->tgt_long.rendezvous_id;
-    ucs_queue_push(&iface->tag.rndv_unexp_pending_q, &p->queue);
-    return UCS_OK;
+    iface->tag.unexp_free = e->next_free;
+    e->op.ep              = NULL;
+    e->op.comp            = NULL;
+    e->op.handler         = uct_cxi_unexp_read_comp;
+    e->iface              = iface;
+    e->event              = *event;
+    e->initiator          = event->tgt_long.initiator.initiator.process;
+    e->tag                = event->tgt_long.match_bits;
+    e->rendezvous_id      = event->tgt_long.rendezvous_id;
+    e->is_rndv            = is_rndv;
+    e->state              = is_rndv ? UCT_CXI_UNEXP_NEW : UCT_CXI_UNEXP_READY;
+    e->value              = 0;
+    ucs_queue_push(&iface->tag.unexp_q, &e->queue);
+    iface->tag.unexp_held += is_rndv;
+    return e;
+}
+
+/* Give back an entry already taken off the queue. */
+static void uct_cxi_unexp_release(uct_cxi_iface_t *iface,
+                                  uct_cxi_unexp_report_t *e)
+{
+    iface->tag.unexp_held -= e->is_rndv;
+    e->next_free          = iface->tag.unexp_free;
+    iface->tag.unexp_free = e;
+}
+
+/* The same message stream as far as ordering goes: one sender, one tag. */
+static UCS_F_ALWAYS_INLINE int
+uct_cxi_unexp_same_stream(const uct_cxi_unexp_report_t *e, uint32_t initiator,
+                          uint64_t tag)
+{
+    return (e->initiator == initiator) &&
+           (e->tag == tag);
+}
+
+/* Is anything of this sender's stream with this tag waiting to be reported? */
+static int uct_cxi_unexp_is_held(uct_cxi_iface_t *iface, uint32_t initiator,
+                                 uint64_t tag)
+{
+    uct_cxi_unexp_report_t *e;
+
+    ucs_queue_for_each(e, &iface->tag.unexp_q, queue) {
+        if (uct_cxi_unexp_same_stream(e, initiator, tag)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /*
- * uct_cxi_iface_rndv_unexp_pending_drain -- complete every pending
- * confirmation for @a initiator, now that its header announce has
- * populated iface->tag.rndv_peer_cache. Multiple entries for the same
- * initiator are possible (pipelined unexpected sends before the announce
- * lands) -- keep scanning after a match rather than stopping at the first.
+ * Post the read of the source address of \a e's rendezvous: 8 bytes from
+ * slot rendezvous_id of the sender's address table, with the same restricted
+ * RMA Get any endpoint would use against its RMA PTE (LAC 0, pid_offset 0).
+ * The sender's address is built from the event's initiator -- there is no
+ * endpoint to the sender here, tag receives belong to the interface -- and
+ * the table's base address is what its announce told us.
+ *
+ * The read itself is not waited for; only for room in the command queue, if
+ * it is full, as everywhere else this interface posts a command from an event
+ * handler (the NIC empties it without any help from us). The REPLY is on the
+ * RX queue, as for the other Gets issued from an event handler (which cannot
+ * be refused for lack of a TX queue slot). UCS_ERR_NO_ELEM: the sender's
+ * announce has not been seen yet.
  */
-static void
-uct_cxi_iface_rndv_unexp_pending_drain(uct_cxi_iface_t *iface,
-                                       uint32_t initiator)
+static ucs_status_t uct_cxi_unexp_start_read(uct_cxi_iface_t *iface,
+                                             uct_cxi_unexp_report_t *e)
 {
-    uct_cxi_rndv_unexp_pending_t *p;
-    ucs_queue_iter_t              iter;
+    uct_cxi_md_t                  *md = uct_cxi_iface_md(iface);
+    khiter_t                       k  = kh_get(uct_cxi_rndv_peer_hash,
+                                               &iface->tag.rndv_peer_cache,
+                                               e->initiator);
+    const uct_cxi_rndv_peer_hdr_t *peer;
+    struct c_full_dma_cmd          cmd = {};
+    union c_fab_addr               dfa;
+    uint8_t                        idx_ext;
+    ucs_time_t                     deadline;
+    int                            ret;
 
-    ucs_queue_for_each_safe(p, iter, &iface->tag.rndv_unexp_pending_q, queue) {
-        khiter_t k;
-        uct_cxi_rndv_hdr_wire_t hdr;
-        uct_cxi_rkey_t rkey = {};
+    if (k == kh_end(&iface->tag.rndv_peer_cache)) {
+        return UCS_ERR_NO_ELEM;
+    }
+    peer = &kh_value(&iface->tag.rndv_peer_cache, k);
 
-        if (p->initiator != initiator) {
+    cxi_build_dfa(CXI_MATCH_ID_EP(md->pid_bits, e->initiator),
+                  CXI_MATCH_ID_PID(md->pid_bits, e->initiator), md->pid_bits,
+                  0 /* the RMA PTE of LAC 0 */, &dfa, &idx_ext);
+
+    cmd.command.opcode     = C_CMD_GET;
+    cmd.index_ext          = idx_ext;
+    cmd.lac                = iface->tag.unexp_ents_mh.cxi_md->lac;
+    cmd.event_send_disable = 1;
+    cmd.restricted         = 1;
+    cmd.eq                 = iface->rx_eq.evtq->eqn;
+    cmd.dfa                = dfa;
+    cmd.remote_offset      = peer->table_iova +
+                             (uint64_t)e->event.tgt_long.rendezvous_id *
+                             sizeof(uint64_t);
+    cmd.local_addr         = iface->tag.unexp_ents_mh.iova_offset +
+                             (uint64_t)(uintptr_t)&e->value;
+    cmd.request_len        = sizeof(e->value);
+    cmd.user_ptr           = (uint64_t)(uintptr_t)e;
+
+    deadline = ucs_get_time() + ucs_time_from_sec(UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
+    do {
+        ret = cxi_cq_emit_dma(iface->tx.cmdq, &cmd);
+    } while ((ret == -ENOSPC) && (ucs_get_time() < deadline));
+    if (ucs_unlikely(ret != 0)) {
+        return UCS_ERR_IO_ERROR;
+    }
+
+    cxi_cq_ring(iface->tx.cmdq);
+    return UCS_OK;
+}
+
+/* Post the address read of every rendezvous that has not had it posted and
+ * can. */
+static void uct_cxi_unexp_start_reads(uct_cxi_iface_t *iface)
+{
+    uct_cxi_unexp_report_t *e;
+    ucs_queue_iter_t        iter;
+
+    ucs_queue_for_each_safe(e, iter, &iface->tag.unexp_q, queue) {
+        ucs_status_t status;
+
+        if (!e->is_rndv || (e->state != UCT_CXI_UNEXP_NEW)) {
             continue;
         }
 
-        k = kh_get(uct_cxi_rndv_peer_hash, &iface->tag.rndv_peer_cache,
-                  initiator);
-        ucs_assert(k != kh_end(&iface->tag.rndv_peer_cache));
-        hdr.ep_id    = kh_value(&iface->tag.rndv_peer_cache, k).ep_id;
-        hdr.md_index = kh_value(&iface->tag.rndv_peer_cache, k).md_index;
-        hdr.req_id   = p->header_data;
-
-        rkey.is_rndv       = 1;
-        rkey.rendezvous_id = p->rendezvous_id;
-
-        ucs_info("cxi TAG [RNDV-HDR-ANNOUNCE-DRAIN] tag=0x%lx "
-                 "rlength=%u rendezvous_id=%u", (unsigned long)p->tag,
-                 p->rlength, (unsigned)rkey.rendezvous_id);
-
-        ucs_queue_del_iter(&iface->tag.rndv_unexp_pending_q, iter);
-        (void)iface->tag.rndv_cb(iface->tag.rndv_arg, 0, p->tag, &hdr,
-                                 sizeof(hdr), p->remote_offset, p->rlength,
-                                 &rkey);
-        ucs_mpool_put(p);
+        status = uct_cxi_unexp_start_read(iface, e);
+        if (status == UCS_OK) {
+            e->state = UCT_CXI_UNEXP_READING;
+        } else if (status != UCS_ERR_NO_ELEM) {
+            ucs_error("cxi TAG cannot read the source address of an "
+                      "unexpected rendezvous: %s",
+                      ucs_status_string(status));
+            e->state = UCT_CXI_UNEXP_FAILED;
+        }
+        /* NO_ELEM: the announce handler brings us back. */
     }
+}
+
+/*
+ * The first entry that can be reported now: ready itself, and with nothing of
+ * the same stream (sender and tag) ahead of it that is not. Entries of other
+ * streams do not wait for one another. Only a few waiting streams are
+ * tracked: past that, nothing behind them is reported until they are, which
+ * is slower, not wrong.
+ */
+static uct_cxi_unexp_report_t *
+uct_cxi_unexp_next_ready(uct_cxi_iface_t *iface, ucs_queue_iter_t *iter_p)
+{
+    struct {
+        uint32_t initiator;
+        uint64_t tag;
+    }                       blocked[UCT_CXI_UNEXP_BLOCKED_MAX];
+    unsigned                num_blocked = 0;
+    uct_cxi_unexp_report_t *e;
+    ucs_queue_iter_t        iter;
+
+    ucs_queue_for_each_safe(e, iter, &iface->tag.unexp_q, queue) {
+        unsigned i;
+        int      is_blocked = 0;
+
+        for (i = 0; i < num_blocked; i++) {
+            if ((blocked[i].initiator == e->initiator) &&
+                (blocked[i].tag == e->tag)) {
+                is_blocked = 1;
+                break;
+            }
+        }
+        if (is_blocked) {
+            continue;
+        }
+
+        if (!e->is_rndv || (e->state == UCT_CXI_UNEXP_READY) ||
+            (e->state == UCT_CXI_UNEXP_FAILED)) {
+            *iter_p = iter;
+            return e;
+        }
+
+        if (num_blocked == UCT_CXI_UNEXP_BLOCKED_MAX) {
+            return NULL;
+        }
+        blocked[num_blocked].initiator = e->initiator;
+        blocked[num_blocked].tag       = e->tag;
+        num_blocked++;
+    }
+
+    return NULL;
+}
+
+/*
+ * Report \a e to UCP and give it back. The entry is released first and the
+ * report made from copies, as the callback may re-enter progress.
+ *
+ * For a rendezvous, rndv_cb gets what UCP's later pull needs:
+ *   - header/header_length: this sender's cached {ep_id, md_index} (its
+ *     announce) plus this message's own req_id (header_data).
+ *   - remote_addr: the source address read from the sender's table.
+ *   - rkey_buf: a stack uct_cxi_rkey_t with is_rndv=1 and rendezvous_id --
+ *     enough for UCP's later uct_ep_get_zcopy/bcopy to reach the sender's
+ *     rendezvous source PTE through its own uct_ep, whose rem_nid/rem_pid
+ *     already identify the peer. No real memory key exists to pack here.
+ * flags=0, as the reference HW-tag-offload transport (uct_rc_mlx5_handle_
+ * unexp_rndv()) passes: a rendezvous report is never fragmented.
+ */
+static void uct_cxi_unexp_report(uct_cxi_iface_t *iface,
+                                 uct_cxi_unexp_report_t *e)
+{
+    union c_event            event   = e->event;
+    uint64_t                 addr    = e->value;
+    int                      is_rndv = e->is_rndv;
+    int                      failed  = (e->state == UCT_CXI_UNEXP_FAILED);
+    uct_cxi_rndv_hdr_wire_t  hdr;
+    uct_cxi_rkey_t           rkey    = {};
+    khiter_t                 k;
+
+    uct_cxi_unexp_release(iface, e);
+
+    if (!is_rndv) {
+        uct_cxi_iface_tag_report_unexp_eager(iface, &event);
+        return;
+    }
+
+    if (failed) {
+        ucs_error("cxi TAG unexpected rendezvous tag=0x%lx dropped: the "
+                  "source address could not be read from its sender",
+                  (unsigned long)event.tgt_long.match_bits);
+        return;
+    }
+
+    k = kh_get(uct_cxi_rndv_peer_hash, &iface->tag.rndv_peer_cache,
+               event.tgt_long.initiator.initiator.process);
+    ucs_assert(k != kh_end(&iface->tag.rndv_peer_cache));
+    hdr.ep_id    = kh_value(&iface->tag.rndv_peer_cache, k).ep_id;
+    hdr.md_index = kh_value(&iface->tag.rndv_peer_cache, k).md_index;
+    hdr.req_id   = event.tgt_long.header_data;
+
+    rkey.is_rndv       = 1;
+    rkey.rendezvous_id = event.tgt_long.rendezvous_id;
+
+    ucs_info("cxi TAG [RNDV-REPORT] tag=0x%lx rlength=%u rendezvous_id=%u "
+             "addr=0x%lx", (unsigned long)event.tgt_long.match_bits,
+             (unsigned)event.tgt_long.rlength, (unsigned)rkey.rendezvous_id,
+             (unsigned long)addr);
+
+    (void)iface->tag.rndv_cb(iface->tag.rndv_arg, 0,
+                             event.tgt_long.match_bits, &hdr, sizeof(hdr),
+                             addr, event.tgt_long.rlength, &rkey);
+}
+
+void uct_cxi_iface_unexp_progress(uct_cxi_iface_t *iface)
+{
+    uct_cxi_unexp_report_t *e;
+    ucs_queue_iter_t        iter;
+
+    /* A report can call into UCP, which may make progress again on this
+     * interface: whatever that adds is for this call to get to. */
+    if (iface->tag.unexp_busy) {
+        return;
+    }
+    iface->tag.unexp_busy = 1;
+
+    uct_cxi_unexp_start_reads(iface);
+    while ((e = uct_cxi_unexp_next_ready(iface, &iter)) != NULL) {
+        ucs_queue_del_iter(&iface->tag.unexp_q, iter);
+        uct_cxi_unexp_report(iface, e);
+        uct_cxi_unexp_start_reads(iface);
+    }
+
+    iface->tag.unexp_busy = 0;
+}
+
+/* An address read is over. */
+static void uct_cxi_unexp_read_comp(uct_cxi_send_op_t *op, ucs_status_t status)
+{
+    uct_cxi_unexp_report_t *e = (uct_cxi_unexp_report_t *)op;
+
+    e->state = (status == UCS_OK) ? UCT_CXI_UNEXP_READY :
+                                    UCT_CXI_UNEXP_FAILED;
+    uct_cxi_iface_unexp_progress(e->iface);
+}
+
+/*
+ * uct_cxi_iface_tag_handle_search_delete_confirm_eager -- the "found and
+ * deleted" confirmation of our SEARCH_AND_DELETE for an unexpected eager
+ * message (see uct_cxi_iface_tag_report_unexp_eager() above for the event).
+ * Reported at once, unless an unexpected rendezvous with the same tag from
+ * the same sender is still waiting for its address: it arrived first, so UCP
+ * must hear of it first, and this waits behind it. The test costs one load
+ * when no rendezvous is held.
+ */
+void
+uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
+                                                     const union c_event *event)
+{
+    if (ucs_unlikely(iface->tag.unexp_held != 0) &&
+        (cxi_event_rc(event) == C_RC_OK) &&
+        uct_cxi_unexp_is_held(iface,
+                              event->tgt_long.initiator.initiator.process,
+                              event->tgt_long.match_bits)) {
+        if (uct_cxi_unexp_alloc(iface, event, 0) != NULL) {
+            return;
+        }
+        ucs_warn("cxi TAG no free entry to hold an unexpected eager message "
+                 "behind an unexpected rendezvous: reporting it out of order");
+    }
+
+    uct_cxi_iface_tag_report_unexp_eager(iface, event);
 }
 
 /*
@@ -890,8 +1284,8 @@ uct_cxi_iface_rndv_unexp_pending_drain(uct_cxi_iface_t *iface,
  * one-time-per-ep control message sent by uct_cxi_ep_send_rndv_hdr_announce
  * (cxi_am.c). Dispatched from cxi_iface.c's AM handling before ever
  * reaching uct_iface_invoke_am() -- this is not a real user AM. Populates
- * this initiator's entry in iface->tag.rndv_peer_cache, then drains any
- * unexpected-rendezvous confirmations that were parked awaiting it.
+ * this initiator's entry in iface->tag.rndv_peer_cache, then lets whatever
+ * of its unexpected rendezvous was waiting for it go on.
  */
 void uct_cxi_iface_handle_rndv_hdr_announce(uct_cxi_iface_t *iface,
                                             const union c_event *event,
@@ -918,85 +1312,56 @@ void uct_cxi_iface_handle_rndv_hdr_announce(uct_cxi_iface_t *iface,
     kh_value(&iface->tag.rndv_peer_cache, k) = *hdr;
 
     ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] initiator=0x%x ep_id=0x%lx "
-             "md_index=%u", initiator, (unsigned long)hdr->ep_id,
-             (unsigned)hdr->md_index);
+             "md_index=%u table_iova=0x%lx", initiator,
+             (unsigned long)hdr->ep_id, (unsigned)hdr->md_index,
+             (unsigned long)hdr->table_iova);
 
-    uct_cxi_iface_rndv_unexp_pending_drain(iface, initiator);
+    uct_cxi_iface_unexp_progress(iface);
 }
 
 /*
  * uct_cxi_iface_tag_handle_search_delete_confirm_rndv -- rendezvous
- * counterpart of tag_handle_search_delete_confirm_eager() above (buffer_id in the
- * disjoint RNDV range). No payload to copy -- a rendezvous message's data
+ * counterpart of tag_handle_search_delete_confirm_eager() above (buffer_id in
+ * the disjoint RNDV range). No payload to copy -- a rendezvous message's data
  * is pulled later by UCP's own generic Get, not delivered inline. mlength is
  * always 0 here (a rendezvous Put never eager-attaches anything -- see
  * uct_ep_tag_rndv_zcopy), so this never touches the overflow buffer at all.
- * This just hands rndv_cb what that later Get needs:
- *   - header/header_length: reconstructed from this peer's cached
- *     {ep_id, md_index} (uct_cxi_iface_handle_rndv_hdr_announce) plus this
- *     arrival's own header_data (req_id). A cache miss means this
- *     initiator's one-time announce hasn't been processed yet -- a
- *     legitimate race (see uct_cxi_rndv_unexp_pending_t's doc comment in
- *     cxi_tag.h), not an error: park this confirmation and complete it once
- *     the announce arrives.
- *   - remote_addr = event->tgt_long.remote_offset directly (the sender's
- *     real source-buffer offset, not an RMA-style rkey-relative value).
- *   - rkey_buf: a stack uct_cxi_rkey_t with is_rndv=1 and rendezvous_id --
- *     enough for UCP's later uct_ep_get_zcopy/bcopy call to reach this
- *     transport's rendezvous source PTE via the same uct_ep, whose
- *     rem_nid/rem_pid already identify the peer. No real memory key exists
- *     to pack for this case.
+ *
+ * It cannot be reported yet: UCP needs the sender's source address, which the
+ * hardware does not give us (see uct_cxi_unexp_report_t). It is queued in
+ * arrival order, and reported once the address has been read from the sender
+ * -- and the sender's announce has been seen, which gives the header fields
+ * and where to read.
  */
 void
 uct_cxi_iface_tag_handle_search_delete_confirm_rndv(uct_cxi_iface_t *iface,
                                                     const union c_event *event)
 {
-    uint64_t tag       = event->tgt_long.match_bits;
-    uint32_t initiator = event->tgt_long.initiator.initiator.process;
-    uct_cxi_rndv_hdr_wire_t hdr;
-    uct_cxi_rkey_t rkey = {};
-    khiter_t k;
-
     if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
         /* See tag_handle_search_delete_confirm_eager()'s own doc comment --
          * not expected to be reachable with use_once=1. Nothing to release
          * (mlength is always 0 for rendezvous, so no ovf_refcnt reference
          * was ever taken for this arrival). */
         ucs_error("cxi TAG [SEARCH-DELETE-RNDV-UNEXPECTED-RC] tag=0x%lx "
-                 "rc=%d", (unsigned long)tag, cxi_event_rc(event));
+                  "rc=%d", (unsigned long)event->tgt_long.match_bits,
+                  cxi_event_rc(event));
         return;
     }
-
-    k = kh_get(uct_cxi_rndv_peer_hash, &iface->tag.rndv_peer_cache, initiator);
-    if (ucs_unlikely(k == kh_end(&iface->tag.rndv_peer_cache))) {
-        ucs_status_t status = uct_cxi_iface_rndv_unexp_pending_push(iface,
-                                                                     event);
-        if (ucs_unlikely(status != UCS_OK)) {
-            ucs_error("cxi TAG rndv_unexp_pending_pool exhausted, "
-                     "tag=0x%lx initiator=0x%x", (unsigned long)tag,
-                     initiator);
-        }
-        return;
-    }
-    hdr.ep_id    = kh_value(&iface->tag.rndv_peer_cache, k).ep_id;
-    hdr.md_index = kh_value(&iface->tag.rndv_peer_cache, k).md_index;
-    hdr.req_id   = event->tgt_long.header_data;
-
-    rkey.is_rndv       = 1;
-    rkey.rendezvous_id = event->tgt_long.rendezvous_id;
 
     ucs_info("cxi TAG [SEARCH-DELETE-RNDV-MATCH] tag=0x%lx rlength=%u "
-             "rendezvous_id=%u", (unsigned long)tag,
-             (unsigned)event->tgt_long.rlength, (unsigned)rkey.rendezvous_id);
+             "rendezvous_id=%u", (unsigned long)event->tgt_long.match_bits,
+             (unsigned)event->tgt_long.rlength,
+             (unsigned)event->tgt_long.rendezvous_id);
 
-    /* flags=0 -- matches the reference HW-tag-offload transport
-     * (uct_rc_mlx5_handle_unexp_rndv(), rc_mlx5_common.c), which passes a
-     * literal 0 here; this transport never fragments a rendezvous
-     * unexpected-arrival report across multiple callback invocations, so
-     * there is no FIRST/LAST-style flag to set. */
-    (void)iface->tag.rndv_cb(iface->tag.rndv_arg, 0, tag, &hdr, sizeof(hdr),
-                             event->tgt_long.remote_offset,
-                             event->tgt_long.rlength, &rkey);
+    if (ucs_unlikely(uct_cxi_unexp_alloc(iface, event, 1) == NULL)) {
+        ucs_error("cxi TAG no free entry to hold an unexpected rendezvous, "
+                  "tag=0x%lx initiator=0x%x -- dropped",
+                  (unsigned long)event->tgt_long.match_bits,
+                  (unsigned)event->tgt_long.initiator.initiator.process);
+        return;
+    }
+
+    uct_cxi_iface_unexp_progress(iface);
 }
 
 /*
@@ -2107,6 +2472,13 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     rop = &iface->rdzv.ops[id];
 
     local_addr    = memh->iova_offset + (uint64_t)(uintptr_t)iov[0].buffer;
+
+    /* Where a target that takes this off its unexpected list can find the
+     * source address (see iface->rdzv.addr_table). A plain store: the Put
+     * below is written to the command queue and the doorbell rung after it,
+     * and that ordering is all the NIC's later read of the slot needs. */
+    iface->rdzv.addr_table[id] = local_addr;
+
     rop->op.ep      = ep;   /* real ep -- unlike uct_cxi_rdzv_get_op_t, this
                              * op has a genuine owning ep, so the normal
                              * ep->outstanding/iface->tx.outstanding/flush
