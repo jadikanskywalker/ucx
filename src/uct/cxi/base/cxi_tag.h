@@ -37,17 +37,13 @@
  * matching is credited and sized like the AM ring. */
 #define UCT_CXI_TAG_OVF_MIN_FREE      256u
 
-/* buffer_id (uint16_t) splits into three disjoint ranges: real priority-LE
- * slot ids [0, max_outstanding); one reserved *eager* SEARCH_AND_DELETE id
- * per overflow buffer, [BUFIDX_BASE, BUFIDX_BASE + num_bufs); and,
- * separately, one reserved *rendezvous* id per overflow buffer,
- * [RNDV_BUFIDX_BASE, + num_bufs) -- eager and rendezvous arrivals share the
- * same overflow ring but dispatch to different UCP callbacks (eager_cb vs
- * rndv_cb), so each buf_idx needs two distinct ids. num_bufs is capped at
- * UCT_CXI_TAG_OVF_NUM_BUFS_MAX so both split points stay fixed constants. */
+/* Cap on the number of overflow ring buffers (TAG_OVERFLOW_NUM_BUFS). */
 #define UCT_CXI_TAG_OVF_NUM_BUFS_MAX      1024u
-#define UCT_CXI_TAG_MAX_OUTSTANDING_MAX   \
-        (65535u - (2u * UCT_CXI_TAG_OVF_NUM_BUFS_MAX))
+
+/* buffer_id (uint16_t) is ours to choose on a command and comes back on its
+ * events: real priority-LE slot ids are [0, max_outstanding), and the one id
+ * above them is reserved for our own SEARCH_AND_DELETE commands. */
+#define UCT_CXI_TAG_MAX_OUTSTANDING_MAX   65534u
 
 /* Advertised rndv.max_hdr -- must be >= sizeof(ucp_tag_offload_unexp_
  * rndv_hdr_t) (17 bytes), which UCP sends with every offloaded rendezvous
@@ -57,45 +53,19 @@
  * zcopy). 32 is comfortable margin. */
 #define UCT_CXI_TAG_RNDV_MAX_HDR      32u
 
-/* Base of the reserved buffer_id range used for our own SEARCH_AND_DELETE
- * commands -- one entry per overflow ring buffer (buf_idx), not one per
- * outstanding command or per arrival. uct_cxi_iface_tag_handle_ovf_
- * arrival() sets sd.buffer_id = BASE + buf_idx when it issues the command
- * for an arrival into that buffer; the confirmation's own buffer_id then
- * directly *is* buf_idx (minus BASE) -- no separate tracking table,
- * free-list, or ordering assumption needed.
+/* The buffer_id of every SEARCH_AND_DELETE command we issue, and so of the
+ * events it produces (C_EVENT_PUT_OVERFLOW if it found and deleted a
+ * message, C_EVENT_SEARCH if it found nothing): it tells those apart from
+ * the events of priority LEs (a delayed match is also a C_EVENT_PUT_OVERFLOW).
  *
- * Why buffer_id and not match_bits (the tag): match_bits is not a safe
- * correlation key on its own -- the same tag can legitimately be
- * outstanding on multiple concurrent messages between a peer pair (normal
- * MPI/UCX usage), so two different arrivals could share it. buffer_id is a
- * field we assign ourselves, so it has no such collision risk.
- *
- * Why per-buffer-generation and not per-arrival: ovf_refcnt itself is
- * tracked per buf_idx, not per arrival (see cxi_iface.h's doc comment on
- * it) -- multiple arrivals into the same generation all just need to
- * decrement the *same* counter, so a shared per-buf_idx id is sufficient;
- * nothing needs to distinguish which specific arrival within a generation
- * a given confirmation belongs to.
- *
- * Why this exists at all (why the previous single shared sentinel wasn't
- * enough): with sd.use_once=1 (see tag_handle_ovf_arrival()'s own comment
- * on why that flag is now set), a "not found" outcome is confirmed via
- * C_EVENT_SEARCH alone, and that event's own event->tgt_long.start is
- * always 0 -- not a real address (empirically confirmed on real hardware,
- * test_cxi_tag_ovf.raw_event_order_and_manual_search_delete: 8/8 runs, a
- * "won" confirmation on the same command shape always carries a real,
- * correct start, a "lost" one always shows exactly 0x0). buf_idx cannot be
- * recovered from that event's own fields at all, so it has to be encoded
- * directly into the one field the command lets us choose ourselves. */
-#define UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE  UCT_CXI_TAG_MAX_OUTSTANDING_MAX
-
-/* Rendezvous counterpart of the range above -- see its own doc comment
- * (UCT_CXI_TAG_OVF_NUM_BUFS_MAX's comment) for why a disjoint range is
- * needed. Dispatched in cxi_iface.c's progress loop before ever falling
- * back to the eager SEARCH_AND_DELETE handlers. */
-#define UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE \
-        (UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + UCT_CXI_TAG_OVF_NUM_BUFS_MAX)
+ * It says nothing about WHICH message. A SEARCH_AND_DELETE deletes the oldest
+ * entry with its tag, which need not be the arrival it was issued for (that
+ * one may have been taken by a receive posted meanwhile, leaving a later one
+ * of the same tag), so a found message is identified by its own event: its
+ * start address (eager: which ring buffer, and the data), its rendezvous flag
+ * and its initiator and rendezvous_id. The "not found" event carries none of
+ * that (its start is always 0), and needs none: it is not acted on. */
+#define UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID  UCT_CXI_TAG_MAX_OUTSTANDING_MAX
 
 /* uct_cxi_tag_ctx_priv_t::rndv_flags bits 1-3 -- per-event bookkeeping for
  * a rendezvous receive (pre-shifted to land directly in rndv_flags).
@@ -387,16 +357,17 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self);
  */
 void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                           const union c_event *event);
-/* Dispatched from cxi_iface.c for a C_EVENT_PUT_OVERFLOW whose buffer_id
- * falls in the reserved eager SEARCH_AND_DELETE range (see UCT_CXI_TAG_
- * SEARCH_DELETE_BUFIDX_BASE), before choosing between eager and rendezvous
- * match handling. With sd.use_once=1, this event only ever fires "found and
+/* Dispatched from cxi_iface.c for a C_EVENT_PUT_OVERFLOW whose buffer_id is
+ * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID and whose message is eager (the
+ * event's own rendezvous flag, not which arrival the command was issued
+ * for), before choosing between eager and rendezvous match handling.
+ * With sd.use_once=1, this event only ever fires "found and
  * deleted" (C_RC_OK) -- "not found" is C_EVENT_SEARCH, see
  * uct_cxi_iface_tag_handle_search_delete_not_found() below. */
 void uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
                                                     const union c_event *event);
-/* Rendezvous counterpart of the above, for the disjoint RNDV_BUFIDX_BASE
- * range: calls rndv_cb instead of eager_cb, and reconstructs/caches the
+/* Rendezvous counterpart of the above, for a message whose event has the
+ * rendezvous flag: calls rndv_cb instead of eager_cb, and reconstructs/caches the
  * unexpected-rndv header (uct_cxi_rndv_peer_hdr_t) instead of just copying
  * raw eager bytes. */
 void uct_cxi_iface_tag_handle_search_delete_confirm_rndv(
@@ -471,21 +442,38 @@ typedef struct uct_cxi_rndv_hdr_wire {
 } UCS_S_PACKED uct_cxi_rndv_hdr_wire_t;
 
 /*
- * uct_cxi_unexp_report_t -- an unexpected message that our SEARCH_AND_DELETE
- * has taken off the hardware list, held until it can be reported to UCP in
- * order (iface->tag.unexp_q).
+ * uct_cxi_unexp_report_t -- an unexpected message that has to wait before it
+ * can be reported to UCP in order (iface->tag.unexp_q).
  *
  * A rendezvous cannot be reported at once: UCP needs the sender's source
  * address, which the hardware does not give us (the events' remote_offset is
  * 0 for an unexpected message), so it is read from the sender's address
- * table (iface->rdzv.addr_table) with an 8-byte RMA Get, and reported when
- * that completes. That is a round trip, and UCP matches unexpected messages
- * in the order they are reported, so a later message with the same tag from
- * the same sender must not be reported ahead of it: it is held behind it, in
- * this queue (an eager one, or another rendezvous, whose own read may finish
+ * table (iface->rdzv.addr_table) with an 8-byte RMA Get. That read is posted
+ * speculatively, as soon as the message is seen, in parallel with the
+ * SEARCH_AND_DELETE that decides whether we own it. Three events can follow
+ * for one rendezvous (identified by its initiator and rendezvous_id, which
+ * all of them carry):
+ *   - ARRIVED: the Put into the overflow list, the first event for it.
+ *   - OWNED:   our SEARCH_AND_DELETE found and deleted it: it is ours to
+ *              report.
+ *   - LOST:    a receive posted in the meantime matched it first (its
+ *              delayed-match event). The message is that receive's, and the
+ *              read, if posted, was for nothing: it cannot be cancelled, so
+ *              the entry is kept until its REPLY returns, only to be the
+ *              landing buffer of it.
+ * (A SEARCH_AND_DELETE that finds nothing is not an event of ours to act on.)
+ * Hardware may deliver these out of order, so any of them can create the
+ * entry; a LOST that comes before ARRIVED leaves a tombstone, which the
+ * ARRIVED removes. Reported once ARRIVED, OWNED and the address is read.
+ *
+ * UCP matches unexpected messages in the order they are reported, so a later
+ * message with the same tag from the same sender must not be reported ahead
+ * of one whose address is still on its way: it is held behind it, in this
+ * queue (an eager one, or another rendezvous, whose own read may finish
  * first). Messages with other tags, or from other senders, are never held:
  * ordering them is not something UCP or the network promises, and a receive
- * with a wildcard tag is UCP's to order.
+ * with a wildcard tag is UCP's to order. All lookups are scans of the queue;
+ * the fields they compare are in the first cache line.
  *
  * Also needed: the sender's one-time announce (ep_id, md_index, and where its
  * table is) may not have been processed yet. The announce and the Put are
@@ -495,13 +483,17 @@ typedef struct uct_cxi_rndv_hdr_wire {
  * `op` must be first, as for uct_cxi_rdzv_get_op_t: the read's REPLY goes
  * through the generic dispatch, which calls op->handler for an op without an
  * ep. The entries are registered memory because `value` is where that read
- * lands. The whole confirmation event is kept so that the report can be made
- * later exactly as if it were made on arrival.
+ * lands. The event is kept so that the report can be made later exactly as
+ * if it were made on arrival.
  */
 #define UCT_CXI_UNEXP_NEW      0  /* rendezvous: address read not posted yet */
 #define UCT_CXI_UNEXP_READING  1  /* rendezvous: address read in flight */
 #define UCT_CXI_UNEXP_READY    2  /* eager, or rendezvous with its address */
 #define UCT_CXI_UNEXP_FAILED   3  /* rendezvous: the address read failed */
+
+#define UCT_CXI_UNEXP_ARRIVED  1  /* flags: see above (eager: all but LOST) */
+#define UCT_CXI_UNEXP_OWNED    2
+#define UCT_CXI_UNEXP_LOST     4
 
 typedef struct uct_cxi_unexp_report {
     /* What the scans of iface->tag.unexp_q read: all in the first cache line */
@@ -511,12 +503,13 @@ typedef struct uct_cxi_unexp_report {
     uint32_t                     initiator; /* event's initiator.process */
     uint8_t                      rendezvous_id; /* event's rendezvous_id */
     uint8_t                      is_rndv;
-    uint8_t                      state;
+    uint8_t                      state;     /* UCT_CXI_UNEXP_{NEW,...} */
+    uint8_t                      flags;     /* UCT_CXI_UNEXP_{ARRIVED,...} */
 
     uint64_t                     value;     /* landing: the source address */
     uct_cxi_iface_t             *iface;
     struct uct_cxi_unexp_report *next_free; /* free list */
-    union c_event                event;     /* the confirmation event */
+    union c_event                event;     /* the first event seen */
 } UCS_V_ALIGNED(UCS_SYS_CACHE_LINE_SIZE) uct_cxi_unexp_report_t;
 
 

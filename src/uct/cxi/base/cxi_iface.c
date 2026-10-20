@@ -206,8 +206,7 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"TAG_OVERFLOW_NUM_BUFS", "4",
      "Number of overflow-list buffers rotated for unexpected tagged\n"
      "messages (no priority LE posted for them yet). Hard ceiling\n"
-     "UCT_CXI_TAG_OVF_NUM_BUFS_MAX (cxi_tag.h) -- one hardware buffer_id\n"
-     "is reserved per buffer for SEARCH_AND_DELETE correlation.",
+     "UCT_CXI_TAG_OVF_NUM_BUFS_MAX (cxi_tag.h).",
      ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_num_bufs),
      UCS_CONFIG_TYPE_UINT},
 
@@ -226,8 +225,8 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"TAG_MAX_OUTSTANDING", "512",
      "Maximum number of simultaneously-posted priority-list receive LEs.\n"
      "Hard ceiling UCT_CXI_TAG_MAX_OUTSTANDING_MAX (the hardware buffer_id\n"
-     "correlation field is 16 bits, and a range at the top of that space\n"
-     "is reserved for SEARCH_AND_DELETE, see cxi_tag.h).",
+     "correlation field is 16 bits, and the id above the receives' is\n"
+     "reserved for SEARCH_AND_DELETE, see cxi_tag.h).",
      ucs_offsetof(uct_cxi_iface_config_t, tag_max_outstanding),
      UCS_CONFIG_TYPE_UINT},
 
@@ -2349,19 +2348,23 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
     } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
                (iface->tag.pte != NULL) &&
                (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
-        /* Either our own SEARCH_AND_DELETE's "found" confirmation
-         * (buffer_id in the eager or, checked first since it's
-         * numerically higher, rendezvous range -- see UCT_CXI_TAG_
-         * SEARCH_DELETE_*_BUFIDX_BASE in cxi_tag.h), or delayed
-         * correlation for a real match (same disposition as a direct
-         * match, routed by event->tgt_long.rendezvous). */
-        if (event->tgt_long.buffer_id >=
-            UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE) {
-            uct_cxi_iface_tag_handle_search_delete_confirm_rndv(iface,
-                                                                event);
-        } else if (event->tgt_long.buffer_id >=
-                   UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
-            uct_cxi_iface_tag_handle_search_delete_confirm_eager(iface, event);
+        /* Either our own SEARCH_AND_DELETE's "found" confirmation (buffer_id
+         * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID, see cxi_tag.h),
+         * or delayed correlation for a real match (same disposition as a
+         * direct match). Either way routed by the event's own rendezvous
+         * flag, not by the command's buffer_id: the SEARCH_AND_DELETE
+         * deletes the oldest entry with its tag, which can be an eager
+         * message when it was posted for a rendezvous arrival, or the
+         * reverse. */
+        if (event->tgt_long.buffer_id ==
+            UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID) {
+            if (event->tgt_long.rendezvous) {
+                uct_cxi_iface_tag_handle_search_delete_confirm_rndv(iface,
+                                                                    event);
+            } else {
+                uct_cxi_iface_tag_handle_search_delete_confirm_eager(iface,
+                                                                     event);
+            }
         } else if (event->tgt_long.rendezvous) {
             uct_cxi_iface_tag_handle_rdzv_match(iface, event);
         } else {
@@ -2370,16 +2373,13 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
     } else if ((event->hdr.event_type == C_EVENT_SEARCH) &&
                (iface->tag.pte != NULL) &&
                (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
-               (event->tgt_long.buffer_id >=
-                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE)) {
-        int is_rndv = event->tgt_long.buffer_id >=
-            UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE;
-        int buf_idx = (int)event->tgt_long.buffer_id -
-                    (is_rndv ? UCT_CXI_TAG_SEARCH_DELETE_RNDV_BUFIDX_BASE :
-                                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE);
-        ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND%s] buf_idx=%d rc=%d "
-                 "match_bits=0x%lx", is_rndv ? "-RNDV" : "", buf_idx,
-                 cxi_event_rc(event), (unsigned long)event->tgt_long.match_bits);
+               (event->tgt_long.buffer_id ==
+                UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID)) {
+        /* Our SEARCH_AND_DELETE found nothing: the message it was issued
+         * for was taken by a receive posted meanwhile, whose own event
+         * accounts for it. Nothing to do. */
+        ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND] rc=%d",
+                 cxi_event_rc(event));
     } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
         ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                  "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",

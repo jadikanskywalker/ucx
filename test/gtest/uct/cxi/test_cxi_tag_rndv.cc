@@ -1123,6 +1123,383 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_rendezvous_reported_in_send_order)
 }
 
 
+/*
+ * A receive posted at about the time an unexpected rendezvous arrives. The
+ * message is reported to UCP (owned: our SEARCH_AND_DELETE took it) or goes
+ * to the receive (lost: the receive's append matched it first, possibly
+ * after its address read was already posted), and never both. The receive is
+ * posted a varying number of progress rounds after the send, so the append
+ * lands at every point from before the message arrives to well after it was
+ * reported, including the windows where the address read is in flight.
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, rendezvous_vs_posted_receive)
+{
+    static const unsigned ITERS   = 200;
+    static const unsigned MAX_LAG = 50;
+    static const size_t   PAY_LEN = 4096;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h sep = sender().ep(0);
+    uct_ep_h rep = receiver().ep(0);
+
+    unsigned to_receive = 0, to_report = 0, reported_first = 0;
+
+    for (unsigned i = 0; i < ITERS; i++) {
+        const uct_tag_t tag  = 0xBEEF000000000000ULL | i;
+        const uint8_t   fill = (uint8_t)(i + 1);
+
+        auto reported = [&]() -> const rndv_arrival_record * {
+            for (size_t k = 0; k < m_ctx.records.size(); k++) {
+                if (m_ctx.records[k].tag == tag) {
+                    return &m_ctx.records[k];
+                }
+            }
+            return NULL;
+        };
+
+        std::vector<uint8_t> tx_buf(PAY_LEN, fill);
+        uct_mem_h tx_memh = reg(sender(), tx_buf.data(), PAY_LEN);
+        uct_cxi_rndv_send_ctx sctx;
+        init_rndv_send_ctx(sctx);
+
+        uct_iov_t siov;
+        siov.buffer = tx_buf.data();
+        siov.length = PAY_LEN;
+        siov.memh   = tx_memh;
+        siov.stride = 0;
+        siov.count  = 1;
+        std::vector<uint8_t> hdr = pack_rndv_hdr(0x99, i, 2);
+        ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
+                sep, tag, hdr.data(), hdr.size(), &siov, 1, 0, &sctx.super)));
+
+        for (unsigned lag = 0; lag < (i % MAX_LAG); lag++) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+
+        std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+        uct_mem_h rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+        uct_cxi_tag_recv_ctx rctx;
+        memset(&rctx, 0, sizeof(rctx));
+        rctx.super.tag_consumed_cb = uct_cxi_tag_consumed_cb;
+        rctx.super.completed_cb    = uct_cxi_tag_completed_cb;
+
+        bool posted = false;
+        if (reported() != NULL) {
+            reported_first++;
+        } else {
+            uct_iov_t riov;
+            riov.buffer = rx_buf.data();
+            riov.length = PAY_LEN;
+            riov.memh   = rx_memh;
+            riov.stride = 0;
+            riov.count  = 1;
+            ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
+                                                   UCS_MASK(64), &riov, 1,
+                                                   &rctx.super));
+            posted = true;
+        }
+
+        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+        while (!rctx.completed && (reported() == NULL) &&
+               (ucs_get_time() < deadline)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        ASSERT_TRUE(rctx.completed || (reported() != NULL))
+                << "iteration " << i << ": the message vanished";
+
+        /* Time for a second, wrong, outcome to show up. */
+        ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.02);
+        while (ucs_get_time() < settle) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+
+        const rndv_arrival_record *rec = reported();
+        if (rctx.completed) {
+            to_receive++;
+            EXPECT_TRUE(rec == NULL)
+                    << "iteration " << i << ": delivered to the receive AND "
+                       "reported to UCP";
+            EXPECT_EQ(UCS_OK, rctx.status);
+            for (size_t b = 0; b < PAY_LEN; b++) {
+                ASSERT_EQ(fill, rx_buf[b]) << "iteration " << i << " byte "
+                                           << b;
+            }
+        } else {
+            to_report++;
+            ASSERT_TRUE(rec != NULL);
+            EXPECT_EQ(i, rec->req_id);
+            if (posted) {
+                ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
+                                                        &rctx.super, 1));
+            }
+            std::vector<uint8_t> dst(PAY_LEN, 0);
+            uct_mem_h dmemh = reg(receiver(), dst.data(), PAY_LEN);
+            pull_and_verify(rep, *rec, dst, dmemh, tx_buf);
+            dereg(receiver(), dmemh);
+        }
+
+        poll_until(sctx.fired);
+        dereg(receiver(), rx_memh);
+        dereg(sender(), tx_memh);
+    }
+
+    UCS_TEST_MESSAGE << to_receive << " went to the receive, " << to_report
+                     << " were reported (" << reported_first
+                     << " before the receive was posted)";
+    flush_ep(sender(), sep);
+}
+
+
+/*
+ * An eager message held behind a rendezvous with its tag has to be let go
+ * when the rendezvous is not to be reported after all, because a receive
+ * posted in the meantime took it. A rendezvous and an eager message with the
+ * same tag are sent back to back, and a receive for the tag is posted a
+ * varying time later. The receive takes one of the two at most; every other
+ * must be reported, once, and in the order sent if both are.
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_behind_rendezvous_taken_by_receive)
+{
+    static const unsigned ITERS   = 100;
+    static const unsigned MAX_LAG = 50;
+    static const size_t   PAY_LEN = 4096;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h sep = sender().ep(0);
+    uct_ep_h rep = receiver().ep(0);
+
+    for (unsigned i = 0; i < ITERS; i++) {
+        const uct_tag_t tag    = 0xCAFE000000000000ULL | i;
+        const size_t    before = m_ctx.order.size();
+        const size_t    rbefore = m_ctx.records.size();
+
+        std::vector<uint8_t> tx_buf(PAY_LEN, (uint8_t)(i + 1));
+        uct_mem_h tx_memh = reg(sender(), tx_buf.data(), PAY_LEN);
+        uct_cxi_rndv_send_ctx sctx;
+        init_rndv_send_ctx(sctx);
+
+        uct_iov_t siov;
+        siov.buffer = tx_buf.data();
+        siov.length = PAY_LEN;
+        siov.memh   = tx_memh;
+        siov.stride = 0;
+        siov.count  = 1;
+        std::vector<uint8_t> hdr = pack_rndv_hdr(0x99, i, 2);
+        ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
+                sep, tag, hdr.data(), hdr.size(), &siov, 1, 0, &sctx.super)));
+        uint64_t marker = 0xE000 + i;
+        ASSERT_UCS_OK(uct_ep_tag_eager_short(sep, tag, &marker,
+                                             sizeof(marker)));
+
+        for (unsigned lag = 0; lag < (i % MAX_LAG); lag++) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+
+        std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+        uct_mem_h rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+        uct_cxi_tag_recv_ctx rctx;
+        memset(&rctx, 0, sizeof(rctx));
+        rctx.super.tag_consumed_cb = uct_cxi_tag_consumed_cb;
+        rctx.super.completed_cb    = uct_cxi_tag_completed_cb;
+        uct_iov_t riov;
+        riov.buffer = rx_buf.data();
+        riov.length = PAY_LEN;
+        riov.memh   = rx_memh;
+        riov.stride = 0;
+        riov.count  = 1;
+        ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
+                                               UCS_MASK(64), &riov, 1,
+                                               &rctx.super));
+
+        /* Two messages: the receive takes one or none, the rest is reported. */
+        ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+        while (((m_ctx.order.size() - before) + (rctx.completed ? 1 : 0) < 2) &&
+               (ucs_get_time() < deadline)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.02);
+        while (ucs_get_time() < settle) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        const size_t reports = m_ctx.order.size() - before;
+        ASSERT_EQ(2u, reports + (rctx.completed ? 1 : 0))
+                << "iteration " << i << ": " << reports << " reported, "
+                << "receive " << (rctx.completed ? "completed" : "pending");
+
+        if (!rctx.completed) {
+            ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
+                                                    &rctx.super, 1));
+        }
+        if (reports == 2) {
+            EXPECT_TRUE(m_ctx.order[before].rndv)
+                    << "iteration " << i << ": the eager message was "
+                       "reported ahead of the rendezvous sent before it";
+        }
+
+        /* Whatever was reported as a rendezvous is pulled and checked; if it
+         * was the receive's instead, check what it got. */
+        if (m_ctx.records.size() > rbefore) {
+            std::vector<uint8_t> dst(PAY_LEN, 0);
+            uct_mem_h dmemh = reg(receiver(), dst.data(), PAY_LEN);
+            pull_and_verify(rep, m_ctx.records[rbefore], dst, dmemh, tx_buf);
+            dereg(receiver(), dmemh);
+        } else {
+            ASSERT_TRUE(rctx.completed);
+            EXPECT_EQ(PAY_LEN, rctx.length) << "iteration " << i;
+            EXPECT_EQ(tx_buf, rx_buf) << "iteration " << i;
+        }
+
+        poll_until(sctx.fired);
+        dereg(receiver(), rx_memh);
+        dereg(sender(), tx_memh);
+    }
+    flush_ep(sender(), sep);
+}
+
+/*
+ * A SEARCH_AND_DELETE deletes the oldest unexpected entry with its tag, which
+ * is not always the arrival it was issued for, and what it finds must be
+ * handled as what it is: an eager message as eager, a rendezvous as
+ * rendezvous, whichever kind of arrival the command was issued for.
+ *
+ * That is made certain here, rather than left to a race: an eager message and
+ * a rendezvous with the same tag are let land in the overflow list while the
+ * receiver does not progress, and a receive for the tag is posted. The
+ * hardware gives it the oldest of the two. Only then does the receiver
+ * progress: it issues a SEARCH_AND_DELETE for each arrival, and the first, the
+ * one for the arrival the receive took, finds the other message, of the other
+ * kind. That one must be reported to UCP once, intact, and the receive must
+ * have got the other one intact. Both send orders are tried.
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, search_delete_finds_the_other_kind)
+{
+    static const unsigned ROUNDS  = 10;
+    static const size_t   PAY_LEN = 4096;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h sep = sender().ep(0);
+    uct_ep_h rep = receiver().ep(0);
+
+    for (unsigned rndv_first = 0; rndv_first < 2; rndv_first++) {
+        for (unsigned i = 0; i < ROUNDS; i++) {
+            const uct_tag_t tag     = 0xD00D000000000000ULL |
+                                      (rndv_first << 16) | i;
+            const uint64_t  marker  = 0xE000 + i;
+            const size_t    before  = m_ctx.order.size();
+            const size_t    rbefore = m_ctx.records.size();
+            const char     *what    = rndv_first ? "rendezvous first" :
+                                                   "eager first";
+
+            std::vector<uint8_t> tx_buf(PAY_LEN, (uint8_t)(i + 1));
+            uct_mem_h tx_memh = reg(sender(), tx_buf.data(), PAY_LEN);
+            uct_cxi_rndv_send_ctx sctx;
+            init_rndv_send_ctx(sctx);
+
+            uct_iov_t siov;
+            siov.buffer = tx_buf.data();
+            siov.length = PAY_LEN;
+            siov.memh   = tx_memh;
+            siov.stride = 0;
+            siov.count  = 1;
+            std::vector<uint8_t> hdr = pack_rndv_hdr(0x99, i, 2);
+
+            for (unsigned k = 0; k < 2; k++) {
+                if (k == rndv_first) {
+                    ASSERT_UCS_OK(uct_ep_tag_eager_short(sep, tag, &marker,
+                                                         sizeof(marker)));
+                } else {
+                    ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
+                            sep, tag, hdr.data(), hdr.size(), &siov, 1, 0,
+                            &sctx.super)));
+                }
+            }
+
+            /* Both land while only the sender progresses (for its own
+             * acknowledgements): the receiver has not seen either yet. */
+            ucs_time_t landed = ucs_get_time() + ucs_time_from_sec(0.1);
+            while (ucs_get_time() < landed) {
+                uct_iface_progress(sender().iface());
+            }
+
+            std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+            uct_mem_h rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+            uct_cxi_tag_recv_ctx rctx;
+            memset(&rctx, 0, sizeof(rctx));
+            rctx.super.tag_consumed_cb = uct_cxi_tag_consumed_cb;
+            rctx.super.completed_cb    = uct_cxi_tag_completed_cb;
+            uct_iov_t riov;
+            riov.buffer = rx_buf.data();
+            riov.length = PAY_LEN;
+            riov.memh   = rx_memh;
+            riov.stride = 0;
+            riov.count  = 1;
+            ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
+                                                   UCS_MASK(64), &riov, 1,
+                                                   &rctx.super));
+            ucs_time_t appended = ucs_get_time() + ucs_time_from_sec(0.1);
+            while (ucs_get_time() < appended) {
+                uct_iface_progress(sender().iface());
+            }
+
+            ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+            while ((m_ctx.order.size() == before) &&
+                   (ucs_get_time() < deadline)) {
+                uct_iface_progress(sender().iface());
+                uct_iface_progress(receiver().iface());
+            }
+            ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.02);
+            while (ucs_get_time() < settle) {
+                uct_iface_progress(sender().iface());
+                uct_iface_progress(receiver().iface());
+            }
+
+            ASSERT_TRUE(rctx.completed) << what << " round " << i
+                    << ": the receive got neither message";
+            ASSERT_EQ(before + 1, m_ctx.order.size())
+                    << what << " round " << i << ": the other message was "
+                    << "reported " << (m_ctx.order.size() - before)
+                    << " times";
+            const unexp_arrival &a = m_ctx.order[before];
+
+            if (a.rndv) {
+                /* The receive got the eager message. */
+                EXPECT_EQ(sizeof(marker), rctx.length) << what << " " << i;
+                uint64_t got = 0;
+                memcpy(&got, rx_buf.data(), sizeof(got));
+                EXPECT_EQ(marker, got) << what << " round " << i;
+
+                ASSERT_EQ(rbefore + 1, m_ctx.records.size());
+                std::vector<uint8_t> dst(PAY_LEN, 0);
+                uct_mem_h dmemh = reg(receiver(), dst.data(), PAY_LEN);
+                pull_and_verify(rep, m_ctx.records[rbefore], dst, dmemh,
+                                tx_buf);
+                dereg(receiver(), dmemh);
+            } else {
+                /* The receive got the rendezvous. */
+                EXPECT_EQ(marker, a.id) << what << " round " << i
+                        << ": eager message reported with the wrong data";
+                EXPECT_EQ(rbefore, m_ctx.records.size());
+                EXPECT_EQ(PAY_LEN, rctx.length) << what << " " << i;
+                EXPECT_EQ(tx_buf, rx_buf) << what << " round " << i;
+            }
+
+            poll_until(sctx.fired);
+            dereg(receiver(), rx_memh);
+            dereg(sender(), tx_memh);
+        }
+    }
+    flush_ep(sender(), sep);
+}
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_rndv_unexp, cxi)
 
 /**

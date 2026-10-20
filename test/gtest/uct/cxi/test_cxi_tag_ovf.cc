@@ -448,8 +448,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         sd.ignore_bits    = 0;
         sd.match_id       = CXI_MATCH_ID_ANY;
         sd.length         = -1U;
-        sd.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE; /* buf_idx 0 --
-                              this fixture's single ring buffer */
+        sd.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID;
         sd.use_once       = 1;
 
         int ret = cxi_cq_emit_target(riface->tgt.cmdq, &sd);
@@ -515,12 +514,12 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
      * cxi_event_rc() from today), otherwise fall back to whatever showed
      * up -- confirmed on real hardware to be only the C_EVENT_SEARCH
      * terminator for a "not found" outcome (see UCT_CXI_TAG_SEARCH_
-     * DELETE_BUFIDX_BASE's doc comment in cxi_tag.h), which production
+     * DELETE_BUFFER_ID's doc comment in cxi_tag.h), which production
      * dispatch now routes to uct_cxi_iface_tag_handle_search_delete_
      * not_found() as a real, load-bearing release point, not a no-op. */
     int sd_confirm_idx = -1;
     for (size_t i = 0; i < sd_events.size(); i++) {
-        if ((sd_events[i].buffer_id == UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) &&
+        if ((sd_events[i].buffer_id == UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID) &&
             (sd_events[i].event_type == C_EVENT_PUT_OVERFLOW)) {
             sd_confirm_idx = (int)i;
             break;
@@ -529,7 +528,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
     if (sd_confirm_idx < 0) {
         for (size_t i = 0; i < sd_events.size(); i++) {
             if (sd_events[i].buffer_id ==
-                UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE) {
+                UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID) {
                 sd_confirm_idx = (int)i;
                 break;
             }
@@ -613,7 +612,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         sd2.ignore_bits    = 0;
         sd2.match_id       = CXI_MATCH_ID_ANY;
         sd2.length         = -1U;
-        sd2.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE; /* buf_idx 0 */
+        sd2.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID; /* buf_idx 0 */
         sd2.use_once       = 1;
 
         int ret = cxi_cq_emit_target(riface->tgt.cmdq, &sd2);
@@ -711,7 +710,7 @@ UCS_TEST_P(test_cxi_tag_ovf, tgt_post_waits_for_full_cmdq)
         sd.match_id       = CXI_MATCH_ID_ANY;
         sd.length         = -1U;
         sd.use_once       = 1;
-        sd.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + i;
+        sd.buffer_id      = UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID - i;
         ASSERT_EQ(UCS_OK, uct_cxi_iface_tgt_post(riface, &sd))
                 << "post " << i << " of " << COUNT;
     }
@@ -732,7 +731,7 @@ UCS_TEST_P(test_cxi_tag_ovf, tgt_post_waits_for_full_cmdq)
 
     ASSERT_EQ(COUNT, ids.size());
     for (unsigned i = 0; i < COUNT; i++) {
-        ASSERT_EQ(UCT_CXI_TAG_SEARCH_DELETE_BUFIDX_BASE + i, ids[i])
+        ASSERT_EQ(UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID - i, ids[i])
                 << "commands must reach the NIC in post order";
     }
 }
