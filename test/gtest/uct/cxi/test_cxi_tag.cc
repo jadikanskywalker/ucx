@@ -42,7 +42,7 @@ UCS_TEST_P(test_cxi_tag, direct_match_short)
     static const size_t    PAY_LEN = 64;
     static const uint8_t   FILL    = 0xA5;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> rx_buf(PAY_LEN, 0);
@@ -87,7 +87,7 @@ UCS_TEST_P(test_cxi_tag, direct_match_bcopy)
     static const size_t    PAY_LEN = 4096;
     static const uint8_t   FILL    = 0x5A;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> rx_buf(PAY_LEN, 0);
@@ -139,7 +139,7 @@ UCS_TEST_P(test_cxi_tag, direct_match_zcopy)
     static const size_t    PAY_LEN = 8192;
     static const uint8_t   FILL    = 0x3C;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> rx_buf(PAY_LEN, 0);
@@ -200,7 +200,7 @@ UCS_TEST_P(test_cxi_tag, unexpected_short)
     static const size_t    PAY_LEN = 48;
     static const uint8_t   FILL    = 0x77;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> tx_buf(PAY_LEN, FILL);
@@ -225,7 +225,7 @@ UCS_TEST_P(test_cxi_tag, unexpected_bcopy)
     static const size_t    PAY_LEN = 2048;
     static const uint8_t   FILL    = 0x99;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     struct { uint8_t fill; size_t len; } arg = {FILL, PAY_LEN};
@@ -260,7 +260,7 @@ UCS_TEST_P(test_cxi_tag, tag_eager_short_tracked_until_ack)
 {
     static const uct_tag_t TAG = 0x1357924680ABCDEFULL;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h         ep     = sender().ep(0);
     uct_cxi_ep_t    *cep    = ucs_derived_of(ep, uct_cxi_ep_t);
     uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
@@ -317,7 +317,7 @@ UCS_TEST_P(test_cxi_tag, unexpected_burst_sizes)
         return m;
     };
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     for (size_t len : BCOPY_SIZES) {
@@ -419,7 +419,7 @@ UCS_TEST_P(test_cxi_tag, delayed_match_data_copy)
     static const uint8_t   SENTINEL = 0xEE; /* != FILL, so leftover sentinel
                                                * bytes are unambiguous */
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> tx_buf(PAY_LEN, FILL);
@@ -477,7 +477,7 @@ UCS_TEST_P(test_cxi_tag, truncation)
     static const size_t    RX_LEN  = 32;
     static const size_t    TX_LEN  = 256;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> rx_buf(RX_LEN, 0);
@@ -633,7 +633,7 @@ UCS_TEST_P(test_cxi_tag, forced_race_search_delete_vs_priority_append)
     static const size_t ITERS   = 100;
     static const size_t PAY_LEN = 32;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     size_t priority_wins      = 0;

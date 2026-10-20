@@ -1828,7 +1828,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
         struct c_idc_msg_hdr hdr = {};
         hdr.dfa        = ep->dfa_tag;
         hdr.match_bits = tag;
-        uct_cxi_idc_track_hdr(&hdr, ep);
+        uct_cxi_idc_track_hdr(&hdr, ep, 0, 0); /* tag credits: later */
 
         ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, data, length);
     }

@@ -47,7 +47,7 @@ class test_cxi_ep : public test_cxi_rma_base {};
  */
 UCS_TEST_P(test_cxi_ep, ep_create_destroy)
 {
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
 
     uct_ep_h ep = sender().ep(0);
     EXPECT_NE((uct_ep_h)NULL, ep);
@@ -60,7 +60,7 @@ UCS_TEST_P(test_cxi_ep, ep_create_destroy)
  */
 UCS_TEST_P(test_cxi_ep, ep_flush_empty)
 {
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
 
     uct_ep_h     ep     = sender().ep(0);
     ucs_status_t status = uct_ep_flush(ep, 0, NULL);

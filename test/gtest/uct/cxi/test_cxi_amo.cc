@@ -73,7 +73,7 @@ protected:
 UCS_TEST_P(test_cxi_amo, atomic64_post_add)
 {
     uint64_t target = 100;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -88,7 +88,7 @@ UCS_TEST_P(test_cxi_amo, atomic64_post_add)
 UCS_TEST_P(test_cxi_amo, atomic64_post_and)
 {
     uint64_t target = 0xFF00FF00FF00FF00ULL;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -104,7 +104,7 @@ UCS_TEST_P(test_cxi_amo, atomic64_post_and)
 UCS_TEST_P(test_cxi_amo, atomic64_post_or)
 {
     uint64_t target = 0x00F000F000F000F0ULL;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -120,7 +120,7 @@ UCS_TEST_P(test_cxi_amo, atomic64_post_or)
 UCS_TEST_P(test_cxi_amo, atomic64_post_xor)
 {
     uint64_t target = 0xAAAAAAAAAAAAAAAAULL;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -143,7 +143,7 @@ UCS_TEST_P(test_cxi_amo, atomic64_fetch_add)
 {
     uint64_t target = 1000;
     uint64_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -162,7 +162,7 @@ UCS_TEST_P(test_cxi_amo, atomic64_fetch_and)
 {
     uint64_t target = 0xFFFF0000FFFF0000ULL;
     uint64_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -182,7 +182,7 @@ UCS_TEST_P(test_cxi_amo, atomic64_fetch_swap)
 {
     uint64_t target = 0xDEADBEEFCAFEBABEULL;
     uint64_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -208,7 +208,7 @@ UCS_TEST_P(test_cxi_amo, cswap64_match)
 {
     uint64_t target = 42;
     uint64_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -227,7 +227,7 @@ UCS_TEST_P(test_cxi_amo, cswap64_no_match)
 {
     uint64_t target = 42;
     uint64_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -252,7 +252,7 @@ UCS_TEST_P(test_cxi_amo, cswap64_no_match)
 UCS_TEST_P(test_cxi_amo, atomic32_post_add)
 {
     uint32_t target = 100;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -268,7 +268,7 @@ UCS_TEST_P(test_cxi_amo, atomic32_fetch_add)
 {
     uint32_t target = 500;
     uint32_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -287,7 +287,7 @@ UCS_TEST_P(test_cxi_amo, cswap32_match)
 {
     uint32_t target = 10;
     uint32_t result = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 
@@ -311,7 +311,7 @@ UCS_TEST_P(test_cxi_amo, cswap32_match)
 UCS_TEST_P(test_cxi_amo, atomic64_sequential_adds)
 {
     uint64_t target = 0;
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
     rkey_ctx rk = setup_target(&target, sizeof(target));
 

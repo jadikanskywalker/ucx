@@ -15,7 +15,19 @@
  *
  * Each direction is independent: the initiator learns the windows the target
  * grants it, and nothing is needed in the other direction until that side
- * creates endpoints of its own. A peer whose target has no control PTE (built
+ * creates endpoints of its own.
+ *
+ * The windows are credits. A sender spends one message credit plus one byte
+ * credit (per UCT_CXI_FC_UNIT bytes) for every Active Message it sends, and
+ * may not send without them, so a sender can never have more outstanding
+ * to a target than the target granted. The target hands credits back only
+ * after it has processed a message (run its handler), which is what ties the
+ * send rate to the target's processing rate. Credits go back as CUMULATIVE
+ * counters, "I have processed N messages and M units from you so far": the
+ * sender applies the increase over what it last saw, so a lost, duplicated or
+ * reordered grant is harmless, and the next one repairs it. They ride
+ * piggybacked on any Active Message to that peer, or on a pure GRANT control
+ * message once half a window is owed. A peer whose target has no control PTE (built
  * with --disable-cxi-fc, or UCX_CXI_FC_ENABLE=n) is marked LEGACY and treated
  * as a plain connectionless peer.
  *
@@ -35,8 +47,11 @@
 #include <cxi_prov_hw.h>
 
 
-/* Flow-control credit unit: byte windows are counted in these. */
-#define UCT_CXI_FC_UNIT       64u
+/* Largest windows the piggyback encoding below can represent unambiguously
+ * (the sender reconstructs the full counter from a truncated one, which needs
+ * the true value to be within half the range of the last it saw). */
+#define UCT_CXI_FC_MAX_MSG_WINDOW   ((1u << 19) - 1)
+#define UCT_CXI_FC_MAX_UNIT_WINDOW  ((1u << 23) - 1)
 
 /* Control channel protocol version; a message with another version is
  * ignored (the sender then times out and treats the peer as FAILED). */
@@ -68,9 +83,31 @@
  * discard a CREP answering a CREQ from a previous incarnation of itself.
  */
 enum {
-    UCT_CXI_CTRL_CREQ = 1,
-    UCT_CXI_CTRL_CREP = 2
+    UCT_CXI_CTRL_CREQ  = 1,
+    UCT_CXI_CTRL_CREP  = 2,
+    UCT_CXI_CTRL_GRANT = 3   /**< header_data: [63:32] messages processed,
+                                  [31:0] units processed -- cumulative */
 };
+
+/*
+ * Credit return piggybacked on an Active Message's match_bits. The AM list
+ * entry wildcards every match bit and the transport itself uses only bits
+ * 0-6 (am_id, header flag, announce flag), so bits 7-63 arrive verbatim.
+ *
+ *   [7]      valid
+ *   [8]      reserved (credit class; only Active Messages so far)
+ *   [28:9]   messages processed, cumulative, low 20 bits
+ *   [52:29]  units processed, cumulative, low 24 bits
+ *   [60:53]  sender's epoch, low 8 bits (rejects a stale incarnation)
+ */
+#define UCT_CXI_FC_PB_VALID        (1ULL << 7)
+#define UCT_CXI_FC_PB_MSG_SHIFT    9
+#define UCT_CXI_FC_PB_MSG_BITS     20
+#define UCT_CXI_FC_PB_UNIT_SHIFT   29
+#define UCT_CXI_FC_PB_UNIT_BITS    24
+#define UCT_CXI_FC_PB_EPOCH_SHIFT  53
+#define UCT_CXI_FC_PB_EPOCH_BITS   8
+#define UCT_CXI_FC_PB_MASK(_bits)  ((1ULL << (_bits)) - 1)
 
 #define UCT_CXI_CTRL_TYPE(_mb)       ((unsigned)((_mb) >> 60))
 #define UCT_CXI_CTRL_VER(_mb)        ((unsigned)(((_mb) >> 56) & 0xf))
@@ -90,6 +127,29 @@ typedef enum {
     UCT_CXI_PEER_FAILED      /**< handshake timed out */
 } uct_cxi_peer_state_t;
 
+
+/** Credits this interface HOLDS toward a peer: what it may still send. */
+typedef struct uct_cxi_fc_tx {
+    int32_t   avail_msgs;
+    int32_t   avail_units;  /**< may dip below zero by up to one bcopy: its
+                                 length is only known after it is packed */
+    uint32_t  ret_msgs;     /**< last cumulative grant applied */
+    uint32_t  ret_units;
+    uint32_t  used_msgs;    /**< net messages / units spent, cumulative */
+    uint32_t  used_units;
+} uct_cxi_fc_tx_t;
+
+/** Credits this interface OWES a peer: what it has processed from it. */
+typedef struct uct_cxi_fc_rx {
+    uint32_t  ret_msgs;     /**< messages processed, cumulative */
+    uint32_t  ret_units;
+    uint32_t  adv_msgs;     /**< last put on the wire (piggyback or GRANT) */
+    uint32_t  adv_units;
+    uint32_t  acked_msgs;   /**< last confirmed delivered, by a GRANT's ACK */
+    uint32_t  acked_units;
+} uct_cxi_fc_rx_t;
+
+struct uct_cxi_ep;
 
 /**
  * One remote interface. Shared by all endpoints to it and kept for the life
@@ -119,6 +179,18 @@ typedef struct uct_cxi_peer {
     uint32_t          msg_window;   /**< CREP: message credits granted to us */
     uint32_t          unit_window;  /**< CREP: byte credits granted, in units */
     uint32_t          rx_epoch;     /**< CREQ: the peer's own epoch */
+
+    uct_cxi_fc_tx_t   tx;           /**< what we may send to the peer */
+    uct_cxi_fc_rx_t   rx;           /**< what we owe the peer */
+
+    /* Pure GRANT waiting to be sent (no ctrl slot or command queue room) */
+    ucs_list_link_t   grants;       /**< link in fc.grants */
+
+    /* Endpoints to this peer whose pending queue is waiting for credits,
+     * descheduled from the arbiter until a grant, the CREP or a refund
+     * makes them runnable again (see uct_cxi_peer_resume). Singly linked
+     * through uct_cxi_ep_t::next_blocked, so an ep costs one pointer. */
+    struct uct_cxi_ep *blocked;
 } uct_cxi_peer_t;
 
 KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
@@ -132,7 +204,9 @@ KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
  */
 typedef struct uct_cxi_ctrl_req {
     uct_cxi_peer_t   *peer;
-    unsigned          type;         /**< UCT_CXI_CTRL_CREQ or _CREP */
+    unsigned          type;         /**< UCT_CXI_CTRL_CREQ, _CREP or _GRANT */
+    uint32_t          grant_msgs;   /**< GRANT: the cumulative values sent, */
+    uint32_t          grant_units;  /**<   to record as delivered on its ACK */
 } uct_cxi_ctrl_req_t;
 
 
@@ -145,9 +219,17 @@ typedef struct uct_cxi_fc_iface {
     uint32_t          epoch;        /**< random, identifies this incarnation */
     uint32_t          msg_window;   /**< what we grant each peer */
     uint32_t          unit_window;
+    uint32_t          grant_msgs;   /**< owe this many messages to a peer, or */
+    uint32_t          grant_units;  /**<   this many units: send a GRANT */
     ucs_time_t        connect_timeout;
     khash_t(uct_cxi_peer_hash) peers;
     ucs_list_link_t   connecting;   /**< peers with a handshake in progress */
+    ucs_list_link_t   grants;       /**< peers with a GRANT still to send */
+
+    /* One-entry cache for the receive path: the peer the last Active Message
+     * came from, to spare a hash lookup per message. */
+    uint32_t          rx_cache_key;
+    uct_cxi_peer_t   *rx_cache_peer;
     ucs_mpool_t       ctrl_req_pool; /**< uct_cxi_ctrl_req_t, UCT_CXI_CTRL_SLOTS */
 
     /* Control PTE: matching, one persistent zero-length list entry that

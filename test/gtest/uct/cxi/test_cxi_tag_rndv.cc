@@ -85,7 +85,7 @@ protected:
                        std::vector<uint8_t> &tx_buf, uct_mem_h &rx_memh,
                        uct_mem_h &tx_memh)
     {
-        sender().connect_to_iface(0, receiver());
+        cxi_connect(sender(), 0, receiver());
         uct_ep_h ep = sender().ep(0);
 
         rx_memh = reg(receiver(), rx_buf.data(), rx_len);
@@ -225,7 +225,7 @@ UCS_TEST_P(test_cxi_tag_rndv, truncation)
     std::vector<uint8_t> rx_buf(RX_LEN + GUARD_LEN, GUARD_FILL);
     std::vector<uint8_t> tx_buf(TX_LEN, 0xEE);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h rx_memh = reg(receiver(), rx_buf.data(), RX_LEN);
@@ -294,7 +294,7 @@ UCS_TEST_P(test_cxi_tag_rndv, cancel_unmatched)
     static const uct_tag_t TAG     = 0xDD445566778899AAULL;
     static const size_t    PAY_LEN = 128;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> tx_buf(PAY_LEN, 0x11);
@@ -381,7 +381,7 @@ UCS_TEST_P(test_cxi_tag_rndv, multiple_outstanding)
     static const size_t N       = 8;
     static const size_t PAY_LEN = 1024;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<std::vector<uint8_t> > rx_bufs(N), tx_bufs(N);
@@ -462,7 +462,7 @@ UCS_TEST_P(test_cxi_tag_rndv, multiple_outstanding)
 
 UCS_TEST_P(test_cxi_tag_rndv, rndv_request_unsupported)
 {
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     ucs_status_t status = uct_ep_tag_rndv_request(ep, 0x1234, NULL, 0, 0);
@@ -492,7 +492,7 @@ UCS_TEST_P(test_cxi_tag_rndv, delayed_match_get_issued)
     static const size_t    PAY_LEN = 512;
     static const uint8_t   FILL    = 0x3D;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> tx_buf(PAY_LEN, FILL);
@@ -748,8 +748,8 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, cold_start)
     static const uint64_t  REQ_ID  = 0x1122334455667788ULL;
     static const uint8_t   MD_IDX  = 7;
 
-    sender().connect_to_iface(0, receiver());
-    receiver().connect_to_iface(0, sender());
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
     uct_ep_h sep = sender().ep(0);
     uct_ep_h rep = receiver().ep(0);
 
@@ -815,8 +815,8 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
     static const uint64_t EP_ID   = 0x99AA99AA99AA99AAULL;
     static const uint8_t  MD_IDX  = 42;
 
-    sender().connect_to_iface(0, receiver());
-    receiver().connect_to_iface(0, sender());
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
     uct_ep_h sep = sender().ep(0);
     uct_ep_h rep = receiver().ep(0);
 
@@ -937,8 +937,8 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp_two_senders, each_sender_keeps_its_header)
     static const uint8_t  MD_A    = 3;
     static const uint8_t  MD_B    = 9;
 
-    sender().connect_to_iface(0, receiver());
-    sender2().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(sender2(), 0, receiver());
 
     std::vector<uint8_t> tx_a(PAY_LEN, 0xAA), tx_b(PAY_LEN, 0xBB);
     uct_mem_h            memh_a = reg(sender(), tx_a.data(), PAY_LEN);

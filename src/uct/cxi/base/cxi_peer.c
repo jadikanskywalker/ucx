@@ -38,19 +38,62 @@ static ucs_mpool_ops_t uct_cxi_fc_mpool_ops = {
  * -------------------------------------------------------------------------
  */
 
+/*
+ * uct_cxi_fc_windows -- the credit windows to grant each peer, from the
+ * configuration. They are needed before the interface is opened (the receive
+ * ring and the RX EQ are sized from them), hence not part of
+ * uct_cxi_fc_init().
+ *
+ * The windows must be representable in the piggyback, and the byte window must
+ * hold the largest message a peer may send or that message could never be
+ * sent.
+ */
+void uct_cxi_fc_windows(const uct_cxi_iface_config_t *config, size_t max_msg,
+                        uint32_t *msg_window_p, uint32_t *unit_window_p)
+{
+    unsigned max_units = UCT_CXI_FC_UNITS(max_msg);
+    uint64_t unit_window;
+
+    *msg_window_p = ucs_max(2u, ucs_min(config->fc_msg_window,
+                                        UCT_CXI_FC_MAX_MSG_WINDOW));
+    unit_window   = ucs_min((uint64_t)config->fc_byte_window / UCT_CXI_FC_UNIT,
+                            (uint64_t)UCT_CXI_FC_MAX_UNIT_WINDOW);
+    if (unit_window < max_units) {
+        ucs_warn("cxi FC_BYTE_WINDOW=%zu is smaller than the largest Active "
+                 "Message (%zu bytes): raising it to %zu",
+                 (size_t)config->fc_byte_window, max_msg,
+                 (size_t)max_units * UCT_CXI_FC_UNIT);
+        unit_window = max_units;
+    }
+    *unit_window_p = (uint32_t)unit_window;
+}
+
 ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
-                             const uct_cxi_iface_config_t *config)
+                             const uct_cxi_iface_config_t *config,
+                             uint32_t msg_window, uint32_t unit_window)
 {
     uct_cxi_fc_iface_t *fc = &iface->fc;
     ucs_mpool_params_t  mp_params;
 
+    unsigned            max_units = UCT_CXI_FC_UNITS(iface->am.max_msg);
+    double              thresh    = ucs_max(0.01, ucs_min(1.0,
+                                                config->fc_grant_thresh));
+
     memset(fc, 0, sizeof(*fc));
     fc->enabled         = config->fc_enable;
     fc->ctrl.ptn        = UINT16_MAX; /* matches no PTE until one is opened */
-    fc->msg_window      = config->fc_msg_window;
-    fc->unit_window     = (uint32_t)ucs_min(config->fc_byte_window /
-                                            UCT_CXI_FC_UNIT, UINT32_MAX);
     fc->connect_timeout = ucs_time_from_sec(config->fc_connect_timeout);
+    fc->msg_window      = msg_window;
+    fc->unit_window     = unit_window;
+
+    /* Hand credits back once this much is owed. The byte threshold leaves room
+     * for one maximum-size message: a sender blocked for lack of units has
+     * more than window - max_units outstanding, and once the target has
+     * processed all of it, that is more than the threshold, so a grant is
+     * always on its way. */
+    fc->grant_msgs  = ucs_max(1u, (uint32_t)(fc->msg_window * thresh));
+    fc->grant_units = ucs_max(1u, ucs_min((uint32_t)(fc->unit_window * thresh),
+                                          fc->unit_window - max_units));
 
     /* Random per interface instance, so a peer can tell a restarted process
      * from the one it handshook with before. Never 0. */
@@ -61,6 +104,7 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
 
     kh_init_inplace(uct_cxi_peer_hash, &fc->peers);
     ucs_list_head_init(&fc->connecting);
+    ucs_list_head_init(&fc->grants);
 
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_ctrl_req_t);
@@ -244,6 +288,7 @@ uct_cxi_peer_t *uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid,
     peer->pid   = pid;
     peer->state = UCT_CXI_PEER_DOWN;
     ucs_list_head_init(&peer->connecting);
+    ucs_list_head_init(&peer->grants);
     cxi_build_dfa(nid, pid, md->pid_bits, UCT_CXI_PTE_CTRL, &peer->dfa_ctrl,
                   &peer->dfa_ctrl_idx_ext);
 
@@ -265,14 +310,183 @@ static uct_cxi_peer_t *uct_cxi_peer_lookup(uct_cxi_iface_t *iface,
            NULL : kh_value(&iface->fc.peers, iter);
 }
 
-/* A handshake is over (completed, failed, or not needed): stop resending. */
-static void uct_cxi_peer_connected(uct_cxi_peer_t *peer, unsigned state)
+/* A handshake is over (completed, failed, or not needed): stop resending, and
+ * let the sends that were waiting on it run (or fail). */
+static void uct_cxi_peer_connected(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
+                                   unsigned state)
 {
     peer->state = state;
     if (!ucs_list_is_empty(&peer->connecting)) {
         ucs_list_del(&peer->connecting);
         ucs_list_head_init(&peer->connecting);
     }
+    uct_cxi_peer_resume(iface, peer);
+}
+
+
+/* -------------------------------------------------------------------------
+ * Credits
+ * -------------------------------------------------------------------------
+ */
+
+ucs_status_t uct_cxi_fc_reserve_slow(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
+                                     int *credited_p)
+{
+    uct_cxi_peer_t *peer = ep->peer;
+
+    *credited_p = 0;
+    if (peer == NULL) {
+        return UCS_OK;
+    }
+
+    switch (peer->state) {
+    case UCT_CXI_PEER_LEGACY:
+        return UCS_OK; /* no flow control with this peer: not charged */
+    case UCT_CXI_PEER_FAILED:
+        return UCS_ERR_ENDPOINT_TIMEOUT;
+    default:
+        /* Handshake still in flight. Not an interface resource: the pending
+         * queue waits for the CREP, which resumes it (see peer_connected). */
+        iface->tx.credit_block = 1;
+        return UCS_ERR_NO_RESOURCE;
+    }
+}
+
+void uct_cxi_fc_block_ep(uct_cxi_ep_t *ep)
+{
+    if (!ep->fc_listed) {
+        ep->next_blocked   = ep->peer->blocked;
+        ep->peer->blocked  = ep;
+        ep->fc_listed      = 1;
+    }
+}
+
+void uct_cxi_fc_unblock_ep(uct_cxi_ep_t *ep)
+{
+    uct_cxi_ep_t **link;
+
+    if (!ep->fc_listed) {
+        return;
+    }
+
+    for (link = &ep->peer->blocked; *link != NULL;
+         link = &(*link)->next_blocked) {
+        if (*link == ep) {
+            *link = ep->next_blocked;
+            break;
+        }
+    }
+    ep->fc_listed = 0;
+}
+
+void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
+{
+    uct_cxi_ep_t *ep = peer->blocked;
+    uct_cxi_ep_t *next;
+
+    peer->blocked = NULL;
+    for (; ep != NULL; ep = next) {
+        next           = ep->next_blocked;
+        ep->fc_listed  = 0;
+        ucs_arbiter_group_schedule(&iface->tx.arbiter, &ep->arb_group);
+    }
+}
+
+/* Apply a cumulative "processed so far" counter from a peer: \a wire is the
+ * peer's full counter, truncated to \a bits bits. Spend nothing new if it is
+ * not ahead of what was last applied (a duplicate or reordered grant). */
+static UCS_F_ALWAYS_INLINE int32_t
+uct_cxi_fc_grant_delta(uint32_t wire, uint32_t last, unsigned bits)
+{
+    unsigned shift = 32 - bits;
+
+    return (int32_t)((wire - last) << shift) >> shift;
+}
+
+static void uct_cxi_fc_apply_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
+                                   uint32_t msgs, uint32_t units, unsigned
+                                   msg_bits, unsigned unit_bits)
+{
+    int32_t dm = uct_cxi_fc_grant_delta(msgs, peer->tx.ret_msgs, msg_bits);
+    int32_t du = uct_cxi_fc_grant_delta(units, peer->tx.ret_units, unit_bits);
+
+    if (dm > 0) {
+        peer->tx.ret_msgs   += dm;
+        peer->tx.avail_msgs += dm;
+    }
+    if (du > 0) {
+        peer->tx.ret_units   += du;
+        peer->tx.avail_units += du;
+    }
+
+    if (((dm > 0) || (du > 0)) && (peer->blocked != NULL)) {
+        uct_cxi_peer_resume(iface, peer);
+    }
+}
+
+void uct_cxi_fc_apply_piggyback(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
+                                uint64_t match_bits)
+{
+    /* Before the handshake completes we do not know the peer's epoch, and
+     * have no credits to add to. The values are cumulative: the next one
+     * carries the same information. */
+    if ((peer->state != UCT_CXI_PEER_UP) ||
+        (((match_bits >> UCT_CXI_FC_PB_EPOCH_SHIFT) &
+          UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_EPOCH_BITS)) !=
+         (peer->remote_epoch & UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_EPOCH_BITS)))) {
+        return;
+    }
+
+    uct_cxi_fc_apply_grant(
+            iface, peer,
+            (uint32_t)((match_bits >> UCT_CXI_FC_PB_MSG_SHIFT) &
+                       UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_MSG_BITS)),
+            (uint32_t)((match_bits >> UCT_CXI_FC_PB_UNIT_SHIFT) &
+                       UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_UNIT_BITS)),
+            UCT_CXI_FC_PB_MSG_BITS, UCT_CXI_FC_PB_UNIT_BITS);
+}
+
+void uct_cxi_fc_refund(uct_cxi_iface_t *iface, uct_cxi_ep_t *ep, unsigned units)
+{
+    uct_cxi_peer_t *peer = ep->peer;
+
+    /* The send never reached the target's software, which therefore will
+     * never hand its credits back: take them back here. */
+    peer->tx.avail_msgs++;
+    peer->tx.avail_units += (int32_t)units;
+    peer->tx.used_msgs--;
+    peer->tx.used_units  -= units;
+
+    /* A credit grant may have gone with it. */
+    uct_cxi_fc_resync(iface, peer);
+    uct_cxi_peer_resume(iface, peer);
+}
+
+void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
+{
+    peer->rx.adv_msgs  = peer->rx.acked_msgs;
+    peer->rx.adv_units = peer->rx.acked_units;
+
+    if (((uint32_t)(peer->rx.ret_msgs  - peer->rx.adv_msgs)  >=
+         iface->fc.grant_msgs) ||
+        ((uint32_t)(peer->rx.ret_units - peer->rx.adv_units) >=
+         iface->fc.grant_units)) {
+        uct_cxi_fc_grant_wanted(iface, peer);
+    }
+}
+
+uct_cxi_peer_t *uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface,
+                                        uint32_t process)
+{
+    khiter_t iter = kh_get(uct_cxi_peer_hash, &iface->fc.peers, process);
+
+    if (iter == kh_end(&iface->fc.peers)) {
+        return NULL;
+    }
+
+    iface->fc.rx_cache_key  = process;
+    iface->fc.rx_cache_peer = kh_value(&iface->fc.peers, iter);
+    return iface->fc.rx_cache_peer;
 }
 
 
@@ -290,7 +504,8 @@ static void uct_cxi_peer_connected(uct_cxi_peer_t *peer, unsigned state)
  */
 static ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface,
                                       uct_cxi_peer_t *peer, unsigned type,
-                                      uint64_t match_bits, uint64_t header_data)
+                                      uint64_t match_bits, uint64_t header_data,
+                                      uint32_t grant_msgs, uint32_t grant_units)
 {
     uct_cxi_ctrl_req_t  *req;
     int                  ret;
@@ -299,8 +514,10 @@ static ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface,
     if (req == NULL) {
         return UCS_ERR_NO_RESOURCE;
     }
-    req->peer = peer;
-    req->type = type;
+    req->peer        = peer;
+    req->type        = type;
+    req->grant_msgs  = grant_msgs;
+    req->grant_units = grant_units;
 
     {
         struct c_cstate_cmd cstate = {};
@@ -340,6 +557,28 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
 {
     int rc = cxi_event_rc(event);
 
+    if (req->type == UCT_CXI_CTRL_GRANT) {
+        uct_cxi_peer_t *peer = req->peer;
+
+        if (rc == C_RC_OK) {
+            /* Delivered: no need to say it again (a later grant may already
+             * have overtaken this one, hence the "only forward" test). */
+            if ((int32_t)(req->grant_msgs - peer->rx.acked_msgs) > 0) {
+                peer->rx.acked_msgs = req->grant_msgs;
+            }
+            if ((int32_t)(req->grant_units - peer->rx.acked_units) > 0) {
+                peer->rx.acked_units = req->grant_units;
+            }
+        } else {
+            /* Lost: say it again, along with whatever has accumulated. */
+            ucs_debug("cxi GRANT to nid 0x%x pid %u failed: rc=%d, resending",
+                      peer->nid, peer->pid, rc);
+            uct_cxi_fc_resync(iface, peer);
+        }
+        ucs_mpool_put(req);
+        return;
+    }
+
     if (ucs_unlikely(rc != C_RC_OK)) {
         if ((rc == C_RC_PTLTE_NOT_FOUND) && (req->type == UCT_CXI_CTRL_CREQ) &&
             ((req->peer->state == UCT_CXI_PEER_DOWN) ||
@@ -348,7 +587,7 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
             ucs_debug("cxi peer nid 0x%x pid %u has no control channel, "
                       "treating it as a legacy peer", req->peer->nid,
                       req->peer->pid);
-            uct_cxi_peer_connected(req->peer, UCT_CXI_PEER_LEGACY);
+            uct_cxi_peer_connected(iface, req->peer, UCT_CXI_PEER_LEGACY);
         } else {
             /* A CREQ is resent until answered and a lost CREP is answered
              * by the next CREQ, so nothing to do here. */
@@ -386,6 +625,11 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
             ucs_error("cxi no memory for a peer record, dropping CREQ");
             return;
         }
+        if ((peer->rx_epoch != 0) && (peer->rx_epoch != (uint32_t)hd)) {
+            /* The requester restarted: what we owed its previous incarnation
+             * means nothing to this one. */
+            memset(&peer->rx, 0, sizeof(peer->rx));
+        }
         peer->rx_epoch = (uint32_t)hd;
 
         /* Fire and forget: if this reply is lost, the requester resends its
@@ -394,7 +638,8 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
                 iface, peer, UCT_CXI_CTRL_CREP,
                 UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREP, iface->fc.epoch,
                                    (uint32_t)hd),
-                ((uint64_t)iface->fc.msg_window << 32) | iface->fc.unit_window);
+                ((uint64_t)iface->fc.msg_window << 32) | iface->fc.unit_window,
+                0, 0);
         break;
 
     case UCT_CXI_CTRL_CREP:
@@ -413,9 +658,26 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
         peer->remote_epoch = UCT_CXI_CTRL_EPOCH24(mb);
         peer->msg_window   = (uint32_t)(hd >> 32);
         peer->unit_window  = (uint32_t)hd;
-        uct_cxi_peer_connected(peer, UCT_CXI_PEER_UP);
+
+        /* The grant is the whole window: nothing has been spent yet. */
+        memset(&peer->tx, 0, sizeof(peer->tx));
+        peer->tx.avail_msgs  = (int32_t)peer->msg_window;
+        peer->tx.avail_units = (int32_t)peer->unit_window;
+
+        uct_cxi_peer_connected(iface, peer, UCT_CXI_PEER_UP);
         ucs_debug("cxi peer nid 0x%x pid %u is up: %u msgs, %u units",
                   peer->nid, peer->pid, peer->msg_window, peer->unit_window);
+        break;
+
+    case UCT_CXI_CTRL_GRANT:
+        peer = uct_cxi_peer_lookup(iface, process);
+        if ((peer == NULL) || (peer->state != UCT_CXI_PEER_UP) ||
+            (UCT_CXI_CTRL_EPOCH24(mb) != peer->remote_epoch)) {
+            ucs_debug("cxi ignoring GRANT from initiator 0x%x", process);
+            return;
+        }
+        uct_cxi_fc_apply_grant(iface, peer, (uint32_t)(hd >> 32), (uint32_t)hd,
+                               32, 32);
         break;
 
     default:
@@ -447,6 +709,40 @@ void uct_cxi_peer_connect(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
     uct_cxi_fc_progress(iface);
 }
 
+/*
+ * uct_cxi_fc_send_grant -- tell \a peer how much of its traffic we have
+ * processed, cumulatively. UCS_ERR_NO_RESOURCE (no control slot, command queue
+ * full) leaves it queued to try again from progress.
+ */
+static ucs_status_t uct_cxi_fc_send_grant(uct_cxi_iface_t *iface,
+                                          uct_cxi_peer_t *peer)
+{
+    uint32_t     msgs  = peer->rx.ret_msgs;
+    uint32_t     units = peer->rx.ret_units;
+    ucs_status_t status;
+
+    status = uct_cxi_ctrl_send(
+            iface, peer, UCT_CXI_CTRL_GRANT,
+            UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_GRANT, iface->fc.epoch, 0),
+            ((uint64_t)msgs << 32) | units, msgs, units);
+    if (status == UCS_OK) {
+        peer->rx.adv_msgs  = msgs;
+        peer->rx.adv_units = units;
+    }
+    return status;
+}
+
+void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
+{
+    if (!ucs_list_is_empty(&peer->grants)) {
+        return; /* already waiting for a control slot */
+    }
+
+    if (uct_cxi_fc_send_grant(iface, peer) != UCS_OK) {
+        ucs_list_add_tail(&iface->fc.grants, &peer->grants);
+    }
+}
+
 void uct_cxi_fc_progress(uct_cxi_iface_t *iface)
 {
     ucs_time_t      now = ucs_get_time();
@@ -454,11 +750,21 @@ void uct_cxi_fc_progress(uct_cxi_iface_t *iface)
     unsigned        shift;
     ucs_time_t      delay;
 
+    ucs_list_for_each_safe(peer, tmp, &iface->fc.grants, grants) {
+        /* Still owed anything? A piggyback may have carried it meanwhile. */
+        if (((peer->rx.ret_msgs == peer->rx.adv_msgs) &&
+             (peer->rx.ret_units == peer->rx.adv_units)) ||
+            (uct_cxi_fc_send_grant(iface, peer) == UCS_OK)) {
+            ucs_list_del(&peer->grants);
+            ucs_list_head_init(&peer->grants);
+        }
+    }
+
     ucs_list_for_each_safe(peer, tmp, &iface->fc.connecting, connecting) {
         if (now > peer->deadline) {
             ucs_warn("cxi handshake with nid 0x%x pid %u timed out after "
                      "%u attempts", peer->nid, peer->pid, peer->attempts);
-            uct_cxi_peer_connected(peer, UCT_CXI_PEER_FAILED);
+            uct_cxi_peer_connected(iface, peer, UCT_CXI_PEER_FAILED);
             continue;
         }
 
@@ -469,7 +775,7 @@ void uct_cxi_fc_progress(uct_cxi_iface_t *iface)
         if (uct_cxi_ctrl_send(iface, peer, UCT_CXI_CTRL_CREQ,
                               UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREQ,
                                                  iface->fc.epoch, 0),
-                              iface->fc.epoch) != UCS_OK) {
+                              iface->fc.epoch, 0, 0) != UCS_OK) {
             continue; /* no slot or command queue room: next progress call */
         }
 

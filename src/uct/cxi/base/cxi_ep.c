@@ -87,6 +87,9 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     ucs_arbiter_group_init(&ep->arb_group);
 
 #ifndef UCT_CXI_DISABLE_FC
+    ep->next_blocked = NULL;
+    ep->fc_listed    = 0;
+
     /* One handshake per remote iface, however many eps are created to it. */
     ep->peer = NULL;
     if (iface->fc.enabled) {
@@ -136,6 +139,11 @@ void uct_cxi_ep_destroy(uct_ep_h tl_ep)
 
     ucs_debug("cxi ep %p destroy (outstanding=%u)", ep, ep->outstanding);
     uct_cxi_ep_pending_purge(tl_ep, uct_cxi_ep_pending_purge_warn_cb, ep);
+#ifndef UCT_CXI_DISABLE_FC
+    if (ep->peer != NULL) {
+        uct_cxi_fc_unblock_ep(ep); /* the peer must not resume a dead ep */
+    }
+#endif
 
     /* Completions of sends still in flight find their ep through a pointer
      * stored in the command (op->ep, or the tagged user_ptr of a short), so
@@ -188,6 +196,9 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
     uct_cxi_ep_t      *ep  = ucs_container_of(group, uct_cxi_ep_t, arb_group);
     uct_pending_req_t *req = ucs_container_of(elem, uct_pending_req_t, priv);
     ucs_status_t       status;
+#ifndef UCT_CXI_DISABLE_FC
+    uct_cxi_iface_t   *iface = uct_cxi_ep_iface(ep);
+#endif
 
     if (ucs_unlikely(ep->retry_backoff_until > ucs_get_time())) {
         /* Still in this EP's adaptive backoff window — leave queued
@@ -200,6 +211,9 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
         return UCS_ARBITER_CB_RESULT_NEXT_GROUP;
     }
 
+#ifndef UCT_CXI_DISABLE_FC
+    iface->tx.credit_block = 0;
+#endif
     status = req->func(req);
     /* TEMPORARY: confirms the dispatch loop is actually retrying queued
      * sends and shows how each attempt resolves. */
@@ -208,6 +222,15 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
     if (status == UCS_OK) {
         return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
     } else if (status == UCS_ERR_NO_RESOURCE) {
+#ifndef UCT_CXI_DISABLE_FC
+        if (iface->tx.credit_block) {
+            /* Short of this peer's credits (or still handshaking), not of
+             * anything shared: park just this ep until a grant, the CREP or
+             * a refund resumes it, and let every other ep carry on. */
+            uct_cxi_fc_block_ep(ep);
+            return UCS_ARBITER_CB_RESULT_DESCHED_GROUP;
+        }
+#endif
         return UCS_ARBITER_CB_RESULT_STOP;
     }
     return UCS_ARBITER_CB_RESULT_NEXT_GROUP;

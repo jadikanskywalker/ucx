@@ -83,9 +83,12 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"EQ_SIZE", "-1",
      "RX event queue depth (number of hardware events): everything the NIC\n"
      "reports for this iface's own portal table entries, i.e. incoming\n"
-     "traffic and PTE state changes. -1 (default) resolves to 1024. Rounded\n"
-     "up to a whole number of pages (64 events). Initiator-side completions\n"
-     "use a separate queue, see TX_EQ_SIZE.",
+     "traffic and PTE state changes. -1 (default) sizes it for\n"
+     "FC_ACTIVE_SENDERS peers each using their full FC_MSG_WINDOW when flow\n"
+     "control is on (a warning is logged if an explicit value is smaller),\n"
+     "and resolves to 1024 when it is off. Rounded up to a whole number of\n"
+     "pages (64 events). Initiator-side completions use a separate queue,\n"
+     "see TX_EQ_SIZE.",
      ucs_offsetof(uct_cxi_iface_config_t, eq_size),
      UCS_CONFIG_TYPE_INT},
 
@@ -112,15 +115,16 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, eq_max_poll),
      UCS_CONFIG_TYPE_UINT},
 
-    {"EQ_RESERVED_SLOTS_PCT", "5",
-     "Percentage of the RX EQ reserved so incoming messages cannot crowd\n"
-     "out the events that are not themselves incoming traffic: PTE state\n"
+    {"EQ_RESERVED_SLOTS", "64",
+     "Number of RX EQ slots reserved so incoming messages cannot crowd out\n"
+     "the events that are not themselves incoming traffic: PTE state\n"
      "changes and the results of this iface's own target commands. One-\n"
      "sided: those events may use the full EQ, this only blocks incoming-\n"
-     "message events from the reserved portion. A floor, safe to default\n"
-     "small since PTE flow control is what actually prevents data loss\n"
+     "message events from the reserved portion. Incoming messages are what\n"
+     "flow control (FC_*) accounts for, so this only has to cover the\n"
+     "others; PTE flow control is what actually prevents data loss\n"
      "regardless of this setting.",
-     ucs_offsetof(uct_cxi_iface_config_t, eq_reserved_slots_pct),
+     ucs_offsetof(uct_cxi_iface_config_t, eq_reserved_slots),
      UCS_CONFIG_TYPE_UINT},
 
     {"EQ_DRAIN_PCT", "50",
@@ -166,21 +170,29 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, eq_max_len),
      UCS_CONFIG_TYPE_UINT},
 
-    {"AM_RX_NUM_BUFS", "4",
-     "Number of AM receive buffers rotated on the PRIORITY list.\n"
-     "More buffers reduce the chance of overflow under burst traffic.",
+    {"AM_RX_NUM_BUFS", "auto",
+     "Number of AM receive buffers rotated on the PRIORITY list. Auto sizes\n"
+     "the ring for FC_ACTIVE_SENDERS peers each using their full\n"
+     "FC_BYTE_WINDOW when flow control is on (a warning is logged if an\n"
+     "explicit value is smaller), and is 4 when it is off. Hard ceiling\n"
+     "UCT_CXI_AM_RX_NUM_BUFS_MAX (cxi_iface.h).",
      ucs_offsetof(uct_cxi_iface_config_t, am_rx_num_bufs),
-     UCS_CONFIG_TYPE_UINT},
+     UCS_CONFIG_TYPE_ULUNITS},
 
-    {"AM_RX_BUF_SIZE", "512k",
-     "Size of each AM receive buffer in bytes.\n"
-     "Automatically increased to AM_MAX_ZCOPY if that is larger.",
+    {"AM_RX_BUF_SIZE", "auto",
+     "Size of each AM receive buffer in bytes. Auto is the greater of 1 MiB\n"
+     "and four times the largest message when flow control is on, and\n"
+     "512 KiB when it is off. Raised to twice the largest message if smaller:\n"
+     "the NIC retires a buffer once less than a maximum-size message is left\n"
+     "in it, so a smaller one would be retired after every message.",
      ucs_offsetof(uct_cxi_iface_config_t, am_rx_buf_size),
      UCS_CONFIG_TYPE_MEMUNITS},
 
-    {"AM_MAX_ZCOPY", "512k",
-     "Maximum AM zcopy payload in bytes.  Capped by AM_RX_BUF_SIZE;\n"
-     "if AM_MAX_ZCOPY exceeds AM_RX_BUF_SIZE, the buffer size is raised.",
+    {"AM_MAX_ZCOPY", "8k",
+     "Largest AM zcopy header + payload in bytes, as advertised to the\n"
+     "upper layer. Together with MAX_BCOPY it sets the largest message the\n"
+     "AM receive buffers must take. The default matches the IB RC segment\n"
+     "size; larger messages use rendezvous. At most 16 MiB - 1.",
      ucs_offsetof(uct_cxi_iface_config_t, am_max_zcopy),
      UCS_CONFIG_TYPE_MEMUNITS},
 
@@ -241,10 +253,29 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, fc_byte_window),
      UCS_CONFIG_TYPE_MEMUNITS},
 
+    {"FC_ACTIVE_SENDERS", "8",
+     "Number of peers that may each send up to their full FC_MSG_WINDOW and\n"
+     "FC_BYTE_WINDOW at the same time. Sizes the AM receive ring and the RX\n"
+     "EQ (unless AM_RX_NUM_BUFS, AM_RX_BUF_SIZE or EQ_SIZE are set), so\n"
+     "pinned memory grows with it. Credits pace senders but do not stop more\n"
+     "peers than this from overrunning the ring; the PTE flow control and\n"
+     "recovery path is the backstop for that.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_active_senders),
+     UCS_CONFIG_TYPE_UINT},
+
     {"FC_CONNECT_TIMEOUT", "30s",
      "Give up on a peer's handshake after this long without a reply.",
      ucs_offsetof(uct_cxi_iface_config_t, fc_connect_timeout),
      UCS_CONFIG_TYPE_TIME},
+
+    {"FC_GRANT_THRESH", "0.5",
+     "Hand credits back to a peer on a message of their own once this\n"
+     "fraction of its window (messages, or bytes) has been processed and not\n"
+     "yet returned. Credits also ride for free on any Active Message sent to\n"
+     "that peer, so this only matters when there is none: lower values return\n"
+     "credits sooner at the cost of more control messages.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_grant_thresh),
+     UCS_CONFIG_TYPE_DOUBLE},
 #endif
 
     {NULL}
@@ -400,7 +431,10 @@ ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
  *
  * buffer_id=buf_idx is echoed in every C_EVENT_PUT, letting iface_progress
  * identify which rx_buf the data landed in.  min_free triggers NIC auto-unlink
- * when remaining space drops below UCT_CXI_AM_MIN_FREE bytes.
+ * when remaining space drops below the largest message there can be, so a
+ * linked buffer can always take the next one: a Put that does not fit what is
+ * left of the buffer it matched is not tried against the next buffer, it fails
+ * with NO_SPACE.
  */
 static ucs_status_t
 uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
@@ -431,7 +465,7 @@ uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
                                                       buf_idx * self->am.buf_size) +
                                sizeof(uint64_t);
     le.length                = self->am.buf_size - sizeof(uint64_t);
-    le.min_free              = UCT_CXI_AM_MIN_FREE;
+    le.min_free              = self->am.max_msg;
     le.ignore_bits           = UINT64_MAX;
     le.match_bits            = 0;
 
@@ -558,13 +592,29 @@ static void uct_cxi_send_desc_init(uct_iface_h tl_iface, void *obj,
 
     desc->iova = cxi_mh->iova_offset + (uint64_t)(uintptr_t)(desc + 1);
     desc->lac  = cxi_mh->cxi_md->lac;
+#ifndef UCT_CXI_DISABLE_FC
+    desc->op.fc_credited = 0;
+#endif
 }
 
-/* op_pool: plain malloc/free, no per-object init needed. */
+#ifndef UCT_CXI_DISABLE_FC
+/* A pooled op starts out uncharged; the completion that consumes a charged
+ * one clears it again (see uct_cxi_op_fc_take). */
+static void uct_cxi_send_op_init(ucs_mpool_t *mp, void *obj, void *chunk)
+{
+    ((uct_cxi_send_op_t *)obj)->fc_credited = 0;
+}
+#endif
+
+/* op_pool: plain malloc/free. */
 static ucs_mpool_ops_t uct_cxi_send_op_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
+#ifndef UCT_CXI_DISABLE_FC
+    .obj_init      = uct_cxi_send_op_init,
+#else
     .obj_init      = NULL,
+#endif
     .obj_cleanup   = NULL,
     .obj_str       = NULL
 };
@@ -679,7 +729,7 @@ ucs_status_t uct_cxi_query_devices(uct_md_h md,
  */
 static void
 uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
-                     unsigned reserved_slots_pct, int grow_enabled,
+                     unsigned reserved_slots, int grow_enabled,
                      const uct_cxi_iface_config_t *config)
 {
     memset(eq, 0, sizeof(*eq));
@@ -688,18 +738,144 @@ uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
                                                       UCT_CXI_EQ_ENTRY_SIZE);
     eq->max_poll           = ucs_max(config->eq_max_poll, 1u);
     eq->drain_pct          = config->eq_drain_pct;
-    eq->reserved_slots_pct = reserved_slots_pct;
+    eq->reserved_slots_cfg = ucs_min(reserved_slots, eq->num_events / 2);
 
-    /* Preemptive EQ growth config — see cxi_iface.h / eq_grow_start(). */
+    /* Preemptive EQ growth config — see cxi_iface.h / eq_grow_start(). The
+     * ceiling is never below the size asked for. */
     eq->grow.enabled        = grow_enabled;
     eq->grow.thresh_pct     = config->eq_grow_thresh_pct;
-    eq->grow.max_len_events = config->eq_max_len;
+    eq->grow.max_len_events = ucs_max(config->eq_max_len, eq->num_events);
+}
+
+/*
+ * uct_cxi_iface_set_am_limits -- the largest AM header + payload we advertise
+ * (AM_MAX_ZCOPY), and the largest message of any kind that can land in a
+ * receive buffer, which is what the buffers' min_free has to be.
+ */
+static void uct_cxi_iface_set_am_limits(uct_cxi_iface_t *self,
+                                        const uct_cxi_iface_config_t *config)
+{
+    size_t max_msg = ucs_max(config->am_max_zcopy, config->max_bcopy);
+
+    if (max_msg > UCT_CXI_AM_MAX_MSG_LIMIT) {
+        ucs_warn("cxi AM_MAX_ZCOPY=%zu / MAX_BCOPY=%zu exceed the %u bytes "
+                 "that min_free can express: limiting the AM size to it",
+                 config->am_max_zcopy, config->max_bcopy,
+                 UCT_CXI_AM_MAX_MSG_LIMIT);
+        max_msg = UCT_CXI_AM_MAX_MSG_LIMIT;
+    }
+
+    self->am.max_zcopy = ucs_min(config->am_max_zcopy, max_msg);
+    self->am.max_msg   = max_msg;
+}
+
+/*
+ * uct_cxi_iface_size_am_ring -- resolve the number and size of the AM receive
+ * buffers. \a outstanding is the most bytes that the peers allowed to send at
+ * once may have sent and not yet had processed (active senders x byte window),
+ * or 0 when flow control is off and nothing bounds it.
+ *
+ * Messages are placed back to back, and the NIC retires a buffer once less
+ * than max_msg is left in it, so every buffer takes at least
+ * (buf_size - 8 - max_msg) bytes before it is retired. Events are processed in
+ * order and a retired buffer is reposted when the event that retired it is,
+ * so the unprocessed bytes sit in the buffers after the one being processed.
+ * Allow for those, for the buffer being processed (it may be mostly processed
+ * and yet cannot be reposted), and for one more that is linked to take the
+ * next message:
+ *
+ *    num_bufs = floor(outstanding / (buf_size - 8 - max_msg)) + 2
+ */
+static void uct_cxi_iface_size_am_ring(uct_cxi_iface_t *self,
+                                       const uct_cxi_iface_config_t *config,
+                                       size_t outstanding)
+{
+    size_t        max_msg  = self->am.max_msg;
+    size_t        min_size = 2 * max_msg + sizeof(uint64_t);
+    size_t        buf_size;
+    unsigned long num_bufs;
+    unsigned long needed   = 0;
+
+    if (config->am_rx_buf_size != UCS_MEMUNITS_AUTO) {
+        buf_size = config->am_rx_buf_size;
+    } else if (outstanding != 0) {
+        buf_size = ucs_max((size_t)UCT_CXI_AM_RX_BUF_SIZE_MIN,
+                           UCT_CXI_AM_RX_BUF_PER_MSG * max_msg);
+    } else {
+        buf_size = UCT_CXI_AM_RX_BUF_SIZE_DEFAULT;
+    }
+
+    if (buf_size < min_size) {
+        ucs_warn("cxi AM receive buffer size %zu is too small for %zu-byte "
+                 "messages: using %zu", buf_size, max_msg, min_size);
+        buf_size = min_size;
+    }
+
+    if (outstanding != 0) {
+        needed = outstanding / (buf_size - sizeof(uint64_t) - max_msg) + 2;
+    }
+
+    if (config->am_rx_num_bufs == UCS_ULUNITS_AUTO) {
+        num_bufs = (outstanding != 0) ? needed : UCT_CXI_AM_RX_NUM_BUFS_DEFAULT;
+    } else {
+        num_bufs = config->am_rx_num_bufs;
+        if (needed > num_bufs) {
+            ucs_warn("cxi AM_RX_NUM_BUFS=%lu is below the %lu that "
+                     "FC_ACTIVE_SENDERS peers at their full window need: "
+                     "the ring can run out of buffers under load",
+                     num_bufs, needed);
+        }
+    }
+
+    if (num_bufs > UCT_CXI_AM_RX_NUM_BUFS_MAX) {
+        ucs_warn("cxi AM receive ring wants %lu buffers, limited to %u",
+                 num_bufs, UCT_CXI_AM_RX_NUM_BUFS_MAX);
+        num_bufs = UCT_CXI_AM_RX_NUM_BUFS_MAX;
+    }
+
+    self->am.num_bufs = (unsigned)ucs_max(num_bufs, 2ul);
+    self->am.buf_size = buf_size;
+}
+
+/*
+ * uct_cxi_iface_rx_eq_events -- resolve the RX EQ depth. \a msg_credits is the
+ * most messages the peers allowed to send at once may have outstanding
+ * (active senders x message window), or 0 when flow control is off.
+ *
+ * Every credited message costs one event until it is processed, so these
+ * events always fit. The rest are reserved (PTE state changes, results of our
+ * own target commands), slack (acknowledgement of events is batched; control
+ * messages are not credited, but are few and quickly processed), and
+ * UCT_CXI_EQ_NUM_EVENTS standing in for everything else, i.e. tag matching,
+ * until that is credited as well.
+ */
+static unsigned
+uct_cxi_iface_rx_eq_events(const uct_cxi_iface_config_t *config,
+                           size_t msg_credits)
+{
+    unsigned needed = UCT_CXI_EQ_NUM_EVENTS;
+
+    if (msg_credits != 0) {
+        needed = msg_credits + UCT_CXI_EQ_NUM_EVENTS +
+                 config->eq_reserved_slots + UCT_CXI_EQ_SLACK;
+    }
+
+    if (config->eq_size == UINT_MAX) {
+        return needed;
+    }
+
+    if ((msg_credits != 0) && (config->eq_size < needed)) {
+        ucs_warn("cxi EQ_SIZE=%u is below the %u events that "
+                 "FC_ACTIVE_SENDERS peers at their full window need: the "
+                 "RX queue can fill under load", config->eq_size, needed);
+    }
+    return config->eq_size;
 }
 
 /*
  * uct_cxi_eq_init -- allocate one event queue: mmap its ring buffer, pin it
  * for the NIC and create the hardware queue on top of it. The caller must
- * have filled in eq->num_events, eq->reserved_slots_pct and eq->grow.* (the
+ * have filled in eq->num_events, eq->reserved_slots_cfg and eq->grow.* (the
  * resolved config) beforehand.
  */
 static ucs_status_t
@@ -734,7 +910,7 @@ uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
     memset(&eq_attr, 0, sizeof(eq_attr));
     eq_attr.queue           = eq->buf;
     eq_attr.queue_len       = buf_len;
-    eq_attr.reserved_slots  = (eq->num_events * eq->reserved_slots_pct) / 100;
+    eq_attr.reserved_slots  = eq->reserved_slots_cfg;
     eq->reserved_slots      = eq_attr.reserved_slots;
     /* status_thresh_*: a single hardware-native fill-percentage threshold
      * (see EQ_DYNAMIC_GROWTH doc) — status_thresh_count=0 when disabled
@@ -816,6 +992,12 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     int                        ret;
     unsigned                   op_max_bufs;
     unsigned                   desc_max_bufs;
+    size_t                     msg_credits  = 0;
+    size_t                     byte_credits = 0;
+#ifndef UCT_CXI_DISABLE_FC
+    uint32_t                   msg_window   = 0;
+    uint32_t                   unit_window  = 0;
+#endif
 
     UCT_CHECK_PARAM(params->field_mask & UCT_IFACE_PARAM_FIELD_OPEN_MODE,
                     "UCT_IFACE_PARAM_FIELD_OPEN_MODE is not defined");
@@ -851,8 +1033,19 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * be (tx.max_inflight): beyond that sends wait on the pending queue
      * instead of growing the event queue.
      */
+    uct_cxi_iface_set_am_limits(self, config);
+#ifndef UCT_CXI_DISABLE_FC
+    if (config->fc_enable) {
+        unsigned active_senders = ucs_max(config->fc_active_senders, 1u);
+
+        uct_cxi_fc_windows(config, self->am.max_msg, &msg_window,
+                           &unit_window);
+        msg_credits  = (size_t)active_senders * msg_window;
+        byte_credits = (size_t)active_senders * unit_window * UCT_CXI_FC_UNIT;
+    }
+#endif
+
     {
-        unsigned eq_cfg    = config->eq_size;
         unsigned tx_eq_cfg = config->tx_eq_size;
         unsigned op_cfg    = config->op_mp.max_bufs;
         unsigned desc_cfg  = config->bcopy_mp.max_bufs;
@@ -865,9 +1058,8 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
         /* Only the RX queue is ever grown or has PTEs to recover; the TX
          * queue is fixed-size and reserves no slots for incoming traffic. */
         uct_cxi_eq_configure(&self->rx_eq, "rx",
-                             (eq_cfg == UINT_MAX) ? UCT_CXI_EQ_NUM_EVENTS :
-                                                    eq_cfg,
-                             config->eq_reserved_slots_pct,
+                             uct_cxi_iface_rx_eq_events(config, msg_credits),
+                             config->eq_reserved_slots,
                              config->dynamic_eq_growth, config);
 
         if ((tx_eq_cfg != UINT_MAX) && (tx_eq_cfg <= UCT_CXI_TX_EQ_UNTRACKED)) {
@@ -985,6 +1177,9 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * outstanding ops can exceed the hardware EQ depth.
      */
     self->tx.outstanding = 0;
+#ifndef UCT_CXI_DISABLE_FC
+    self->tx.credit_block = 0;
+#endif
     kh_init_inplace(uct_cxi_zombie_ep_hash, &self->tx.zombie_eps);
     ucs_arbiter_init(&self->tx.arbiter);
     ucs_mpool_params_reset(&mp_params);
@@ -1078,10 +1273,10 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * Page-aligned so that iova_offset + VA gives the exact IOVA of each
      * buffer slice — required for start/offset arithmetic in iface_progress.
      */
-    self->am.num_bufs = ucs_min(config->am_rx_num_bufs,
-                                UCT_CXI_AM_RX_NUM_BUFS_MAX);
-    self->am.buf_size = ucs_max(config->am_rx_buf_size,
-                                config->am_max_zcopy);
+    uct_cxi_iface_size_am_ring(self, config, byte_credits);
+    ucs_info("cxi AM ring: %u buffers of %zu bytes, min_free %zu; RX EQ %u "
+             "events", self->am.num_bufs, self->am.buf_size, self->am.max_msg,
+             self->rx_eq.num_events);
     self->am.rx_base  = NULL;
     {
         size_t total = self->am.num_bufs * self->am.buf_size;
@@ -1150,7 +1345,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
 #ifndef UCT_CXI_DISABLE_FC
     /* Step 17: connected-endpoint flow control -- per-peer state and the
      * control PTE its handshake runs on. */
-    status = uct_cxi_fc_init(self, config);
+    status = uct_cxi_fc_init(self, config, msg_window, unit_window);
     if (status != UCS_OK) {
         goto err_rdzv_pte;
     }
@@ -1393,7 +1588,7 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
     iface_attr->cap.am.max_short      = C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t);
     iface_attr->cap.am.max_bcopy      = iface->tx.max_bcopy;
     iface_attr->cap.am.max_hdr        = sizeof(uint64_t);
-    iface_attr->cap.am.max_zcopy      = iface->am.buf_size - sizeof(uint64_t);
+    iface_attr->cap.am.max_zcopy      = iface->am.max_zcopy;
     iface_attr->cap.am.opt_zcopy_align = sizeof(uint64_t);
     iface_attr->cap.am.align_mtu      = 1;
     iface_attr->cap.am.max_iov        = 1;
@@ -1701,13 +1896,11 @@ static void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface, uct_cxi_eq_t 
     eq->grow.pending_len = 0;
     eq->grow.resizing    = 0;
 
-    target_reserved = (eq->num_events *
-                       eq->reserved_slots_pct) / 100;
+    target_reserved = eq->reserved_slots_cfg;
     ret = cxil_evtq_adjust_reserved_fc(
             eq->evtq, (int)target_reserved - (int)eq->reserved_slots);
     if (ret < 0) {
-        ucs_warn("cxi EQ grow: reserved-slots adjust failed: %s — "
-                 "reserved floor now a smaller fraction of the grown EQ",
+        ucs_warn("cxi EQ grow: reserved-slots adjust failed: %s",
                  strerror(-ret));
     } else {
         eq->reserved_slots = (unsigned)ret;
@@ -1824,16 +2017,50 @@ uct_cxi_iface_tx_error(uct_cxi_iface_t *iface, const union c_event *event,
 }
 
 /*
+ * uct_cxi_iface_am_put_failed -- a Put the NIC could not place in an AM
+ * buffer. Rare, kept out of line.
+ *
+ * The event reports the failure (rc != OK, mlength 0) and carries no message:
+ * there is nothing to hand to the handler, and nothing to return credits for
+ * (the sender is told of the failure in its own ACK, and takes its credits
+ * back itself). The usual cause is a message longer than what is left of the
+ * buffer it matched -- the NIC does not try the next buffer.
+ */
+static UCS_F_NOINLINE void
+uct_cxi_iface_am_put_failed(uct_cxi_iface_t *iface, const union c_event *event)
+{
+    int buf_idx = (int)event->tgt_long.buffer_id;
+
+    ucs_error("cxi AM Put failed: rc=%d buf=%d rlength=%u mlength=%u, "
+              "message dropped", (int)event->tgt_long.return_code, buf_idx,
+              (unsigned)event->tgt_long.rlength,
+              (unsigned)event->tgt_long.mlength);
+
+    /* The buffer's fate does not depend on how this Put went. */
+    if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+        uct_cxi_iface_post_am_le(iface, buf_idx, 1);
+    }
+}
+
+/*
  * uct_cxi_iface_ep_tx_done -- account one completed send against its ep:
  * the part common to every send, whether it was tracked by an op or by a
  * tagged user_ptr (IDC shorts).
  */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_iface_ep_tx_done(uct_cxi_iface_t *iface, const union c_event *event,
-                         uct_cxi_ep_t *ep, ucs_status_t status)
+                         uct_cxi_ep_t *ep, ucs_status_t status, int credited,
+                         unsigned units)
 {
     if (ucs_unlikely(status != UCS_OK)) {
         uct_cxi_iface_tx_error(iface, event, ep);
+#ifndef UCT_CXI_DISABLE_FC
+        /* The message did not reach the target's software, so the target will
+         * never hand back what it cost: take it back. */
+        if (credited) {
+            uct_cxi_fc_refund(iface, ep, units);
+        }
+#endif
     }
     /* Target PTE in graceful recovery (en_flowctrl) or any
      * other completion status feeds this EP's adaptive
@@ -1860,6 +2087,23 @@ uct_cxi_iface_ep_tx_done(uct_cxi_iface_t *iface, const union c_event *event,
     ucs_trace("cxi TX event %d rc=%d ep %p outstanding=%u",
               (int)event->hdr.event_type, cxi_event_rc(event), ep,
               ep->outstanding);
+}
+
+/* The flow-control charge an op carries, cleared as it is read so a pooled op
+ * is never mistaken for a charged one later. */
+static UCS_F_ALWAYS_INLINE int
+uct_cxi_op_fc_take(uct_cxi_send_op_t *op, unsigned *units_p)
+{
+#ifndef UCT_CXI_DISABLE_FC
+    int credited = op->fc_credited;
+
+    *units_p        = op->fc_units;
+    op->fc_credited = 0;
+    return credited;
+#else
+    *units_p = 0;
+    return 0;
+#endif
 }
 
 /*
@@ -1909,16 +2153,23 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         uint64_t     user_ptr = event->init_short.user_ptr;
         ucs_status_t status   = uct_cxi_rc_to_status(cxi_event_rc(event));
         uct_cxi_ep_t *ep;
+        unsigned      fc_units;
 
         /* Every command that reports on the TX queue carries a user_ptr. */
         ucs_assert(user_ptr != 0);
 
         if (user_ptr & UCT_CXI_USER_PTR_SHORT) {
             /* IDC short, tracked by its ep alone (no op) -- see
-             * uct_cxi_idc_track_hdr. */
-            ep = (uct_cxi_ep_t *)(uintptr_t)(user_ptr &
-                                             ~UCT_CXI_USER_PTR_SHORT);
-            uct_cxi_iface_ep_tx_done(iface, event, ep, status);
+             * uct_cxi_idc_track_hdr, which also left its cost in the top
+             * byte. */
+            ep = (uct_cxi_ep_t *)(uintptr_t)(
+                    user_ptr & UCT_CXI_USER_PTR_PTR_MASK &
+                    ~UCT_CXI_USER_PTR_SHORT);
+            fc_units = (unsigned)((user_ptr >> UCT_CXI_USER_PTR_UNITS_SHIFT) &
+                                  UCT_CXI_USER_PTR_UNITS_MASK);
+            uct_cxi_iface_ep_tx_done(iface, event, ep, status,
+                                     (user_ptr & UCT_CXI_USER_PTR_CREDITED) != 0,
+                                     fc_units);
             uct_cxi_iface_ep_release(iface, ep);
 #ifndef UCT_CXI_DISABLE_FC
         } else if (ucs_unlikely(user_ptr & UCT_CXI_USER_PTR_CTRL)) {
@@ -1940,7 +2191,10 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
                  * ep==NULL. */
                 op->handler(op, status);
             } else {
-                uct_cxi_iface_ep_tx_done(iface, event, ep, status);
+                int credited = uct_cxi_op_fc_take(op, &fc_units);
+
+                uct_cxi_iface_ep_tx_done(iface, event, ep, status, credited,
+                                         fc_units);
                 if (op->handler != NULL) {
                     op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
                 } else {
@@ -1990,6 +2244,9 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         /* Flow-control control channel (handshake). */
         uct_cxi_iface_handle_ctrl_msg(iface, event);
 #endif
+    } else if ((event->hdr.event_type == C_EVENT_PUT) &&
+               ucs_unlikely(event->tgt_long.return_code != C_RC_OK)) {
+        uct_cxi_iface_am_put_failed(iface, event);
     } else if (event->hdr.event_type == C_EVENT_PUT) {
         /* Target-side AM receive.  buffer_id identifies which rx_buf the
          * NIC wrote into.  start is the absolute IOVA of the first byte. */
@@ -2001,6 +2258,25 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         uint32_t len      = event->tgt_long.mlength;
         void    *data     = buf_va +
                             (size_t)(event->tgt_long.start - buf_iova);
+#ifndef UCT_CXI_DISABLE_FC
+        uint32_t         mlength = len; /* before the header is prepended */
+        uct_cxi_peer_t  *peer    = NULL;
+
+        /* Credits piggybacked on this message are for what we send to its
+         * sender; and its own cost is ours to hand back once it has been
+         * processed. A sender without flow control has no peer record and is
+         * neither charged nor repaid. */
+        if (ucs_likely(iface->fc.enabled)) {
+            peer = uct_cxi_fc_rx_peer(
+                    iface, event->tgt_long.initiator.initiator.process);
+            if (ucs_unlikely((peer != NULL) &&
+                             (event->tgt_long.match_bits &
+                              UCT_CXI_FC_PB_VALID))) {
+                uct_cxi_fc_apply_piggyback(iface, peer,
+                                           event->tgt_long.match_bits);
+            }
+        }
+#endif
 
         // ucs_trace("cxi C_EVENT_PUT: buf=%d ptl_list=%d "
         //           "mlength=%u rlength=%u "
@@ -2037,6 +2313,13 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
 
             uct_iface_invoke_am(&iface->super, am_id, data, len, 0);
         }
+
+#ifndef UCT_CXI_DISABLE_FC
+        /* Processed: the sender's credits for this message go back to it. */
+        if (peer != NULL) {
+            uct_cxi_fc_rx_done(iface, peer, mlength);
+        }
+#endif
 
         if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
             /* This Put exhausted the buffer's remaining space and
@@ -2191,8 +2474,10 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
     unsigned         n;
 
 #ifndef UCT_CXI_DISABLE_FC
-    /* Resend handshake requests that have gone unanswered. */
-    if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.connecting))) {
+    /* Resend handshake requests that have gone unanswered, and credit grants
+     * that found no control slot. */
+    if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.connecting) ||
+                     !ucs_list_is_empty(&iface->fc.grants))) {
         uct_cxi_fc_progress(iface);
     }
 #endif

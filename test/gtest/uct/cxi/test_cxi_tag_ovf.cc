@@ -167,7 +167,7 @@ UCS_TEST_P(test_cxi_tag_ovf, no_premature_repost)
     static const uint8_t   FILL_B = 0xBB;
     static const uint8_t   FILL_C = 0xCC;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_cxi_iface_t *riface = cxi_iface(receiver());
@@ -310,7 +310,7 @@ UCS_TEST_P(test_cxi_tag_ovf, raw_event_order_and_manual_search_delete)
         uint64_t start;
     };
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h          ep     = sender().ep(0);
     uct_cxi_iface_t  *riface = cxi_iface(receiver());
 

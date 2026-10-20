@@ -128,7 +128,7 @@ UCS_TEST_P(test_cxi_pending, pending_add_retries_after_pool_exhaustion)
 {
     uint64_t target = 0;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h target_memh = reg(receiver(), &target, sizeof(target));
@@ -183,7 +183,7 @@ UCS_TEST_P(test_cxi_pending, pending_add_multiple_requests_drain_in_order)
     static const size_t N = 6;
     uint64_t             target = 0;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h target_memh = reg(receiver(), &target, sizeof(target));
@@ -253,7 +253,7 @@ UCS_TEST_P(test_cxi_pending, pending_purge_removes_queued_request)
 {
     uint64_t target = 0;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h target_memh = reg(receiver(), &target, sizeof(target));
@@ -303,7 +303,7 @@ UCS_TEST_P(test_cxi_pending, pending_purged_on_ep_destroy)
 {
     uint64_t target = 0;
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h target_memh = reg(receiver(), &target, sizeof(target));

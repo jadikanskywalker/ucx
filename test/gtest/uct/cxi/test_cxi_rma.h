@@ -17,8 +17,46 @@
 #include <common/test.h>
 #include <uct/uct_test.h>
 
+#include <uct/cxi/base/cxi_ep.h>
+#include <uct/cxi/base/cxi_iface.h>
+
 #include <string>
 #include <vector>
+
+
+/**
+ * Connect @a from's endpoint @a idx to @a to's iface, and wait for the
+ * connection to be usable.
+ *
+ * A new endpoint handshakes with its peer, and until that completes an Active
+ * Message cannot be sent (it returns UCS_ERR_NO_RESOURCE, and UCP parks the
+ * send on its pending queue until the peer is up). UCT tests send straight
+ * after connecting, so they use this to get the same effect: both ifaces are
+ * progressed until the handshake is over. Tests of the handshake itself, or of
+ * what happens before it finishes, call connect_to_iface() directly.
+ */
+template<typename Entity>
+static inline void cxi_connect(Entity &from, unsigned idx, Entity &to)
+{
+    from.connect_to_iface(idx, to);
+
+#ifndef UCT_CXI_DISABLE_FC
+    uct_cxi_peer_t *peer     = ucs_derived_of(from.ep(idx), uct_cxi_ep_t)->peer;
+    ucs_time_t      deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+
+    while ((peer != NULL) &&
+           ((peer->state == UCT_CXI_PEER_DOWN) ||
+            (peer->state == UCT_CXI_PEER_CREQ_SENT)) &&
+           (ucs_get_time() < deadline)) {
+        uct_iface_progress(from.iface());
+        uct_iface_progress(to.iface());
+    }
+
+    EXPECT_TRUE((peer == NULL) || ((peer->state != UCT_CXI_PEER_DOWN) &&
+                                   (peer->state != UCT_CXI_PEER_CREQ_SENT)))
+            << "handshake with the peer did not finish";
+#endif
+}
 
 
 /**

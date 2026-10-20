@@ -58,6 +58,14 @@ typedef struct uct_cxi_send_op {
     struct uct_cxi_ep *ep;      /**< Owning EP — used to decrement outstanding */
     uct_completion_t  *comp;    /**< Caller completion callback, or NULL       */
     void (*handler)(struct uct_cxi_send_op *, ucs_status_t); /**< NULL = default zcopy path */
+#ifndef UCT_CXI_DISABLE_FC
+    uint32_t           fc_units;    /**< flow-control cost, in units, to refund
+                                         if this send fails...               */
+    uint8_t            fc_credited; /**< ...but only if it was charged. Must be
+                                         0 whenever the op is not in use: set
+                                         when the pool creates it, cleared by
+                                         the completion that consumed it    */
+#endif
 } uct_cxi_send_op_t;
 
 
@@ -125,6 +133,9 @@ typedef struct uct_cxi_ep {
     struct uct_cxi_peer *peer;         /**< Remote iface's flow-control state,
                                              shared with every ep to it; NULL
                                              when flow control is off */
+    struct uct_cxi_ep *next_blocked;   /**< Next ep waiting for credits on the
+                                             same peer (uct_cxi_peer_t::blocked) */
+    uint8_t           fc_listed;       /**< Is on peer->blocked */
 #endif
     uint8_t           destroyed;       /**< uct_ep_destroy() was called while
                                              sends were still in flight; the
@@ -192,6 +203,11 @@ uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
  * to account the send against. Ops, which are pointers to a uct_cxi_send_op_t
  * (at least 8-byte aligned), never have this bit set.
  *
+ * The top byte of a short's user_ptr carries its flow-control cost, so a
+ * failed one can be refunded without a descriptor to look it up in: bits
+ * [62:56] the cost in units (a short is at most 192 bytes, 3 units), bit 63
+ * set if it was charged at all. Userspace pointers have those bits clear.
+ *
  * Tracked shorts exist to make connected-endpoint flow control possible --
  * without a completion there is nothing to refund a lost send's credit
  * from -- so a build without it keeps the untracked fire-and-forget path.
@@ -202,6 +218,11 @@ uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
  * an ep. */
 #define UCT_CXI_USER_PTR_CTRL   2ULL
 
+#define UCT_CXI_USER_PTR_UNITS_SHIFT    56
+#define UCT_CXI_USER_PTR_UNITS_MASK     0x7fULL
+#define UCT_CXI_USER_PTR_CREDITED       (1ULL << 63)
+#define UCT_CXI_USER_PTR_PTR_MASK       ((1ULL << UCT_CXI_USER_PTR_UNITS_SHIFT) - 1)
+
 #ifdef UCT_CXI_DISABLE_FC
 
 static UCS_F_ALWAYS_INLINE void
@@ -210,12 +231,43 @@ uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
 }
 
 static UCS_F_ALWAYS_INLINE void
-uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep)
+uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep,
+                      unsigned units, int credited)
 {
 }
 
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_idc_track_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+}
+
+/* Flow control compiled out: nothing is charged, nothing piggybacked. */
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_cxi_fc_reserve(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, unsigned units,
+                   int *credited_p)
+{
+    *credited_p = 0;
+    return UCS_OK;
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited, unsigned units)
+{
+}
+
+static UCS_F_ALWAYS_INLINE uint64_t
+uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+    return 0;
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_pb_sent(uct_cxi_ep_t *ep, uint64_t bits)
+{
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned units)
 {
 }
 
@@ -232,16 +284,22 @@ uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
 }
 
 /**
- * Tag the completion with \a ep. For an unrestricted IDC message the event's
- * user_ptr is the one in the message's own header -- the c_state command's
- * user_ptr only applies to restricted IDC puts -- so this goes in the
- * c_idc_msg_hdr, not the c_state.
+ * Tag the completion with \a ep and the send's flow-control cost. For an
+ * unrestricted IDC message the event's user_ptr is the one in the message's
+ * own header -- the c_state command's user_ptr only applies to restricted IDC
+ * puts -- so this goes in the c_idc_msg_hdr, not the c_state.
  */
 static UCS_F_ALWAYS_INLINE void
-uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep)
+uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep,
+                      unsigned units, int credited)
 {
-    ucs_assert(((uintptr_t)ep & UCT_CXI_USER_PTR_SHORT) == 0);
-    hdr->user_ptr = (uint64_t)(uintptr_t)ep | UCT_CXI_USER_PTR_SHORT;
+    ucs_assert(((uintptr_t)ep & (UCT_CXI_USER_PTR_SHORT |
+                                 UCT_CXI_USER_PTR_CTRL)) == 0);
+    ucs_assert(((uint64_t)(uintptr_t)ep & ~UCT_CXI_USER_PTR_PTR_MASK) == 0);
+    ucs_assert(units <= UCT_CXI_USER_PTR_UNITS_MASK);
+    hdr->user_ptr = (uint64_t)(uintptr_t)ep | UCT_CXI_USER_PTR_SHORT |
+                    ((uint64_t)units << UCT_CXI_USER_PTR_UNITS_SHIFT) |
+                    (credited ? UCT_CXI_USER_PTR_CREDITED : 0);
 }
 
 /** Account the send once it has been rung (undone by its completion). */
@@ -250,6 +308,99 @@ uct_cxi_idc_track_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
 {
     ep->outstanding++;
     iface->tx.outstanding++;
+}
+
+/** Slow path of uct_cxi_fc_reserve(): the peer is not (yet) up. */
+BEGIN_C_DECLS
+ucs_status_t uct_cxi_fc_reserve_slow(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
+                                     int *credited_p);
+END_C_DECLS
+
+/**
+ * May a send costing \a units go out to this ep's peer? If so, \a *credited_p
+ * says whether it must be charged (the peer is credit-controlled) or not (no
+ * flow control: the peer is LEGACY, or the ep has no peer record). If not,
+ * UCS_ERR_NO_RESOURCE: no credits, or the handshake is still in flight;
+ * iface->tx.credit_block is set so the pending queue knows to wait for credits
+ * rather than for interface resources.
+ */
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_cxi_fc_reserve(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, unsigned units,
+                   int *credited_p)
+{
+    uct_cxi_peer_t *peer = ep->peer;
+
+    if (ucs_likely((peer != NULL) && (peer->state == UCT_CXI_PEER_UP))) {
+        if (ucs_likely((peer->tx.avail_msgs >= 1) &&
+                       (peer->tx.avail_units >= (int32_t)units))) {
+            *credited_p = 1;
+            return UCS_OK;
+        }
+        iface->tx.credit_block = 1;
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    return uct_cxi_fc_reserve_slow(ep, iface, credited_p);
+}
+
+/** Charge a send that has been rung, if \a credited. */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited, unsigned units)
+{
+    uct_cxi_peer_t *peer = ep->peer;
+
+    if (credited) {
+        peer->tx.avail_msgs--;
+        peer->tx.avail_units -= (int32_t)units;
+        peer->tx.used_msgs++;
+        peer->tx.used_units  += units;
+    }
+}
+
+/**
+ * match_bits to piggyback on an outgoing Active Message to this ep's peer:
+ * the credits we owe it for messages it sent us and we have processed, or 0
+ * if nothing is owed. See uct_cxi_fc_pb_sent() for the other half.
+ */
+static UCS_F_ALWAYS_INLINE uint64_t
+uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+    uct_cxi_peer_t *peer = ep->peer;
+
+    if (ucs_likely((peer == NULL) ||
+                   ((peer->rx.ret_msgs == peer->rx.adv_msgs) &&
+                    (peer->rx.ret_units == peer->rx.adv_units)))) {
+        return 0;
+    }
+
+    return UCT_CXI_FC_PB_VALID |
+           ((uint64_t)(peer->rx.ret_msgs &
+                       UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_MSG_BITS))
+                   << UCT_CXI_FC_PB_MSG_SHIFT) |
+           ((uint64_t)(peer->rx.ret_units &
+                       UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_UNIT_BITS))
+                   << UCT_CXI_FC_PB_UNIT_SHIFT) |
+           ((uint64_t)(iface->fc.epoch &
+                       UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_EPOCH_BITS))
+                   << UCT_CXI_FC_PB_EPOCH_SHIFT);
+}
+
+/** The message carrying \a bits (from uct_cxi_fc_pb_bits) has been rung. */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_pb_sent(uct_cxi_ep_t *ep, uint64_t bits)
+{
+    if (bits != 0) {
+        ep->peer->rx.adv_msgs  = ep->peer->rx.ret_msgs;
+        ep->peer->rx.adv_units = ep->peer->rx.ret_units;
+    }
+}
+
+/** Record a pooled op's flow-control charge, to refund if it fails. */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned units)
+{
+    op->fc_credited = (uint8_t)credited;
+    op->fc_units    = units;
 }
 
 #endif /* UCT_CXI_DISABLE_FC */

@@ -64,7 +64,7 @@ UCS_TEST_P(test_cxi_rma, put_zcopy_single)
     std::vector<uint8_t> src(SIZE, 0xAB);
     std::vector<uint8_t> dst(SIZE, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(sender(),   src.data(), SIZE);
@@ -114,7 +114,7 @@ UCS_TEST_P(test_cxi_rma, put_short_single)
     std::vector<uint8_t> src(SIZE, 0x5A);
     std::vector<uint8_t> dst(SIZE, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     /* Only the destination buffer needs registration (remote target). */
@@ -160,7 +160,7 @@ UCS_TEST_P(test_cxi_rma, get_short_single)
     std::vector<uint8_t> src(SIZE, 0xC3); /* remote source — on receiver */
     std::vector<uint8_t> dst(SIZE, 0x00); /* local result  — filled by get_short */
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     /* Only the remote source needs registration. */
@@ -206,7 +206,7 @@ UCS_TEST_P(test_cxi_rma, get_short_multiple)
                   (uint8_t)(0x10 + i));
     }
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(receiver(), src.data(), TOTAL);
@@ -249,7 +249,7 @@ UCS_TEST_P(test_cxi_rma, put_zcopy_multiple)
     std::vector<uint8_t> src(TOTAL, 0xCD);
     std::vector<uint8_t> dst(TOTAL, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(sender(),   src.data(), TOTAL);
@@ -309,7 +309,7 @@ UCS_TEST_P(test_cxi_rma, get_zcopy_single)
     std::vector<uint8_t> src(SIZE, 0xEF); /* remote source — on receiver side */
     std::vector<uint8_t> dst(SIZE, 0x00); /* local sink   — on sender side    */
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     /* Register src on the receiver's MD (remote) and dst on the sender's MD (local). */
@@ -371,7 +371,7 @@ UCS_TEST_P(test_cxi_rma, get_zcopy_multiple)
                   (uint8_t)(0x10 + i));
     }
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(receiver(), src.data(), TOTAL);
@@ -429,7 +429,7 @@ UCS_TEST_P(test_cxi_rma, put_bcopy_single)
 
     std::vector<uint8_t> dst(SIZE, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h dst_memh = reg(receiver(), dst.data(), SIZE);
@@ -476,7 +476,7 @@ UCS_TEST_P(test_cxi_rma, put_bcopy_multiple)
 
     std::vector<uint8_t> dst(TOTAL, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h dst_memh = reg(receiver(), dst.data(), TOTAL);
@@ -539,7 +539,7 @@ UCS_TEST_P(test_cxi_rma, get_bcopy_single)
     std::vector<uint8_t> src(SIZE, 0xC3); /* remote source — on receiver */
     std::vector<uint8_t> dst(SIZE, 0x00); /* local result  — filled by unpack_cb */
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(receiver(), src.data(), SIZE);
@@ -591,7 +591,7 @@ UCS_TEST_P(test_cxi_rma, get_bcopy_multiple)
     /* Flat destination buffer; each get_bcopy writes to its own stride. */
     std::vector<uint8_t> dst(TOTAL, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(receiver(), src.data(), TOTAL);
@@ -673,7 +673,7 @@ UCS_TEST_P(test_cxi_rma, put_short_remote_nonaligned)
 
     std::vector<uint8_t> src(NONALIGNED_SIZE, 0xD0);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h dst_memh = reg(receiver(), dst, NONALIGNED_SIZE);
@@ -715,7 +715,7 @@ UCS_TEST_P(test_cxi_rma, put_zcopy_nonaligned)
 
     std::fill(src, src + NONALIGNED_SIZE, (uint8_t)0xD1);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(sender(),   src, NONALIGNED_SIZE);
@@ -766,7 +766,7 @@ UCS_TEST_P(test_cxi_rma, get_zcopy_nonaligned)
 
     std::fill(src, src + NONALIGNED_SIZE, (uint8_t)0xD2);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(receiver(), src, NONALIGNED_SIZE);
@@ -817,7 +817,7 @@ UCS_TEST_P(test_cxi_rma, get_short_remote_nonaligned)
 
     std::vector<uint8_t> dst(NONALIGNED_SIZE, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h src_memh = reg(receiver(), src, NONALIGNED_SIZE);
@@ -861,7 +861,7 @@ UCS_TEST_P(test_cxi_rma, tx_inflight_cap_holds_back_sends)
 
     std::vector<uint8_t> dst(SIZE, 0x00);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uct_mem_h dst_memh = reg(receiver(), dst.data(), SIZE);

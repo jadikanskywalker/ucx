@@ -28,11 +28,13 @@
 #include <uct/api/uct.h>
 #include <ucs/datastruct/queue.h>
 
-/* min_free threshold for the overflow ring: a small fixed margin, matching
- * UCT_CXI_AM_MIN_FREE's already-proven pattern (see cxi_iface.h) rather
- * than scaling to the max eager size -- Cassini's manage_local placement
- * logic evidently handles an oversized-relative-to-remaining-space Put on
- * its own; a large fixed threshold is unvalidated and unnecessary here. */
+/* min_free threshold for the overflow ring: a small fixed margin.
+ *
+ * Too small for any message larger than it: a Put that does not fit what is
+ * left of the buffer it matched is not tried against the next buffer, it fails
+ * with NO_SPACE (seen on hardware; see uct_cxi_iface_post_am_le()). The AM ring
+ * sets min_free to its largest message; this ring still has to, once tag
+ * matching is credited and sized like the AM ring. */
 #define UCT_CXI_TAG_OVF_MIN_FREE      256u
 
 /* buffer_id (uint16_t) splits into three disjoint ranges: real priority-LE

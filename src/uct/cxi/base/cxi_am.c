@@ -26,7 +26,7 @@
  * ────────
  * iface_progress sees C_EVENT_PUT on the AM OVERFLOW LE, reads buffer_id to
  * identify the receive buffer, and calls uct_iface_invoke_am.  The two-buffer
- * ping-pong (UCT_CXI_AM_MIN_FREE, auto_unlinked) is managed in cxi_iface.c.
+ * ping-pong (min_free, auto_unlinked) is managed in cxi_iface.c.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -86,6 +86,10 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     uct_cxi_ep_t    *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t *iface = uct_cxi_am_ep_iface(ep);
     uint8_t          buf[C_MAX_IDC_PAYLOAD_UNR]; /* stack: ≤192 B inline */
+    unsigned         units = UCT_CXI_FC_UNITS(sizeof(uint64_t) + length);
+    uint64_t         fcbits;
+    ucs_status_t     status;
+    int              credited;
     int              ret;
 
     UCT_CHECK_LENGTH(length, 0,
@@ -94,6 +98,12 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
+
+    status = uct_cxi_fc_reserve(ep, iface, units, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
+    }
+    fcbits = uct_cxi_fc_pb_bits(ep, iface);
 
     memcpy(buf, &header, sizeof(uint64_t));
     memcpy(buf + sizeof(uint64_t), payload, length);
@@ -117,8 +127,8 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     {
         struct c_idc_msg_hdr hdr = {};
         hdr.dfa        = ep->dfa_am;
-        hdr.match_bits = (uint64_t)id;
-        uct_cxi_idc_track_hdr(&hdr, ep);
+        hdr.match_bits = (uint64_t)id | fcbits;
+        uct_cxi_idc_track_hdr(&hdr, ep, units, credited);
 
         ucs_trace("cxi IDC_SEND: am_id=%u total_len=%zu "
                   "nid=%u pid=%u idx_ext=%u "
@@ -138,6 +148,8 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
 
     cxi_cq_ring(iface->tx.cmdq);
     uct_cxi_idc_track_commit(ep, iface);
+    uct_cxi_fc_debit(ep, credited, units);
+    uct_cxi_fc_pb_sent(ep, fcbits);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, SHORT, sizeof(uint64_t) + length);
@@ -168,7 +180,20 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
 {
     uct_cxi_iface_t         *iface = uct_cxi_am_ep_iface(ep);
     uct_cxi_rndv_peer_hdr_t  payload;
+    unsigned                 units = UCT_CXI_FC_UNITS(sizeof(payload));
+    uint64_t                 fcbits;
+    ucs_status_t             status;
+    int                      credited;
     int                      ret;
+
+    /* An ordinary Active Message as far as the target is concerned: it uses
+     * an AM buffer and an event, and the target hands its credits back like
+     * any other's. */
+    status = uct_cxi_fc_reserve(ep, iface, units, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
+    }
+    fcbits = uct_cxi_fc_pb_bits(ep, iface);
 
     payload.ep_id    = ep_id;
     payload.md_index = md_index;
@@ -193,8 +218,8 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     {
         struct c_idc_msg_hdr hdr = {};
         hdr.dfa        = ep->dfa_am;
-        hdr.match_bits = UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG;
-        uct_cxi_idc_track_hdr(&hdr, ep);
+        hdr.match_bits = UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG | fcbits;
+        uct_cxi_idc_track_hdr(&hdr, ep, units, credited);
 
         ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, &payload,
                                   sizeof(payload));
@@ -207,6 +232,8 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
 
     cxi_cq_ring(iface->tx.cmdq);
     uct_cxi_idc_track_commit(ep, iface);
+    uct_cxi_fc_debit(ep, credited, units);
+    uct_cxi_fc_pb_sent(ep, fcbits);
     ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u",
              ep, (unsigned long)ep_id, (unsigned)md_index);
     return UCS_OK;
@@ -238,10 +265,25 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     uct_cxi_iface_t     *iface = uct_cxi_am_ep_iface(ep);
     uct_cxi_send_desc_t *desc;
     size_t               length;
+    unsigned             units;
+    uint64_t             fcbits;
+    ucs_status_t         status;
+    int                  credited;
     int                  ret;
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
+    }
+
+    /* The length is only known once it is packed, and pack_cb must run once:
+     * so ask only for one unit now (any credit at all) and charge the real
+     * cost afterwards. Credits may thereby dip below zero by up to one bcopy
+     * (max_bcopy bytes), which the byte window's slack absorbs; what matters
+     * is that a 1-byte message is never refused for want of room for a big
+     * one. */
+    status = uct_cxi_fc_reserve(ep, iface, 1, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return (ssize_t)status;
     }
 
     desc = ucs_mpool_get(&iface->tx.desc_pool);
@@ -251,6 +293,8 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     }
 
     length = pack_cb(desc + 1, arg);
+    units  = UCT_CXI_FC_UNITS(length);
+    fcbits = uct_cxi_fc_pb_bits(ep, iface);
 
     desc->op.ep      = ep;
     desc->op.comp    = NULL;
@@ -267,7 +311,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.initiator            = iface->match_id;
         cmd.eq                   = iface->tx_eq.evtq->eqn;
         cmd.dfa                  = ep->dfa_am;
-        cmd.match_bits           = (uint64_t)id;
+        cmd.match_bits           = (uint64_t)id | fcbits;
         cmd.remote_offset        = 0;  /* NIC places at its managed write pointer */
         cmd.local_addr           = desc->iova;
         cmd.request_len          = (uint32_t)length;
@@ -294,6 +338,9 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
+    uct_cxi_fc_debit(ep, credited, units);
+    uct_cxi_op_fc_set(&desc->op, credited, units);
+    uct_cxi_fc_pb_sent(ep, fcbits);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, BCOPY, length);
@@ -334,16 +381,35 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     uct_cxi_mem_handle_t *memh  = (uct_cxi_mem_handle_t *)iov[0].memh;
     size_t                iov_length = uct_iov_get_length(iov);
     uct_cxi_send_op_t    *op;
+    size_t                wire_len;
+    unsigned              units;
+    uint64_t              fcbits;
+    ucs_status_t          status;
+    int                   contiguous;
+    int                   credited;
     int                   ret;
 
     UCT_CHECK_LENGTH(header_length, 0, sizeof(uint64_t), "am_zcopy header");
-    UCT_CHECK_LENGTH(header_length + iov_length, 0,
-                     iface->am.buf_size - sizeof(uint64_t),
+    UCT_CHECK_LENGTH(header_length + iov_length, 0, iface->am.max_zcopy,
                      "am_zcopy total");
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
+
+    /* What the target will see as the message's length, hence what it will
+     * hand back: the header counts only when it travels in the payload. */
+    contiguous = (header_length > 0) &&
+                 ((const uint8_t *)header + header_length ==
+                  (const uint8_t *)iov[0].buffer);
+    wire_len   = contiguous ? (header_length + iov_length) : iov_length;
+    units      = UCT_CXI_FC_UNITS(wire_len);
+
+    status = uct_cxi_fc_reserve(ep, iface, units, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
+    }
+    fcbits = uct_cxi_fc_pb_bits(ep, iface);
 
     op = ucs_mpool_get(&iface->tx.op_pool);
     if (ucs_unlikely(op == NULL)) {
@@ -355,9 +421,6 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
 
     {
         struct c_full_dma_cmd cmd = {};
-        int contiguous = (header_length > 0) &&
-                         ((const uint8_t *)header + header_length ==
-                          (const uint8_t *)iov[0].buffer);
 
         cmd.command.opcode        = C_CMD_PUT;
         cmd.index_ext             = ep->dfa_am_idx_ext;
@@ -372,19 +435,19 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
         cmd.user_ptr              = (uint64_t)(uintptr_t)op;
 
         if (contiguous) {
-            cmd.match_bits  = (uint64_t)id;
+            cmd.match_bits  = (uint64_t)id | fcbits;
             cmd.local_addr  = memh->iova_offset +
                               (uint64_t)(uintptr_t)header;
             cmd.request_len = (uint32_t)(header_length + iov_length);
         } else if (header_length > 0) {
-            cmd.match_bits  = (uint64_t)id | UCT_CXI_AM_HDR_FLAG;
+            cmd.match_bits  = (uint64_t)id | UCT_CXI_AM_HDR_FLAG | fcbits;
             cmd.header_data = 0;
             memcpy(&cmd.header_data, header, header_length);
             cmd.local_addr  = memh->iova_offset +
                               (uint64_t)(uintptr_t)iov[0].buffer;
             cmd.request_len = (uint32_t)iov_length;
         } else {
-            cmd.match_bits  = (uint64_t)id;
+            cmd.match_bits  = (uint64_t)id | fcbits;
             cmd.local_addr  = memh->iova_offset +
                               (uint64_t)(uintptr_t)iov[0].buffer;
             cmd.request_len = (uint32_t)iov_length;
@@ -401,6 +464,9 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
+    uct_cxi_fc_debit(ep, credited, units);
+    uct_cxi_op_fc_set(op, credited, units);
+    uct_cxi_fc_pb_sent(ep, fcbits);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, ZCOPY, header_length + iov_length);

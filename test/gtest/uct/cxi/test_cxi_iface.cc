@@ -246,4 +246,172 @@ UCS_TEST_P(test_cxi_iface, eq_split_layout)
 }
 
 
+
+/* -------------------------------------------------------------------------
+ * AM ring and RX EQ sizing
+ * -------------------------------------------------------------------------
+ */
+
+/** A fixture whose configuration is set by configure(), before the iface opens. */
+class test_cxi_iface_sized : public test_cxi_iface {
+protected:
+    virtual void configure()
+    {
+    }
+
+    void init() override
+    {
+        configure();
+        test_cxi_iface::init();
+    }
+
+    uct_cxi_iface_t *cxi_iface()
+    {
+        return ucs_derived_of(get_entity().iface(), uct_cxi_iface_t);
+    }
+};
+
+#ifndef UCT_CXI_DISABLE_FC
+
+/**
+ * By default the ring and the RX EQ are sized for 8 peers at their full
+ * window (512 messages, 1 MiB), and the advertised AM size is the IB RC one.
+ */
+UCS_TEST_P(test_cxi_iface_sized, sized_for_flow_control)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+
+    EXPECT_EQ(8192u, iface->am.max_zcopy);
+    EXPECT_EQ(8192u, iface->am.max_msg);
+    EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
+
+    /* 8 x 1 MiB outstanding, 1 MiB buffers of which at least
+     * 1 MiB - 8 - 8 KiB are used before one is retired: 8 of them, and 2. */
+    EXPECT_EQ(1024u * 1024, iface->am.buf_size);
+    EXPECT_EQ(10u, iface->am.num_bufs);
+
+    /* 8 x 512 messages, 1024 for the rest, 64 reserved, 128 slack. */
+    EXPECT_EQ(8u * 512 + 1024 + 64 + 128, iface->rx_eq.num_events);
+    EXPECT_EQ(64u, iface->rx_eq.reserved_slots);
+}
+
+class test_cxi_iface_16_senders : public test_cxi_iface_sized {
+protected:
+    void configure() override
+    {
+        modify_config("CXI_FC_ACTIVE_SENDERS", "16");
+    }
+};
+
+UCS_TEST_P(test_cxi_iface_16_senders, sized_for_more_senders)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+
+    EXPECT_EQ(1024u * 1024, iface->am.buf_size);
+    EXPECT_EQ(18u, iface->am.num_bufs);
+    EXPECT_EQ(16u * 512 + 1024 + 64 + 128, iface->rx_eq.num_events);
+}
+
+/** Sizes that are set explicitly are used as they are. */
+class test_cxi_iface_explicit : public test_cxi_iface_sized {
+protected:
+    void configure() override
+    {
+        /* Big enough for what they allow to be outstanding, so no warning. */
+        modify_config("CXI_FC_ACTIVE_SENDERS", "1");
+        modify_config("CXI_FC_BYTE_WINDOW", "64k");
+        modify_config("CXI_FC_MSG_WINDOW", "64");
+        modify_config("CXI_AM_RX_NUM_BUFS", "3");
+        modify_config("CXI_AM_RX_BUF_SIZE", "64k");
+        modify_config("CXI_EQ_SIZE", "2048");
+    }
+};
+
+UCS_TEST_P(test_cxi_iface_explicit, explicit_sizes_are_used)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+
+    EXPECT_EQ(3u, iface->am.num_bufs);
+    EXPECT_EQ(64u * 1024, iface->am.buf_size);
+    EXPECT_EQ(2048u, iface->rx_eq.num_events);
+}
+
+/** ... even when they are too small for what the credits allow. */
+class test_cxi_iface_too_small : public test_cxi_iface_sized {
+protected:
+    void configure() override
+    {
+        modify_config("CXI_AM_RX_NUM_BUFS", "2");
+        modify_config("CXI_EQ_SIZE", "1024");
+    }
+
+    void init() override
+    {
+        /* Each logs that it is below what 8 peers at their full window need. */
+        scoped_log_handler wrap_warn(wrap_warns_logger);
+        test_cxi_iface_sized::init();
+    }
+};
+
+UCS_TEST_P(test_cxi_iface_too_small, too_small_sizes_are_used_with_a_warning)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+
+    EXPECT_EQ(2u, iface->am.num_bufs);
+    EXPECT_EQ(1024u, iface->rx_eq.num_events);
+}
+
+/**
+ * Bigger receive buffers are ring geometry only: they must not change the
+ * advertised AM size, nor the byte window (which may not be below it).
+ */
+class test_cxi_iface_big_buffers : public test_cxi_iface_sized {
+protected:
+    void configure() override
+    {
+        modify_config("CXI_FC_ACTIVE_SENDERS", "1");
+        modify_config("CXI_AM_RX_BUF_SIZE", "2m");
+    }
+};
+
+UCS_TEST_P(test_cxi_iface_big_buffers, buffer_size_is_not_message_size)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+
+    EXPECT_EQ(2u * 1024 * 1024, iface->am.buf_size);
+    EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
+    EXPECT_EQ(1024u * 1024 / UCT_CXI_FC_UNIT, iface->fc.unit_window);
+}
+
+#endif /* UCT_CXI_DISABLE_FC */
+
+/** Without flow control nothing bounds what arrives, so the legacy sizes stay. */
+class test_cxi_iface_no_fc : public test_cxi_iface_sized {
+protected:
+    void configure() override
+    {
+#ifndef UCT_CXI_DISABLE_FC
+        modify_config("CXI_FC_ENABLE", "n");
+#endif
+    }
+};
+
+UCS_TEST_P(test_cxi_iface_no_fc, legacy_sizes)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+
+    EXPECT_EQ(4u, iface->am.num_bufs);
+    EXPECT_EQ(512u * 1024, iface->am.buf_size);
+    EXPECT_EQ(1024u, iface->rx_eq.num_events);
+    EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
+}
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_iface, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_sized, cxi)
+#ifndef UCT_CXI_DISABLE_FC
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_16_senders, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_explicit, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_too_small, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_big_buffers, cxi)
+#endif
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_no_fc, cxi)

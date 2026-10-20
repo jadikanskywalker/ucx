@@ -64,7 +64,7 @@ UCS_TEST_P(test_cxi_am, am_short_single)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     uint8_t payload[PAY_LEN];
@@ -101,7 +101,7 @@ UCS_TEST_P(test_cxi_am, am_short_max)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> payload(PAY_LEN);
@@ -140,7 +140,7 @@ UCS_TEST_P(test_cxi_am, am_short_multiple)
         set_am_handler(static_cast<uint8_t>(i + 1), &ctx[i]);
     }
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     for (size_t i = 0; i < N; i++) {
@@ -204,7 +204,7 @@ UCS_TEST_P(test_cxi_am, am_bcopy_single)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     /* Pack a known pattern into the desc buffer. */
@@ -241,7 +241,7 @@ UCS_TEST_P(test_cxi_am, am_bcopy_multiple)
         set_am_handler(static_cast<uint8_t>(10 + i), &ctx[i]);
     }
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     for (size_t i = 0; i < N; i++) {
@@ -316,7 +316,7 @@ UCS_TEST_P(test_cxi_am, am_zcopy_single)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     /* Contiguous: [header(8B)][payload(4096B)] in one registered buffer. */
@@ -366,7 +366,7 @@ UCS_TEST_P(test_cxi_am, am_zcopy_multiple)
         set_am_handler(static_cast<uint8_t>(21 + i), &ctx[i]);
     }
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     std::vector<uint8_t> bufs[N];
@@ -448,7 +448,7 @@ UCS_TEST_P(test_cxi_am, am_zcopy_noncontiguous_header)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
 
     /* Header on the stack — deliberately NOT in the registered IOV region. */
@@ -507,8 +507,19 @@ UCS_TEST_P(test_cxi_am, eq_split_routing)
     ASSERT_NE(siface->tx_eq.evtq->eqn, siface->rx_eq.evtq->eqn)
             << "TX and RX must be distinct hardware queues";
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h ep = sender().ep(0);
+
+#ifndef UCT_CXI_DISABLE_FC
+    /* Connecting is a conversation: the receiver answers the connection
+     * request, and the completion of that answer is a TX event on its side.
+     * Let it be consumed, so that what is left on the queues is this test's. */
+    ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.2);
+    while (ucs_get_time() < settle) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+#endif
 
     auto pack = [](void *dst, void *) -> size_t {
         memset(dst, 0x77, LEN);
@@ -560,7 +571,7 @@ UCS_TEST_P(test_cxi_am, match_bits_high_bits_delivered)
     uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
     uct_cxi_iface_t *riface = ucs_derived_of(receiver().iface(), uct_cxi_iface_t);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_cxi_ep_t *cep = ucs_derived_of(sender().ep(0), uct_cxi_ep_t);
 
     uint64_t payload = 0x1122334455667788ULL;
@@ -617,7 +628,7 @@ UCS_TEST_P(test_cxi_am, am_short_tracked_until_ack)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_ep_h         ep     = sender().ep(0);
     uct_cxi_ep_t    *cep    = ucs_derived_of(ep, uct_cxi_ep_t);
     uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
@@ -654,7 +665,7 @@ UCS_TEST_P(test_cxi_am, ep_destroy_with_am_short_in_flight)
     uct_cxi_am_recv_ctx ctx = {false, {}};
     set_am_handler(AM_ID, &ctx);
 
-    sender().connect_to_iface(0, receiver());
+    cxi_connect(sender(), 0, receiver());
     uct_cxi_ep_t    *cep    = ucs_derived_of(sender().ep(0), uct_cxi_ep_t);
     uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
 
@@ -680,4 +691,246 @@ UCS_TEST_P(test_cxi_am, ep_destroy_with_am_short_in_flight)
 
 #endif /* UCT_CXI_DISABLE_FC */
 
+
+/* -------------------------------------------------------------------------
+ * Receive ring wrap-around
+ * -------------------------------------------------------------------------
+ */
+
+/**
+ * A small receive ring (four 64 KiB buffers), so that a few thousand messages
+ * of up to the maximum size go round it many times.
+ */
+class test_cxi_am_small_ring : public test_cxi_am {
+protected:
+    void init() override
+    {
+        modify_config("CXI_AM_RX_BUF_SIZE", "64k");
+        modify_config("CXI_AM_RX_NUM_BUFS", "4");
+#ifndef UCT_CXI_DISABLE_FC
+        /* One sender at a time, and no more bytes outstanding than the ring
+         * is meant to hold. */
+        modify_config("CXI_FC_ACTIVE_SENDERS", "1");
+        modify_config("CXI_FC_BYTE_WINDOW", "64k");
+#endif
+        test_cxi_am::init();
+    }
+};
+
+struct ring_wrap_rx_t {
+    unsigned received[3];
+    unsigned bad;
+};
+
+enum { RING_WRAP_SHORT, RING_WRAP_BCOPY, RING_WRAP_ZCOPY };
+
+static const size_t RING_WRAP_MAX = 8192;
+
+/* Payload lengths are a function of the sequence number, so that the receiver
+ * knows what to expect. */
+static inline size_t ring_wrap_short_len(unsigned seq)
+{
+    return (seq * 13) % 177;
+}
+
+static inline size_t ring_wrap_bcopy_len(unsigned seq)
+{
+    return 1 + (seq * 977) % (RING_WRAP_MAX - sizeof(uint64_t) - 1);
+}
+
+static inline size_t ring_wrap_zcopy_len(unsigned seq)
+{
+    return 1 + (seq * 1531) % RING_WRAP_MAX;
+}
+
+static inline uint8_t ring_wrap_zcopy_byte(size_t k)
+{
+    return (uint8_t)(k * 7 + 3);
+}
+
+/* am_short and am_bcopy messages are [seq (8 bytes)][payload], payload byte k
+ * being seq + k. */
+static void ring_wrap_check_seq(ring_wrap_rx_t *rx, const void *data,
+                                size_t length, size_t (*payload_len)(unsigned))
+{
+    const uint8_t *p   = static_cast<const uint8_t*>(data);
+    uint64_t       seq = 0;
+
+    if (length < sizeof(seq)) {
+        rx->bad++;
+        return;
+    }
+
+    memcpy(&seq, p, sizeof(seq));
+    if (length != sizeof(seq) + payload_len(seq)) {
+        rx->bad++;
+        return;
+    }
+
+    for (size_t k = 0; k < length - sizeof(seq); k++) {
+        if (p[sizeof(seq) + k] != (uint8_t)(seq + k)) {
+            rx->bad++;
+            return;
+        }
+    }
+}
+
+static size_t (*const ring_wrap_short_len_fn)(unsigned) = ring_wrap_short_len;
+static size_t (*const ring_wrap_bcopy_len_fn)(unsigned) = ring_wrap_bcopy_len;
+
+static ucs_status_t ring_wrap_short_handler(void *arg, void *data,
+                                            size_t length, unsigned flags)
+{
+    ring_wrap_rx_t *rx = static_cast<ring_wrap_rx_t*>(arg);
+
+    rx->received[RING_WRAP_SHORT]++;
+    ring_wrap_check_seq(rx, data, length, ring_wrap_short_len_fn);
+    return UCS_OK;
+}
+
+static ucs_status_t ring_wrap_bcopy_handler(void *arg, void *data,
+                                            size_t length, unsigned flags)
+{
+    ring_wrap_rx_t *rx = static_cast<ring_wrap_rx_t*>(arg);
+
+    rx->received[RING_WRAP_BCOPY]++;
+    ring_wrap_check_seq(rx, data, length, ring_wrap_bcopy_len_fn);
+    return UCS_OK;
+}
+
+/* am_zcopy messages are payload only, byte k being a function of k. */
+static ucs_status_t ring_wrap_zcopy_handler(void *arg, void *data,
+                                            size_t length, unsigned flags)
+{
+    ring_wrap_rx_t *rx = static_cast<ring_wrap_rx_t*>(arg);
+    const uint8_t  *p  = static_cast<const uint8_t*>(data);
+
+    rx->received[RING_WRAP_ZCOPY]++;
+    if ((length == 0) || (length > RING_WRAP_MAX)) {
+        rx->bad++;
+        return UCS_OK;
+    }
+
+    for (size_t k = 0; k < length; k++) {
+        if (p[k] != ring_wrap_zcopy_byte(k)) {
+            rx->bad++;
+            return UCS_OK;
+        }
+    }
+    return UCS_OK;
+}
+
+struct ring_wrap_pack_t {
+    uint64_t seq;
+    size_t   payload_len;
+};
+
+static size_t ring_wrap_pack(void *dest, void *arg)
+{
+    const ring_wrap_pack_t *a = static_cast<const ring_wrap_pack_t*>(arg);
+    uint8_t                *p = static_cast<uint8_t*>(dest);
+
+    memcpy(p, &a->seq, sizeof(a->seq));
+    for (size_t k = 0; k < a->payload_len; k++) {
+        p[sizeof(a->seq) + k] = (uint8_t)(a->seq + k);
+    }
+    return sizeof(a->seq) + a->payload_len;
+}
+
+/**
+ * Send enough messages, of every kind and of sizes up to the maximum, to go
+ * round the receive ring many times, and check that every one arrives intact.
+ *
+ * The NIC retires a buffer once less than a maximum-size message is left in
+ * it, and the next goes into the following one. A buffer retired too late
+ * would be left holding a message that does not fit: that one is lost (the
+ * sender and the receiver both report the failure, which fails this test).
+ */
+UCS_TEST_P(test_cxi_am_small_ring, ring_wraps)
+{
+    static const unsigned PER_KIND = 1000;
+    ring_wrap_rx_t        rx       = {{0, 0, 0}, 0};
+    unsigned              sent[3]  = {0, 0, 0};
+
+    ASSERT_UCS_OK(uct_iface_set_am_handler(receiver().iface(), 1,
+                                           ring_wrap_short_handler, &rx, 0));
+    ASSERT_UCS_OK(uct_iface_set_am_handler(receiver().iface(), 2,
+                                           ring_wrap_bcopy_handler, &rx, 0));
+    ASSERT_UCS_OK(uct_iface_set_am_handler(receiver().iface(), 3,
+                                           ring_wrap_zcopy_handler, &rx, 0));
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> zbuf(RING_WRAP_MAX);
+    for (size_t k = 0; k < zbuf.size(); k++) {
+        zbuf[k] = ring_wrap_zcopy_byte(k);
+    }
+    uct_mem_h memh = reg(sender(), zbuf.data(), zbuf.size());
+
+    std::vector<uint8_t> shortbuf(256);
+    ucs_time_t           deadline = ucs_get_time() + ucs_time_from_sec(60.0);
+    unsigned             i;
+
+    for (i = 0; (i < 3 * PER_KIND) && (ucs_get_time() < deadline);) {
+        unsigned     kind = i % 3;
+        unsigned     seq  = i / 3;
+        ucs_status_t st;
+
+        if (kind == RING_WRAP_SHORT) {
+            size_t len = ring_wrap_short_len(seq);
+
+            for (size_t k = 0; k < len; k++) {
+                shortbuf[k] = (uint8_t)(seq + k);
+            }
+            st = uct_ep_am_short(ep, 1, seq, shortbuf.data(), len);
+        } else if (kind == RING_WRAP_BCOPY) {
+            ring_wrap_pack_t arg = {seq, ring_wrap_bcopy_len(seq)};
+            ssize_t          res = uct_ep_am_bcopy(ep, 2, ring_wrap_pack, &arg,
+                                                   0);
+
+            st = (res >= 0) ? UCS_OK : (ucs_status_t)res;
+        } else {
+            uct_iov_t iov = {zbuf.data(), ring_wrap_zcopy_len(seq), memh, 0, 1};
+
+            st = uct_ep_am_zcopy(ep, 3, NULL, 0, &iov, 1, 0, NULL);
+            if (st == UCS_INPROGRESS) {
+                st = UCS_OK;
+            }
+        }
+
+        if (st == UCS_OK) {
+            sent[kind]++;
+            i++;
+        } else {
+            ASSERT_EQ(UCS_ERR_NO_RESOURCE, st);
+        }
+
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    ASSERT_EQ(3 * PER_KIND, i) << "could not send everything in time";
+
+    auto all_in = [&]() {
+        return (rx.received[RING_WRAP_SHORT] == sent[RING_WRAP_SHORT]) &&
+               (rx.received[RING_WRAP_BCOPY] == sent[RING_WRAP_BCOPY]) &&
+               (rx.received[RING_WRAP_ZCOPY] == sent[RING_WRAP_ZCOPY]);
+    };
+    ucs_time_t until = ucs_get_time() + ucs_time_from_sec(30.0);
+    while (!all_in() && (ucs_get_time() < until)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    ASSERT_TRUE(all_in())
+            << "short " << rx.received[RING_WRAP_SHORT] << "/"
+            << sent[RING_WRAP_SHORT] << " bcopy "
+            << rx.received[RING_WRAP_BCOPY] << "/" << sent[RING_WRAP_BCOPY]
+            << " zcopy " << rx.received[RING_WRAP_ZCOPY] << "/"
+            << sent[RING_WRAP_ZCOPY];
+    EXPECT_EQ(0u, rx.bad) << "messages that arrived damaged";
+
+    flush_ep(sender(), ep);
+    dereg(sender(), memh);
+}
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_am, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_am_small_ring, cxi)

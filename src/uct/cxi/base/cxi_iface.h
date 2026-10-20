@@ -34,6 +34,19 @@
  * hardware constant. */
 #define UCT_CXI_EQ_NUM_EVENTS  1024U
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
+/* RX EQ slots, beyond what flow control accounts for, that sizing from the
+ * credit windows leaves free: events are acknowledged to the NIC in batches,
+ * so processed ones still hold slots for a moment, and control messages
+ * (handshake, grants) are not credited. */
+#define UCT_CXI_EQ_SLACK       128U
+/* Flow-control credit unit: byte windows are counted in these, and a message
+ * costs one message credit plus UCT_CXI_FC_UNITS(len) byte credits. Defined
+ * here, outside the UCT_CXI_DISABLE_FC guard, because the send paths compute
+ * the cost whether or not it is charged. */
+#define UCT_CXI_FC_UNIT       64u
+#define UCT_CXI_FC_UNITS(_len) \
+    ((unsigned)(((_len) + UCT_CXI_FC_UNIT - 1) / UCT_CXI_FC_UNIT))
+
 /* How long uct_cxi_iface_tgt_post() waits for room in a full target command
  * queue before giving up. The NIC normally frees room within microseconds. */
 #define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
@@ -42,15 +55,24 @@
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
 
-/* AM receive buffer defaults.  Actual values are runtime-configurable
- * via UCX_CXI_AM_RX_NUM_BUFS and UCX_CXI_AM_RX_BUF_SIZE. */
-#define UCT_CXI_AM_RX_BUF_SIZE_DEFAULT  (512u * 1024u)  /* 512 KiB per buffer */
-#define UCT_CXI_AM_RX_NUM_BUFS_DEFAULT  4
-#define UCT_CXI_AM_RX_NUM_BUFS_MAX      16
-/* min_free threshold: max possible message size aligned to 64 B.
- * ceil((sizeof(uint64_t) + C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t) + 63) / 64) * 64
- * = ceil(192/64)*64 = 192; use 256 for a one-slot safety margin. */
-#define UCT_CXI_AM_MIN_FREE     256u
+/* AM receive ring.  UCX_CXI_AM_RX_BUF_SIZE and UCX_CXI_AM_RX_NUM_BUFS are
+ * "auto" by default: with flow control the ring is sized from the credit
+ * windows (see uct_cxi_iface_size_am_ring()); without it, from the legacy
+ * defaults below. */
+#define UCT_CXI_AM_RX_BUF_SIZE_DEFAULT  (512u * 1024u)  /* legacy, no FC */
+#define UCT_CXI_AM_RX_NUM_BUFS_DEFAULT  4               /* legacy, no FC */
+#define UCT_CXI_AM_RX_NUM_BUFS_MAX      64
+
+/* Automatic buffer size with flow control: a multiple of the largest message,
+ * so the tail the NIC strands in each buffer (see min_free in
+ * uct_cxi_iface_post_am_le) stays a small fraction of it, but not below this
+ * floor, which keeps the number of buffers (and so of LEs) low for small
+ * messages. */
+#define UCT_CXI_AM_RX_BUF_SIZE_MIN      (1024u * 1024u)
+#define UCT_CXI_AM_RX_BUF_PER_MSG       4u
+
+/* min_free is a 24-bit field, and is set to the largest message. */
+#define UCT_CXI_AM_MAX_MSG_LIMIT        ((1u << 24) - 1)
 
 
 /*
@@ -125,9 +147,11 @@ typedef struct uct_cxi_iface_config {
     uct_iface_mpool_config_t bcopy_mp;  /**< desc_pool config (bufs_grow, max_bufs) */
     uct_iface_mpool_config_t op_mp;     /**< op_pool config (bufs_grow, max_bufs)   */
     size_t                   max_bcopy; /**< Max payload for put_bcopy/get_bcopy    */
-    unsigned                 am_rx_num_bufs; /**< # AM receive buffers (PRIORITY MEs) */
-    size_t                   am_rx_buf_size; /**< Size of each AM receive buffer     */
-    size_t                   am_max_zcopy;  /**< Max AM zcopy payload               */
+    unsigned long            am_rx_num_bufs; /**< # AM receive buffers (PRIORITY MEs),
+                                                  or UCS_ULUNITS_AUTO               */
+    size_t                   am_rx_buf_size; /**< Size of each AM receive buffer, or
+                                                  UCS_MEMUNITS_AUTO                 */
+    size_t                   am_max_zcopy;  /**< Max AM zcopy header + payload      */
     unsigned                 eq_size;    /**< RX event queue depth. -1 sentinel
                                               resolves to UCT_CXI_EQ_NUM_EVENTS */
     unsigned                 tx_eq_size; /**< TX event queue depth. -1 sentinel
@@ -135,8 +159,8 @@ typedef struct uct_cxi_iface_config {
                                               (see iface_open)                 */
     unsigned                 eq_max_poll; /**< Max events drained per
                                               iface_progress() call            */
-    unsigned                 eq_reserved_slots_pct; /**< % of EQ reserved so RX
-                                              traffic can't crowd out TX completions */
+    unsigned                 eq_reserved_slots; /**< RX EQ slots kept for events
+                                              that are not incoming messages  */
     unsigned                 eq_drain_pct;   /**< % of EQ to drain (from the point a
                                               drop is detected) before attempting to
                                               re-enable a disabled PTE               */
@@ -172,6 +196,13 @@ typedef struct uct_cxi_iface_config {
     double                    fc_connect_timeout; /**< Give up on a peer's
                                                     handshake after this long
                                                     (seconds)                  */
+    double                    fc_grant_thresh; /**< Send a pure credit grant once
+                                                    this fraction of a window is
+                                                    owed to a peer             */
+    unsigned                  fc_active_senders; /**< Peers sending at their
+                                                    full window at once, which
+                                                    the ring and RX EQ are
+                                                    sized for                  */
 #endif
 } uct_cxi_iface_config_t;
 
@@ -281,11 +312,9 @@ typedef struct uct_cxi_eq {
                                         PTEs; decremented once per event drained
                                         in iface_progress(), 0 = not recovering */
     unsigned       drain_pct;      /**< Resolved from config at iface_open */
-    unsigned       reserved_slots_pct; /**< Resolved from config at iface_open;
-                                        persisted (not just applied once)
-                                        so eq.grow can recompute the
-                                        absolute reserved count as
-                                        num_events changes           */
+    unsigned       reserved_slots_cfg; /**< Resolved from config at iface_open;
+                                        persisted so eq.grow can restore it
+                                        if the resize changes the count */
     unsigned       reserved_slots; /**< Current absolute reserved-slot
                                         count, kept in sync with the
                                         value cxil_evtq_adjust_reserved_fc()
@@ -340,6 +369,13 @@ typedef struct uct_cxi_iface {
         ucs_mpool_t      desc_pool;        /**< uct_cxi_send_desc_t — bcopy bounce bufs */
         size_t           max_bcopy;        /**< Max payload per bcopy op (from config) */
         unsigned         outstanding;      /**< Total in-flight sends (all EPs) */
+#ifndef UCT_CXI_DISABLE_FC
+        uint8_t          credit_block;     /**< Set by a send that returned
+                                                UCS_ERR_NO_RESOURCE for lack of
+                                                flow-control credits (not of an
+                                                interface resource), for the
+                                                pending-queue dispatch to read */
+#endif
         unsigned         max_inflight;     /**< Cap on outstanding: every counted
                                                 send yields exactly one TX EQ
                                                 event, so this is the TX EQ depth
@@ -575,13 +611,20 @@ typedef struct uct_cxi_iface {
         struct cxil_pte_map  *pte_map;
         /* N-buffer rotation on the PRIORITY list.  All buffers are posted
          * at init.  The NIC writes to the head buffer using manage_local=1.
-         * When remaining space drops below UCT_CXI_AM_MIN_FREE, the NIC
-         * auto-unlinks that buffer and moves to the next.  C_EVENT_UNLINK
-         * reposts the consumed buffer at the tail of the list. */
+         * When remaining space drops below max_msg (the LE's min_free), the
+         * NIC auto-unlinks that buffer and moves to the next, and the Put that
+         * did it is flagged auto_unlinked, which reposts the buffer at the
+         * tail of the list.  A Put that does not fit what is left of a linked
+         * buffer is not tried against the next one: it fails with NO_SPACE. */
         uint8_t              *rx_base;     /**< Single contiguous allocation */
         uct_cxi_mem_handle_t  rx_mh;       /**< Single cxil_map for rx_base  */
         unsigned              num_bufs;    /**< Runtime buffer count          */
         size_t                buf_size;    /**< Runtime per-buffer size       */
+        size_t                max_zcopy;   /**< Largest am_zcopy header +
+                                                payload (AM_MAX_ZCOPY)        */
+        size_t                max_msg;     /**< Largest message that can land
+                                                in a buffer: the greater of
+                                                max_zcopy and max_bcopy      */
         uint32_t              rx_total;    /**< Total messages received       */
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for am.pte     */
     } am;
@@ -692,8 +735,12 @@ ucs_status_t uct_cxi_iface_event_fd_get(uct_iface_h tl_iface, int *fd_p);
 BEGIN_C_DECLS
 
 /* cxi_peer.c */
+void         uct_cxi_fc_windows(const uct_cxi_iface_config_t *config,
+                                size_t max_msg, uint32_t *msg_window_p,
+                                uint32_t *unit_window_p);
 ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
-                             const uct_cxi_iface_config_t *config);
+                             const uct_cxi_iface_config_t *config,
+                             uint32_t msg_window, uint32_t unit_window);
 void         uct_cxi_fc_cleanup(uct_cxi_iface_t *iface);
 ucs_status_t uct_cxi_iface_open_ctrl_pte(uct_cxi_iface_t *iface,
                                          struct cxil_lni *lni);
@@ -720,7 +767,72 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
 /** Resend CREQs that have gone unanswered; give up on stale handshakes. */
 void uct_cxi_fc_progress(uct_cxi_iface_t *iface);
 
+/** The peer record for event initiator \a process, or NULL if there is none
+ *  (a sender without flow control). Refills the one-entry cache. */
+uct_cxi_peer_t *uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface,
+                                        uint32_t process);
+
+/** Credits piggybacked on an Active Message from \a peer (\a match_bits). */
+void uct_cxi_fc_apply_piggyback(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
+                                uint64_t match_bits);
+
+/** We owe \a peer a lot of credits: send it a GRANT now, or when we can. */
+void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
+
+/** Make runnable the endpoints of \a peer that were waiting for credits. */
+void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
+
+/** Give back the credits of a send to \a ep's peer that never arrived. */
+void uct_cxi_fc_refund(uct_cxi_iface_t *iface, struct uct_cxi_ep *ep,
+                       unsigned units);
+
+/** Forget that we told \a peer anything we cannot be sure it received. */
+void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
+
+/** Park \a ep, whose pending queue waits for credits, on its peer. */
+void uct_cxi_fc_block_ep(struct uct_cxi_ep *ep);
+
+/** Forget \a ep (being destroyed) wherever it is parked. */
+void uct_cxi_fc_unblock_ep(struct uct_cxi_ep *ep);
+
 END_C_DECLS
+
+/**
+ * The record for the sender of the Active Message just received, or NULL.
+ * A sender without flow control has none and is not charged, so there is
+ * nothing to hand back to it.
+ */
+static UCS_F_ALWAYS_INLINE uct_cxi_peer_t *
+uct_cxi_fc_rx_peer(uct_cxi_iface_t *iface, uint32_t process)
+{
+    if (ucs_likely((iface->fc.rx_cache_peer != NULL) &&
+                   (iface->fc.rx_cache_key == process))) {
+        return iface->fc.rx_cache_peer;
+    }
+
+    return uct_cxi_fc_rx_peer_slow(iface, process);
+}
+
+/**
+ * An Active Message of \a mlength bytes from \a peer has been processed:
+ * the sender's credits for it are now ours to give back.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_rx_done(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
+                   uint32_t mlength)
+{
+    uct_cxi_fc_rx_t *rx = &peer->rx;
+
+    rx->ret_msgs++;
+    rx->ret_units += UCT_CXI_FC_UNITS(mlength);
+
+    if (ucs_unlikely(((uint32_t)(rx->ret_msgs  - rx->adv_msgs)  >=
+                      iface->fc.grant_msgs) ||
+                     ((uint32_t)(rx->ret_units - rx->adv_units) >=
+                      iface->fc.grant_units))) {
+        uct_cxi_fc_grant_wanted(iface, peer);
+    }
+}
 
 #endif /* UCT_CXI_DISABLE_FC */
 
