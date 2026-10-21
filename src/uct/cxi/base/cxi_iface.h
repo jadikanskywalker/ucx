@@ -245,15 +245,8 @@ typedef struct uct_cxi_pte_fc {
  * hardware can report on a command queue's event queue
  * (C_EVENT_COMMAND_FAILURE, C_EVENT_ERROR). Those never occur in normal
  * operation; if more arrive than this holds, the queue drops the extras and
- * progress reports the drop. With flow control, also the control channel's
- * own requests, which are bounded by UCT_CXI_CTRL_SLOTS and bypass the data
- * send cap. Defined here, after cxi_fc.h, so it can name that constant. */
-#ifdef UCT_CXI_DISABLE_FC
+ * progress reports the drop. (Control messages are counted, like any send.) */
 #define UCT_CXI_TX_EQ_UNTRACKED  8U
-#else
-/* Plus the control channel's own slots. */
-#define UCT_CXI_TX_EQ_UNTRACKED  (8U + UCT_CXI_CTRL_SLOTS)
-#endif
 
 /* Defined in cxi_tag.h (included after this header, via cxi_ep.h); only a
  * pointer to it is needed here, so a forward declaration avoids a circular
@@ -883,8 +876,8 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
 void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                                 const union c_event *event);
 
-/** Resend CREQs that have gone unanswered; give up on stale handshakes. */
-void uct_cxi_fc_progress(uct_cxi_iface_t *iface);
+/** Send the GRANTs that are waiting, as far as there is room. */
+void uct_cxi_fc_retry_grants(uct_cxi_iface_t *iface);
 
 /** The peer record for event initiator \a process, or NULL if there is none
  *  (a sender without flow control). Refills the one-entry cache. */

@@ -58,14 +58,11 @@
  * ignored (the sender then times out and treats the peer as FAILED). */
 #define UCT_CXI_CTRL_VERSION  1u
 
-/* Control requests (and so TX completions) in flight at once. They take their
- * own slice of the TX event queue, see UCT_CXI_TX_EQ_UNTRACKED. */
-#define UCT_CXI_CTRL_SLOTS    16u
-
 /* Connection retry: a CREQ with no CREP yet is resent after this long,
- * doubling per attempt up to the cap. The retries are timers of a timer wheel
- * (uct_cxi_fc_iface_t::twheel) whose resolution is this base delay, so every
- * delay is at least one slot. */
+ * doubling per attempt up to the cap. A GRANT that could not be sent, or was
+ * lost, is retried on the same schedule, doubling with each consecutive loss.
+ * The retries are timers of a timer wheel (uct_cxi_fc_iface_t::twheel) whose
+ * resolution is this base delay, so every delay is at least one slot. */
 #define UCT_CXI_CTRL_RETRY_BASE_US  50
 #define UCT_CXI_CTRL_RETRY_MAX_US   50000
 
@@ -239,13 +236,22 @@ typedef struct uct_cxi_fc_iface {
     unsigned          num_connecting; /**< handshakes in progress: the wheel is
                                          only swept while there are any */
     ucs_mpool_t       conn_pool;    /**< uct_cxi_peer_conn_t */
-    ucs_list_link_t   grants;       /**< peers with a GRANT still to send */
+    ucs_list_link_t   grants;       /**< peers with a GRANT still to send, in
+                                         the order they were found to need
+                                         one. Retried when TX completions free
+                                         room, and on grant_timer. */
+    ucs_wtimer_t      grant_timer;  /**< retries the grants while any wait */
+    unsigned          grant_failures; /**< GRANTs lost in a row: the backoff of
+                                           grant_timer */
 
     /* One-entry cache for the receive path: the peer the last Active Message
      * came from, to spare a hash lookup per message. */
     uint32_t          rx_cache_key;
     uct_cxi_peer_t   *rx_cache_peer;
-    ucs_mpool_t       ctrl_req_pool; /**< uct_cxi_ctrl_req_t, UCT_CXI_CTRL_SLOTS */
+    ucs_mpool_t       ctrl_req_pool; /**< uct_cxi_ctrl_req_t: a control message
+                                          is counted in iface->tx.outstanding
+                                          like any send, so there are never
+                                          more than max_inflight of them */
 
     /* Control PTE: matching, one persistent zero-length list entry that
      * accepts every message, so control traffic consumes no buffer and can

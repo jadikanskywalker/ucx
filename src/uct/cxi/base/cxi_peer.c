@@ -57,6 +57,26 @@ uct_cxi_peer_ctrl_dfa(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer,
                   idx_ext);
 }
 
+static void uct_cxi_fc_grant_timer(ucs_wtimer_t *timer);
+
+/*
+ * Set \a timer on the wheel to go off in \a delay (not less than a slot, and
+ * the wheel's own cap is a little over the longest delay used). The wheel is
+ * only swept while it has timers, so when this is the first it may be far
+ * behind: bring it up to date before anything is set on it.
+ */
+static void uct_cxi_fc_timer_add(uct_cxi_iface_t *iface, ucs_wtimer_t *timer,
+                                 ucs_time_t delay)
+{
+    ucs_twheel_t *twheel = &iface->fc.twheel;
+
+    if (ucs_twheel_is_empty(twheel)) {
+        ucs_twheel_sweep(twheel, ucs_get_time());
+    }
+    ucs_wtimer_add(twheel, timer, ucs_max(delay, twheel->res));
+}
+static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
+
 /* -------------------------------------------------------------------------
  * Interface-level state
  * -------------------------------------------------------------------------
@@ -129,11 +149,11 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
 
     kh_init_inplace(uct_cxi_peer_hash, &fc->peers);
     ucs_list_head_init(&fc->grants);
+    ucs_wtimer_init(&fc->grant_timer, uct_cxi_fc_grant_timer);
 
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_ctrl_req_t);
-    mp_params.elems_per_chunk = UCT_CXI_CTRL_SLOTS;
-    mp_params.max_elems       = UCT_CXI_CTRL_SLOTS;
+    mp_params.elems_per_chunk = 32;
     mp_params.ops             = &uct_cxi_fc_mpool_ops;
     mp_params.name            = "cxi-ctrl-req";
     status = ucs_mpool_init(&mp_params, &fc->ctrl_req_pool);
@@ -175,6 +195,7 @@ void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface)
     uct_cxi_fc_iface_t *fc = &iface->fc;
     uct_cxi_peer_t     *peer;
 
+    ucs_wtimer_remove(&fc->twheel, &fc->grant_timer);
     kh_foreach_value(&fc->peers, peer, {
         if (peer->conn != NULL) {
             ucs_wtimer_remove(&fc->twheel, &peer->conn->timer);
@@ -530,7 +551,7 @@ void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
          iface->fc.grant_msgs) ||
         ((uint32_t)(peer->rx.ret_units - peer->rx.adv_units) >=
          iface->fc.grant_units)) {
-        uct_cxi_fc_grant_wanted(iface, peer);
+        uct_cxi_fc_queue_grant(iface, peer);
     }
 }
 
@@ -556,10 +577,11 @@ uct_cxi_peer_t *uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface,
 
 /*
  * uct_cxi_ctrl_send -- send one zero-payload control message to \a peer's
- * control PTE, from the control request pool: UCS_ERR_NO_RESOURCE when all
- * UCT_CXI_CTRL_SLOTS are in flight or the command queue is full, and the
- * caller just tries again later. Control messages are not subject to the data
- * send cap -- they have their own slice of the TX queue.
+ * control PTE. It is a send like any other as far as the TX queue goes: it
+ * takes one of the iface->tx.max_inflight places until its completion, so
+ * UCS_ERR_NO_RESOURCE if there is none free or the command queue is full, and
+ * the caller just tries again later (a GRANT from the list of waiting ones, a
+ * CREQ from its timer, a CREP when the requester sends its CREQ again).
  */
 static ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface,
                                       uct_cxi_peer_t *peer, unsigned type,
@@ -570,6 +592,10 @@ static ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface,
     union c_fab_addr     dfa;
     uint8_t              idx_ext;
     int                  ret;
+
+    if (iface->tx.outstanding >= iface->tx.max_inflight) {
+        return UCS_ERR_NO_RESOURCE;
+    }
 
     req = ucs_mpool_get(&iface->fc.ctrl_req_pool);
     if (req == NULL) {
@@ -611,6 +637,7 @@ static ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface,
     }
 
     cxi_cq_ring(iface->tx.cmdq);
+    iface->tx.outstanding++;
     return UCS_OK;
 }
 
@@ -619,10 +646,12 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
 {
     int rc = cxi_event_rc(event);
 
+    iface->tx.outstanding--;
     if (req->type == UCT_CXI_CTRL_GRANT) {
         uct_cxi_peer_t *peer = req->peer;
 
         if (rc == C_RC_OK) {
+            iface->fc.grant_failures = 0;
             /* Delivered: no need to say it again (a later grant may already
              * have overtaken this one, hence the "only forward" test). */
             if ((int32_t)(req->grant_msgs - peer->rx.acked_msgs) > 0) {
@@ -632,10 +661,13 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                 peer->rx.acked_units = req->grant_units;
             }
         } else {
-            /* Lost: say it again, along with whatever has accumulated. */
+            /* Lost: say it again, along with whatever has accumulated, but
+             * not at once: the target may be refusing control messages for
+             * a while, and a resend straight away would be refused too. */
             ucs_debug("cxi GRANT to nid 0x%x pid %u failed: rc=%d, resending",
                       uct_cxi_peer_nid(iface, peer),
                       uct_cxi_peer_pid(iface, peer), rc);
+            iface->fc.grant_failures++;
             uct_cxi_fc_resync(iface, peer);
         }
         ucs_mpool_put(req);
@@ -785,10 +817,7 @@ static void uct_cxi_peer_conn_attempt(uct_cxi_peer_conn_t *conn)
         conn->attempts++;
     }
 
-    /* Not less than a slot (see uct_cxi_fc_init()), and the wheel's own cap
-     * is a little over the longest delay. */
-    ucs_wtimer_add(&iface->fc.twheel, &conn->timer,
-                   ucs_max(delay, iface->fc.twheel.res));
+    uct_cxi_fc_timer_add(iface, &conn->timer, delay);
 }
 
 /* The timer of a handshake: give up if its time is up, else resend. */
@@ -833,11 +862,7 @@ void uct_cxi_peer_connect(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
     conn->attempts = 0;
     peer->conn     = conn;
 
-    /* The wheel is only swept while a handshake is in progress, so it may be
-     * far behind: bring it up to date before anything is set on it. */
-    if (iface->fc.num_connecting++ == 0) {
-        ucs_twheel_sweep(&iface->fc.twheel, now);
-    }
+    iface->fc.num_connecting++;
     uct_cxi_peer_conn_attempt(conn);
 }
 
@@ -864,34 +889,70 @@ static ucs_status_t uct_cxi_fc_send_grant(uct_cxi_iface_t *iface,
     return status;
 }
 
+/* Put \a peer on the list of those waiting for a GRANT, and make sure the
+ * timer that retries the list is running. */
+static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
+{
+    unsigned shift;
+
+    if (ucs_list_is_empty(&peer->grants)) {
+        ucs_list_add_tail(&iface->fc.grants, &peer->grants);
+    }
+
+    shift = ucs_min(iface->fc.grant_failures, 10u);
+    uct_cxi_fc_timer_add(iface, &iface->fc.grant_timer,
+                         ucs_time_from_usec(
+                                 ucs_min((uint64_t)UCT_CXI_CTRL_RETRY_BASE_US
+                                                 << shift,
+                                         (uint64_t)UCT_CXI_CTRL_RETRY_MAX_US)));
+}
+
 void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 {
     if (!ucs_list_is_empty(&peer->grants)) {
-        return; /* already waiting for a control slot */
+        return; /* already waiting */
     }
 
     if (uct_cxi_fc_send_grant(iface, peer) != UCS_OK) {
-        ucs_list_add_tail(&iface->fc.grants, &peer->grants);
+        uct_cxi_fc_queue_grant(iface, peer);
     }
 }
 
-void uct_cxi_fc_progress(uct_cxi_iface_t *iface)
+/*
+ * Send the GRANTs that are waiting, oldest first, until one cannot be sent
+ * (the TX queue is full: the others could not be either). Called when TX
+ * completions have made room, before the sends waiting in pending queues get
+ * it, and from the timer in case no completion comes.
+ */
+void uct_cxi_fc_retry_grants(uct_cxi_iface_t *iface)
 {
-    uct_cxi_peer_t *peer, *tmp;
+    uct_cxi_peer_t *peer;
 
-    /* Handshake timers: resends and deadlines. */
-    if (iface->fc.num_connecting != 0) {
-        ucs_twheel_sweep(&iface->fc.twheel, ucs_get_time());
-    }
+    while (!ucs_list_is_empty(&iface->fc.grants)) {
+        peer = ucs_list_head(&iface->fc.grants, uct_cxi_peer_t, grants);
 
-    ucs_list_for_each_safe(peer, tmp, &iface->fc.grants, grants) {
         /* Still owed anything? A piggyback may have carried it meanwhile. */
-        if (((peer->rx.ret_msgs == peer->rx.adv_msgs) &&
-             (peer->rx.ret_units == peer->rx.adv_units)) ||
-            (uct_cxi_fc_send_grant(iface, peer) == UCS_OK)) {
-            ucs_list_del(&peer->grants);
-            ucs_list_head_init(&peer->grants);
+        if (((peer->rx.ret_msgs != peer->rx.adv_msgs) ||
+             (peer->rx.ret_units != peer->rx.adv_units)) &&
+            (uct_cxi_fc_send_grant(iface, peer) != UCS_OK)) {
+            return;
         }
+
+        ucs_list_del(&peer->grants);
+        ucs_list_head_init(&peer->grants);
+    }
+}
+
+static void uct_cxi_fc_grant_timer(ucs_wtimer_t *timer)
+{
+    uct_cxi_iface_t *iface = ucs_container_of(timer, uct_cxi_iface_t,
+                                              fc.grant_timer);
+
+    uct_cxi_fc_retry_grants(iface);
+    if (!ucs_list_is_empty(&iface->fc.grants)) {
+        /* Still waiting: again, a little later. */
+        uct_cxi_fc_queue_grant(iface, ucs_list_head(&iface->fc.grants,
+                                                    uct_cxi_peer_t, grants));
     }
 }
 

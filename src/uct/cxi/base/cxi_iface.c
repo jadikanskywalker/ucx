@@ -2471,21 +2471,31 @@ uct_cxi_iface_eq_poll(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
 static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxi_iface_t *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
-    unsigned         n;
+    unsigned         n, n_tx;
 
 #ifndef UCT_CXI_DISABLE_FC
-    /* Resend handshake requests that have gone unanswered, and credit grants
-     * that found no control slot. */
-    if (ucs_unlikely((iface->fc.num_connecting != 0) ||
-                     !ucs_list_is_empty(&iface->fc.grants))) {
-        uct_cxi_fc_progress(iface);
+    /* Timers of the flow-control machinery: resends of handshake requests,
+     * their deadlines, and retries of credit grants that could not be sent.
+     * The wheel only has timers while there is something to wait for. */
+    if (ucs_unlikely(!ucs_twheel_is_empty(&iface->fc.twheel))) {
+        ucs_twheel_sweep(&iface->fc.twheel, ucs_get_time());
     }
 #endif
 
     /* Each queue gets its own EQ_MAX_POLL budget, so neither a receive flood
      * nor a burst of completions can starve the other. */
     n  = uct_cxi_iface_eq_poll(iface, &iface->rx_eq);
-    n += uct_cxi_iface_eq_poll(iface, &iface->tx_eq);
+    n_tx = uct_cxi_iface_eq_poll(iface, &iface->tx_eq);
+    n += n_tx;
+
+#ifndef UCT_CXI_DISABLE_FC
+    /* Completions free room in the TX queue, and a credit grant waiting for it
+     * (the sender of those credits may be unable to send until it gets them)
+     * goes before the sends that wait in pending queues. */
+    if (ucs_unlikely((n_tx != 0) && !ucs_list_is_empty(&iface->fc.grants))) {
+        uct_cxi_fc_retry_grants(iface);
+    }
+#endif
 
     /* Retry any sends queued via uct_ep_pending_add() now that this round
      * of completions may have freed cmdq/op_pool/desc_pool resources.

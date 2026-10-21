@@ -362,6 +362,50 @@ UCS_TEST_P(test_cxi_fc_credits, sends_block_without_credits_then_resume)
 }
 
 /**
+ * A credit grant that finds the TX queue full waits, and goes when there is
+ * room again, with nothing else in flight to announce it (so it is the
+ * timer's retry that sends it). Until then the sender has not got the
+ * credits back.
+ */
+UCS_TEST_P(test_cxi_fc_credits, grant_waits_for_tx_room_then_goes)
+{
+    count_receives();
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h         ep     = sender().ep(0);
+    uct_cxi_peer_t  *peer   = peer_of(sender(), 0);
+    uct_cxi_iface_t *riface = cxi_iface(receiver());
+    unsigned         saved  = riface->tx.max_inflight;
+    unsigned         sent   = 0;
+
+    /* As far as the receiver knows its TX queue has no room for a message. */
+    riface->tx.max_inflight = 0;
+
+    /* Half a window, the threshold at which the receiver owes a grant. */
+    while (sent < MSG_WINDOW / 2) {
+        ASSERT_UCS_OK(send_short(ep));
+        sent++;
+    }
+    ASSERT_TRUE(progress_until([&]() { return m_received == sent; }));
+    EXPECT_FALSE(ucs_list_is_empty(&riface->fc.grants))
+            << "the receiver owes a grant it cannot send";
+
+    ucs_time_t until = ucs_get_time() + ucs_time_from_msec(20);
+    while (ucs_get_time() < until) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    EXPECT_EQ((int)(MSG_WINDOW - sent), peer->tx.avail_msgs)
+            << "credits came back although there was no room to send them";
+    EXPECT_FALSE(ucs_list_is_empty(&riface->fc.grants));
+
+    riface->tx.max_inflight = saved;
+    ASSERT_TRUE(progress_until([&]() {
+        return peer->tx.avail_msgs == (int)MSG_WINDOW;
+    })) << "the waiting grant was never sent";
+    EXPECT_TRUE(ucs_list_is_empty(&riface->fc.grants));
+}
+
+/**
  * A send that found no credits and was parked on the pending queue runs by
  * itself when credits come back -- through the arbiter, not by being retried
  * by hand.
