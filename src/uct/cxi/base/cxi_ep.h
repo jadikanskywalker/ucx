@@ -146,18 +146,35 @@ typedef struct uct_cxi_ep {
                                              (ep_id, md_index) has been sent
                                              -- see uct_ep_tag_rndv_zcopy and
                                              uct_cxi_ep_send_rndv_hdr_announce
-                                             in cxi_am.c. Fire-and-forget: no
-                                             ack, no retry once sent (only
-                                             reset to 0 on a failed send, so
-                                             the next rndv send retries). */
+                                             in cxi_am.c. Not resent once
+                                             sent (only reset to 0 when the
+                                             send is refused, so the next
+                                             rndv send retries). */
 } uct_cxi_ep_t;
 
 /*
- * uct_cxi_ep_tx_complete — update this EP's adaptive backoff state after a
- * TX completion (called once per drained op from iface_progress(),
- * regardless of status). Defined in cxi_ep.c.
+ * uct_cxi_ep_tx_complete_slow — update this EP's adaptive backoff state after
+ * a TX completion that changes it (see uct_cxi_ep_tx_complete() below).
+ * Defined in cxi_ep.c.
  */
-void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
+void uct_cxi_ep_tx_complete_slow(uct_cxi_ep_t *ep, ucs_status_t status);
+
+/*
+ * uct_cxi_ep_tx_complete — the usual completion (success, on an ep whose
+ * concurrency cap has never been cut, or has grown back to unconstrained) has
+ * nothing to update: the cap cannot grow further, and a streak of successes
+ * only matters to an ep that has failed. Everything else is for
+ * uct_cxi_ep_tx_complete_slow().
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status)
+{
+    if (ucs_unlikely((status != UCS_OK) ||
+                     (ep->max_outstanding !=
+                      UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED))) {
+        uct_cxi_ep_tx_complete_slow(ep, status);
+    }
+}
 
 
 /*
@@ -179,7 +196,8 @@ void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status);
  *   - ep->outstanding >= ep->max_outstanding: this EP's adaptive
  *     concurrency cap (see uct_cxi_ep_tx_complete).
  *   - ep->retry_backoff_until: this EP's adaptive retry-cadence backoff,
- *     set after a C_RC_PT_DISABLED-class completion.
+ *     set after a C_RC_PT_DISABLED-class completion. Zero (the usual) is
+ *     tested first so that the clock is only read while a backoff is set.
  *
  * Deliberately not gated on the RX EQ being drained after a drop: with
  * separate TX and RX event queues, local sends only produce TX completions
@@ -192,7 +210,8 @@ uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
     return ucs_unlikely(((pte_fc != NULL) && pte_fc->exhausted) ||
                          (iface->tx.outstanding >= iface->tx.max_inflight) ||
                          (ep->outstanding >= ep->max_outstanding) ||
-                         (ep->retry_backoff_until > ucs_get_time()));
+                         ((ep->retry_backoff_until != 0) &&
+                          (ep->retry_backoff_until > ucs_get_time())));
 }
 
 /*
@@ -404,6 +423,55 @@ uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned units)
 }
 
 #endif /* UCT_CXI_DISABLE_FC */
+
+/**
+ * Send \a length bytes of \a data as one unrestricted inline (IDC) message to
+ * \a dfa: a c_state command that says where the send's completion goes, then
+ * the message itself, rung together, with the send counted against its ep and
+ * tracked by its completion (see uct_cxi_idc_track_hdr; \a units and
+ * \a credited are its flow-control charge, which the caller applies).
+ *
+ * UCS_ERR_NO_RESOURCE if the command queue has no room, with nothing counted.
+ * A c_state already written then stays in the queue, harmlessly: every IDC
+ * send writes its own before its message. \a what names the caller in the
+ * log if the failure is not a full queue.
+ */
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
+                    union c_fab_addr dfa, uint8_t idx_ext, uint64_t match_bits,
+                    const void *data, size_t length, unsigned units,
+                    int credited, const char *what)
+{
+    struct c_cstate_cmd  cstate = {};
+    struct c_idc_msg_hdr hdr    = {};
+    int                  ret;
+
+    cstate.event_send_disable = 1;
+    cstate.restricted         = 0;
+    cstate.initiator          = iface->match_id;
+    cstate.index_ext          = idx_ext;
+    uct_cxi_idc_track_cstate(&cstate, iface);
+
+    ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
+    if (ucs_unlikely(ret != 0)) {
+        uct_cxi_tx_emit_error(ep, what, ret);
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    hdr.dfa        = dfa;
+    hdr.match_bits = match_bits;
+    uct_cxi_idc_track_hdr(&hdr, ep, units, credited);
+
+    ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, data, length);
+    if (ucs_unlikely(ret != 0)) {
+        uct_cxi_tx_emit_error(ep, what, ret);
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    cxi_cq_ring(iface->tx.cmdq);
+    uct_cxi_idc_track_commit(ep, iface);
+    return UCS_OK;
+}
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);
 void         uct_cxi_ep_destroy(uct_ep_h tl_ep);

@@ -131,7 +131,7 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(op);
-        ucs_error("cxi ep %p ep_get_short emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "ep_get_short", ret);
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -343,7 +343,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(desc);
-        ucs_error("cxi ep %p ep_put_bcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "ep_put_bcopy", ret);
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -452,7 +452,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(desc);
-        ucs_error("cxi ep %p ep_get_bcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "ep_get_bcopy", ret);
         return UCS_ERR_NO_RESOURCE;
     }
 

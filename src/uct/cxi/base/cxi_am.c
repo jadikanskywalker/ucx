@@ -2,31 +2,37 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI UCT Active Message operations — ep_am_short, ep_am_bcopy.
+ * CXI UCT Active Message operations -- ep_am_short, ep_am_bcopy, ep_am_zcopy.
  *
  * TX model
  * ────────
- * Both ep_am_short and ep_am_bcopy use c_full_dma_cmd (restricted=0) targeting
- * the remote AM PTE via ep->dfa_am.  No rkey is exchanged — unrestricted DMA
- * routes by DFA (NID+PID+pid_offset) to the pre-posted OVERFLOW LE.
+ * All three send an unrestricted message to the remote AM PTE, addressed by
+ * ep->dfa_am (NID+PID+pid_offset); no rkey is exchanged. Each is counted
+ * against its ep and the interface's TX queue until its completion event, and
+ * is charged against the credits the target granted (see cxi_fc.h).
  *
- * ep_am_short (≤ 184 B payload):
- *   Acquires a desc from desc_pool, copies [header(8B)|payload] into desc+1,
- *   then emits c_full_dma_cmd.  The NIC DMA's from the registered desc buffer
- *   into the remote OVERFLOW LE, advancing the remote write pointer per message
- *   (unlike IDC unrestricted, which always writes to le.start).  On C_EVENT_ACK
- *   the bcopy_comp handler returns desc to desc_pool.  Returns UCS_OK (caller's
- *   header+payload are copied into desc and reusable immediately).
+ * ep_am_short (header + payload <= C_MAX_IDC_PAYLOAD_UNR):
+ *   An unrestricted IDC message: the NIC takes the bytes from the command
+ *   queue, so there is no descriptor and the caller's buffers are reusable at
+ *   once. Its completion (an ACK on the TX EQ) carries the ep and the
+ *   message's flow-control charge in its user_ptr, see cxi_ep.h.
  *
- * ep_am_bcopy (≤ max_bcopy):
- *   Same hardware path as ep_am_short but fills desc via pack_cb instead of
- *   memcpy.  Returns ssize_t (bytes packed).
+ * ep_am_bcopy (<= max_bcopy):
+ *   Takes a pre-registered uct_cxi_send_desc_t from desc_pool, fills it with
+ *   pack_cb, and posts a C_CMD_PUT from it. The descriptor goes back to the
+ *   pool on the ACK. Returns the number of bytes packed.
+ *
+ * ep_am_zcopy (<= max_zcopy):
+ *   Posts a C_CMD_PUT straight from the caller's registered buffer; the
+ *   caller's completion fires on the ACK.
  *
  * RX model
  * ────────
- * iface_progress sees C_EVENT_PUT on the AM OVERFLOW LE, reads buffer_id to
- * identify the receive buffer, and calls uct_iface_invoke_am.  The two-buffer
- * ping-pong (min_free, auto_unlinked) is managed in cxi_iface.c.
+ * iface_progress sees C_EVENT_PUT on the AM list, reads buffer_id to find
+ * which buffer of the receive ring the NIC wrote into, and calls
+ * uct_iface_invoke_am. The ring (several buffers, each a manage_local list
+ * entry that unlinks itself near its end and is reposted) is managed in
+ * cxi_iface.c.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -71,11 +77,10 @@ static void uct_cxi_am_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 /*
  * uct_cxi_ep_am_short — unrestricted IDC AM send (≤ 184 B payload).
  *
- * Emits c_cstate_cmd (restricted=0, all events suppressed) followed by
- * c_idc_msg_hdr carrying [header(8B)|payload] as inline data.  Pure
- * fire-and-forget: no desc, no outstanding tracking, no events.  The NIC
- * places the data in the remote OVERFLOW LE at its managed write pointer
- * (manage_local=1 on the OVERFLOW LE).
+ * Sends [header(8B)|payload] as one inline IDC message (see
+ * uct_cxi_ep_idc_send). The NIC places the data in the remote AM list at its
+ * managed write pointer. The send is tracked by its completion, which is what
+ * lets a send that never arrived be noticed and its credits taken back.
  *
  * Returns UCS_OK on the same turn; caller's buffers are reusable immediately.
  */
@@ -90,7 +95,6 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     uint64_t         fcbits;
     ucs_status_t     status;
     int              credited;
-    int              ret;
 
     UCT_CHECK_LENGTH(length, 0,
                      C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t), "am_short");
@@ -108,46 +112,22 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     memcpy(buf, &header, sizeof(uint64_t));
     memcpy(buf + sizeof(uint64_t), payload, length);
 
-    {
-        struct c_cstate_cmd cstate    = {};
-        cstate.event_send_disable     = 1;
-        cstate.event_success_disable  = 0;
-        cstate.restricted             = 0;
-        cstate.initiator              = iface->match_id;
-        cstate.index_ext              = ep->dfa_am_idx_ext;
-        uct_cxi_idc_track_cstate(&cstate, iface);
+    ucs_trace("cxi IDC_SEND: am_id=%u total_len=%zu "
+              "nid=%u pid=%u idx_ext=%u "
+              "wp32=%lu hw_wp32=%lu",
+              (unsigned)id, sizeof(uint64_t) + length,
+              ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
+              (unsigned long)iface->tx.cmdq->wp32,
+              (unsigned long)iface->tx.cmdq->hw_wp32);
 
-        ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi ep %p am_short cstate emit failed: %d", ep, ret);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    {
-        struct c_idc_msg_hdr hdr = {};
-        hdr.dfa        = ep->dfa_am;
-        hdr.match_bits = (uint64_t)id | fcbits;
-        uct_cxi_idc_track_hdr(&hdr, ep, units, credited);
-
-        ucs_trace("cxi IDC_SEND: am_id=%u total_len=%zu "
-                  "nid=%u pid=%u idx_ext=%u "
-                  "wp32=%lu hw_wp32=%lu",
-                  (unsigned)id, sizeof(uint64_t) + length,
-                  ep->rem_nid, ep->rem_pid, (unsigned)ep->dfa_am_idx_ext,
-                  (unsigned long)iface->tx.cmdq->wp32,
-                  (unsigned long)iface->tx.cmdq->hw_wp32);
-
-        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, buf,
-                                  sizeof(uint64_t) + length);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi ep %p am_short idc_msg emit failed: %d", ep, ret);
-        return UCS_ERR_NO_RESOURCE;
+    status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_am, ep->dfa_am_idx_ext,
+                                 (uint64_t)id | fcbits, buf,
+                                 sizeof(uint64_t) + length, units, credited,
+                                 "am_short");
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
     }
 
-    cxi_cq_ring(iface->tx.cmdq);
-    uct_cxi_idc_track_commit(ep, iface);
     uct_cxi_fc_debit(ep, credited, units);
     uct_cxi_fc_pb_sent(ep, fcbits);
 
@@ -166,14 +146,12 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
  * uct_cxi_ep_send_rndv_hdr_announce -- one-time-per-ep control message
  * carrying {ep_id, md_index, where our rendezvous address table is} to the
  * peer, over the same unrestricted IDC path as uct_cxi_ep_am_short() above,
- * but with UCT_CXI_RNDV_HDR_ANNOUNCE_
- * FLAG set in match_bits instead of a real am_id -- the receiver's AM
- * dispatch (cxi_iface.c) checks that bit before ever calling
- * uct_iface_invoke_am(), routing this to uct_cxi_iface_handle_rndv_hdr_
- * announce() (cxi_tag.c) instead. Fire-and-forget, same as am_short: no
- * desc, no outstanding tracking, no events -- the fabric's own retry engine
- * is trusted for reliability, same as every other unacked Put in this
- * transport.
+ * but with UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG set in match_bits instead of a real
+ * am_id -- the receiver's AM dispatch (cxi_iface.c) checks that bit before
+ * ever calling uct_iface_invoke_am(), routing this to
+ * uct_cxi_iface_handle_rndv_hdr_announce() (cxi_tag.c) instead. To the flow
+ * control it is an ordinary Active Message (credited, tracked); it is not
+ * resent if it is lost, only sent again if the send was refused.
  */
 ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
                                                 uint64_t ep_id,
@@ -185,7 +163,6 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     uint64_t                 fcbits;
     ucs_status_t             status;
     int                      credited;
-    int                      ret;
 
     /* An ordinary Active Message as far as the target is concerned: it uses
      * an AM buffer and an event, and the target hands its credits back like
@@ -202,40 +179,14 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     payload.table_iova = iface->rdzv.addr_table_mh.iova_offset +
                          (uint64_t)(uintptr_t)iface->rdzv.addr_table;
 
-    {
-        struct c_cstate_cmd cstate    = {};
-        cstate.event_send_disable     = 1;
-        cstate.event_success_disable  = 0;
-        cstate.restricted             = 0;
-        cstate.initiator              = iface->match_id;
-        cstate.index_ext              = ep->dfa_am_idx_ext;
-        uct_cxi_idc_track_cstate(&cstate, iface);
-
-        ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi ep %p rndv_hdr_announce cstate emit failed: %d", ep,
-                 ret);
-        return UCS_ERR_NO_RESOURCE;
+    status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_am, ep->dfa_am_idx_ext,
+                                 UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG | fcbits,
+                                 &payload, sizeof(payload), units, credited,
+                                 "rndv_hdr_announce");
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
     }
 
-    {
-        struct c_idc_msg_hdr hdr = {};
-        hdr.dfa        = ep->dfa_am;
-        hdr.match_bits = UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG | fcbits;
-        uct_cxi_idc_track_hdr(&hdr, ep, units, credited);
-
-        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, &payload,
-                                  sizeof(payload));
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi ep %p rndv_hdr_announce idc_msg emit failed: %d", ep,
-                 ret);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    cxi_cq_ring(iface->tx.cmdq);
-    uct_cxi_idc_track_commit(ep, iface);
     uct_cxi_fc_debit(ep, credited, units);
     uct_cxi_fc_pb_sent(ep, fcbits);
     ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u "
@@ -336,7 +287,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(desc);
-        ucs_error("cxi ep %p ep_am_bcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "ep_am_bcopy", ret);
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -462,7 +413,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(op);
-        ucs_error("cxi ep %p ep_am_zcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "ep_am_zcopy", ret);
         return UCS_ERR_NO_RESOURCE;
     }
 

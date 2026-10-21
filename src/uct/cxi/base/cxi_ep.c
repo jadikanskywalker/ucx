@@ -179,15 +179,19 @@ void uct_cxi_ep_destroy(uct_ep_h tl_ep)
 
 /*
  * uct_cxi_ep_process_pending — arbiter dispatch callback, invoked from
- * iface_progress() once TX completions have freed cmdq/pool resources.
+ * iface_progress() once TX completions have freed cmdq/pool resources or a
+ * grant has returned credits.
  *
- * Unlike IB RC, CXI has no per-EP remote flow-control credits — cmdq,
- * op_pool, and desc_pool are all iface-global.  So if one EP's pending
- * callback hits NO_RESOURCE, no other EP can progress this round either;
- * STOP halts the whole dispatch instead of RC's four-way EP-vs-iface split.
- * An EP's own adaptive backoff (retry_backoff_until) is the opposite case:
- * it says nothing about the shared resources, so it only skips that EP's
- * group (NEXT_GROUP) rather than halting everyone else's queued sends.
+ * A NO_RESOURCE from req->func is one of two things:
+ *   - this ep's peer has no credits for it, or the handshake with the peer
+ *     is still in flight (iface->tx.credit_block was set by
+ *     uct_cxi_fc_reserve()): nothing shared is short, so only this ep is
+ *     parked (DESCHED_GROUP) on its peer until a grant, the CREP or a refund
+ *     resumes it, and every other ep's queue carries on;
+ *   - cmdq, op_pool, desc_pool or the TX queue are iface-global: if one ep
+ *     cannot send, none can this round, so STOP halts the whole dispatch.
+ * An EP's own adaptive backoff (retry_backoff_until) says nothing about the
+ * shared resources, so it only skips that EP's group (NEXT_GROUP).
  */
 ucs_arbiter_cb_result_t
 uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
@@ -200,7 +204,8 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
     uct_cxi_iface_t   *iface = uct_cxi_ep_iface(ep);
 #endif
 
-    if (ucs_unlikely(ep->retry_backoff_until > ucs_get_time())) {
+    if (ucs_unlikely((ep->retry_backoff_until != 0) &&
+                     (ep->retry_backoff_until > ucs_get_time()))) {
         /* Still in this EP's adaptive backoff window — leave queued
          * without even attempting req->func. Retrying now would both
          * burn a dispatch cycle every progress() call and, more
@@ -294,12 +299,13 @@ void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
  */
 
 /*
- * uct_cxi_ep_tx_complete — shrink/grow this EP's max_outstanding and
+ * uct_cxi_ep_tx_complete_slow — shrink/grow this EP's max_outstanding and
  * retry_backoff_until in response to one TX completion's status.
  *
- * Called once per drained op from iface_progress(), for every status —
- * not just failures — since sustained health is what grows the endpoint
- * back toward unconstrained (see UCT_CXI_FC_HEALTHY_STREAK).
+ * Called from uct_cxi_ep_tx_complete() (cxi_ep.h) for every completion that
+ * is not a success on an unconstrained ep -- sustained health is what grows
+ * a constrained endpoint back toward unconstrained (see
+ * UCT_CXI_FC_HEALTHY_STREAK).
  *
  * Only UCS_ERR_BUSY (this file's mapping of C_RC_PT_DISABLED — see
  * uct_cxi_rc_to_status in cxi_iface.c) drives this policy. Other non-OK
@@ -307,7 +313,7 @@ void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
  * signal this backoff exists to react to, so they neither shrink nor
  * grow it.
  */
-void uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status)
+void uct_cxi_ep_tx_complete_slow(uct_cxi_ep_t *ep, ucs_status_t status)
 {
     if (status == UCS_ERR_BUSY) {
         unsigned   shift   = ucs_min(ep->consecutive_failures, 10);

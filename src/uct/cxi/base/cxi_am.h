@@ -52,8 +52,8 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h ep, uint8_t id,
  * uct_cxi_ep_send_rndv_hdr_announce -- one-time-per-ep control message
  * carrying the constant-for-the-life-of-the-ep {ep_id, md_index} halves of
  * UCP's rendezvous header (see cxi_ep.h's rndv_hdr_announced and
- * uct_ep_tag_rndv_zcopy in cxi_tag.c). Mirrors uct_cxi_ep_am_short's own
- * fire-and-forget IDC-send mechanism, but targets the reserved
+ * uct_ep_tag_rndv_zcopy in cxi_tag.c). Goes out the way uct_cxi_ep_am_short
+ * does (uct_cxi_ep_idc_send), but targets the reserved
  * UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG match_bits instead of a real am_id, and
  * carries a uct_cxi_rndv_peer_hdr_t (cxi_iface.h) as its payload.
  */

@@ -217,8 +217,8 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      UCS_CONFIG_TYPE_MEMUNITS},
 
     {"TAG_EAGER_MAX", "512k",
-     "Maximum eager tag bcopy/zcopy payload in bytes.  Also sizes the\n"
-     "unexpected-message copy-out pool elements.",
+     "Maximum eager tag bcopy/zcopy payload in bytes.  Also the minimum\n"
+     "size of each overflow-list buffer.",
      ucs_offsetof(uct_cxi_iface_config_t, tag_eager_max),
      UCS_CONFIG_TYPE_MEMUNITS},
 
@@ -1334,6 +1334,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * calling it directly outside this constructor.
      */
     memset(&self->rdzv, 0, sizeof(self->rdzv));
+    self->rdzv.ptn = -1;
     if (self->tag.enabled) {
         status = uct_cxi_iface_open_rdzv_pte(self, lni);
         if (status != UCS_OK) {
@@ -1995,6 +1996,11 @@ uct_cxi_iface_handle_state_change(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
     }
 }
 
+void uct_cxi_tx_emit_failed(const void *obj, const char *what, int ret)
+{
+    ucs_error("cxi %p %s emit failed: %d", obj, what, ret);
+}
+
 /*
  * uct_cxi_iface_tx_error -- log a TX completion that did not succeed. Rare,
  * kept out of line so it adds nothing to the inlined completion path.
@@ -2206,8 +2212,7 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
             }
         }
     } else if ((event->hdr.event_type == C_EVENT_RENDEZVOUS) &&
-               (iface->tag.pte != NULL) &&
-               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+               (event->tgt_long.ptlte_index == iface->tag.ptn)) {
         /* Direct-matched rendezvous Put (Phase B) -- always on the
          * priority list (an unexpected rendezvous arrival stays
          * C_EVENT_PUT/ptl_list==OVERFLOW, handled by the branch
@@ -2215,14 +2220,12 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
          * accounting -- see its doc comment. */
         uct_cxi_iface_tag_handle_rdzv_match(iface, event);
     } else if ((event->hdr.event_type == C_EVENT_GET) &&
-               (iface->rdzv.pte != NULL) &&
-               (event->tgt_long.ptlte_index == iface->rdzv.pte->ptn)) {
+               (event->tgt_long.ptlte_index == iface->rdzv.ptn)) {
         /* A peer's Get read from our exposed rendezvous catch-all LE
          * -- the send side of a rendezvous transfer completing. */
         uct_cxi_iface_tag_handle_rdzv_get(iface, event);
     } else if ((event->hdr.event_type == C_EVENT_PUT) &&
-               (iface->tag.pte != NULL) &&
-               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+               (event->tgt_long.ptlte_index == iface->tag.ptn)) {
         /* Target-side TAG receive.  Both LE populations on this PTE
          * report C_EVENT_PUT; ptl_list is the discriminator (shared
          * ptlte_index alone can't tell them apart) -- see cxi_tag.h.
@@ -2334,8 +2337,7 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
     } else if (event->hdr.event_type == C_EVENT_STATE_CHANGE) {
         uct_cxi_iface_handle_state_change(iface, eq, event);
     } else if ((event->hdr.event_type == C_EVENT_UNLINK) &&
-               (iface->tag.pte != NULL) &&
-               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+               (event->tgt_long.ptlte_index == iface->tag.ptn)) {
         uct_cxi_iface_tag_handle_unlink(iface, event);
     } else if (event->hdr.event_type == C_EVENT_UNLINK) {
         /* Auto-unlink (min_free) is signaled via auto_unlinked on the
@@ -2346,8 +2348,7 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         ucs_debug("cxi AM LE C_EVENT_UNLINK buf=%d (manual)",
                   (int)event->tgt_long.buffer_id);
     } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
-               (iface->tag.pte != NULL) &&
-               (event->tgt_long.ptlte_index == iface->tag.pte->ptn)) {
+               (event->tgt_long.ptlte_index == iface->tag.ptn)) {
         /* Either our own SEARCH_AND_DELETE's "found" confirmation (buffer_id
          * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID, see cxi_tag.h),
          * or delayed correlation for a real match (same disposition as a
@@ -2371,8 +2372,7 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
             uct_cxi_iface_tag_handle_eager_match(iface, event);
         }
     } else if ((event->hdr.event_type == C_EVENT_SEARCH) &&
-               (iface->tag.pte != NULL) &&
-               (event->tgt_long.ptlte_index == iface->tag.pte->ptn) &&
+               (event->tgt_long.ptlte_index == iface->tag.ptn) &&
                (event->tgt_long.buffer_id ==
                 UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID)) {
         /* Our SEARCH_AND_DELETE found nothing: the message it was issued

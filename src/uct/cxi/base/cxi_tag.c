@@ -207,6 +207,47 @@ static void uct_cxi_iface_tag_unexp_cleanup(uct_cxi_iface_t *self)
 }
 
 /*
+ * uct_cxi_iface_tag_init_recv_le -- build tag.recv_le, the priority-list entry
+ * of every posted receive but for what differs between receives (the slot,
+ * the buffer and the tag to match), which uct_cxi_iface_tag_recv_zcopy() fills
+ * in. Needs tag.ptn.
+ */
+static void uct_cxi_iface_tag_init_recv_le(uct_cxi_iface_t *self)
+{
+    struct c_target_cmd *le = &self->tag.recv_le;
+
+    le->command.opcode        = C_CMD_TGT_APPEND;
+    le->ptl_list              = C_PTL_LIST_PRIORITY;
+    le->ptlte_index           = self->tag.ptn;
+    le->op_put                = 1;
+    le->op_get                = 0;
+    le->use_once              = 1;
+    le->manage_local          = 1; /* mandatory even for a single-message LE
+                                   * -- makes Cassini ignore initiator
+                                   * remote_offset (libfabric's own
+                                   * _cxip_recv_req() comment) */
+    le->unexpected_hdr_disable = 0; /* empirically confirmed to have no
+                                     * effect on priority-list APPENDs
+                                     * either way -- left at the real
+                                     * default */
+    le->unrestricted_body_ro  = 1;
+    le->unrestricted_end_ro   = 1;
+    le->event_link_disable    = 1; /* no append-ack needed */
+    le->event_unlink_disable  = 1; /* Suppress the event for the automatic
+                                   * (use_once-on-match) unlinkevent.
+                                   * The separate, explicit C_CMD_TGT_UNLINK
+                                   * issued by tag_recv_cancel() has its
+                                   * own event_unlink_disable setting left
+                                   * on. Thus, every C_EVENT_UNLINK on PTE
+                                   * priority list is a cancel confirmation. */
+    le->no_truncate           = 0; /* allow truncated delivery so
+                                   * UCS_ERR_TRUNCATED can be reported,
+                                   * unlike AM which rejects outright */
+    le->restart_seq           = 0;
+    le->match_id              = CXI_MATCH_ID_ANY;
+}
+
+/*
  * uct_cxi_iface_post_tag_ovf_le -- append one overflow-list LE for ring
  * buffer buf_idx. Mirrors uct_cxi_iface_post_am_le's shape (contiguous
  * ring, buffer_id-indexed, manage_local), but with the flags that make
@@ -272,6 +313,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     unsigned             i;
 
     memset(&self->tag, 0, sizeof(self->tag));
+    self->tag.ptn = -1;
 
     if ((config->tag_enable == UCS_NO) ||
         !ucs_test_all_flags(params->field_mask,
@@ -411,6 +453,8 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         status = UCS_ERR_IO_ERROR;
         goto err_unmap_rx;
     }
+    self->tag.ptn = self->tag.pte->ptn;
+    uct_cxi_iface_tag_init_recv_le(self);
 
     ret = cxil_map_pte(self->tag.pte, self->domain, (int)UCT_CXI_PTE_TAG,
                        false, &self->tag.pte_map);
@@ -470,6 +514,7 @@ err_unmap_pte:
 err_destroy_pte:
     cxil_destroy_pte(self->tag.pte);
     self->tag.pte = NULL;
+    self->tag.ptn = -1;
     ucs_free(self->tag.ovf_repost_pending);
     self->tag.ovf_repost_pending = NULL;
 err_free_ovf_refcnt:
@@ -517,6 +562,7 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
             ucs_warn("cxi cxil_destroy_pte TAG failed: %s", strerror(-ret));
         }
     }
+    self->tag.ptn = -1;
     uct_cxi_do_unmap(&self->tag.rx_mh);
     ucs_free(self->tag.rx_base);
     ucs_free(self->tag.ovf_repost_pending);
@@ -621,6 +667,7 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
     uint32_t                   i;
 
     memset(&self->rdzv, 0, sizeof(self->rdzv));
+    self->rdzv.ptn = -1;
 
     self->rdzv.max_outstanding = ucs_min(self->tag.max_outstanding,
                                          UCT_CXI_RDZV_MAX_OUTSTANDING_MAX);
@@ -658,6 +705,7 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         status = UCS_ERR_IO_ERROR;
         goto err_free_ids;
     }
+    self->rdzv.ptn = self->rdzv.pte->ptn;
 
     /* pid_idx must be the device's own driver-reported rdzv_get_idx, not a
      * self-chosen value -- confirmed on real hardware (C_RC_PTLTE_NOT_FOUND
@@ -756,6 +804,7 @@ err_unmap_pte:
 err_destroy_pte:
     cxil_destroy_pte(self->rdzv.pte);
     self->rdzv.pte = NULL;
+    self->rdzv.ptn = -1;
 err_free_ids:
     uct_cxi_iface_rdzv_table_cleanup(self);
     ucs_free(self->rdzv.free_ids);
@@ -786,6 +835,7 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self)
             ucs_warn("cxi cxil_destroy_pte RDZV failed: %s", strerror(-ret));
         }
     }
+    self->rdzv.ptn = -1;
     uct_cxi_iface_rdzv_table_cleanup(self);
     ucs_free(self->rdzv.free_ids);
     self->rdzv.free_ids = NULL;
@@ -1908,7 +1958,7 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
 
     sd.command.opcode = C_CMD_TGT_SEARCH_AND_DELETE;
     sd.ptl_list       = C_PTL_LIST_UNEXPECTED;
-    sd.ptlte_index    = iface->tag.pte->ptn;
+    sd.ptlte_index    = iface->tag.ptn;
     sd.match_bits     = tag;
     sd.ignore_bits    = 0;
     sd.match_id       = CXI_MATCH_ID_ANY;
@@ -2648,7 +2698,7 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
 {
     uct_cxi_ep_t    *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t *iface = uct_cxi_tag_ep_iface(ep);
-    int              ret;
+    ucs_status_t     status;
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, "tag_eager_short");
 
@@ -2656,38 +2706,13 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_ERR_NO_RESOURCE;
     }
 
-    {
-        struct c_cstate_cmd cstate   = {};
-        cstate.event_send_disable    = 1;
-        cstate.restricted            = 0; /* unrestricted -> TAG PTE */
-        cstate.initiator             = iface->match_id;
-        cstate.index_ext             = ep->dfa_tag_idx_ext;
-        uct_cxi_idc_track_cstate(&cstate, iface);
-
-        ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi ep %p tag_eager_short cstate emit failed: %d",
-                 ep, ret);
-        return UCS_ERR_NO_RESOURCE;
+    status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_tag, ep->dfa_tag_idx_ext,
+                                 tag, data, length, 0, 0 /* tag credits: later */,
+                                 "tag_eager_short");
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
     }
 
-    {
-        struct c_idc_msg_hdr hdr = {};
-        hdr.dfa        = ep->dfa_tag;
-        hdr.match_bits = tag;
-        uct_cxi_idc_track_hdr(&hdr, ep, 0, 0); /* tag credits: later */
-
-        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, data, length);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_error("cxi ep %p tag_eager_short idc_msg emit failed: %d",
-                 ep, ret);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    cxi_cq_ring(iface->tx.cmdq);
-    uct_cxi_idc_track_commit(ep, iface);
     ucs_debug("cxi TAG [SEND-SHORT] ep=%p tag=0x%lx len=%zu", ep,
              (unsigned long)tag, length);
     return UCS_OK;
@@ -2745,7 +2770,7 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(desc);
-        ucs_error("cxi ep %p tag_eager_bcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "tag_eager_bcopy", ret);
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -2810,7 +2835,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     }
     if (ucs_unlikely(ret != 0)) {
         ucs_mpool_put(op);
-        ucs_error("cxi ep %p tag_eager_zcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "tag_eager_zcopy", ret);
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -3005,7 +3030,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     if (ucs_unlikely(ret != 0)) {
         rop->valid = 0;
         iface->rdzv.free_ids[iface->rdzv.free_count++] = id;
-        ucs_error("cxi ep %p tag_rndv_zcopy emit failed: %d", ep, ret);
+        uct_cxi_tx_emit_error(ep, "tag_rndv_zcopy", ret);
         return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
     }
 
@@ -3117,7 +3142,7 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
     uct_cxi_mem_handle_t   *memh;
     uct_cxi_tag_ctx_priv_t *priv;
     uint16_t                slot;
-    struct c_target_cmd     le    = {};
+    struct c_target_cmd     le    = iface->tag.recv_le;
     int                     ret;
 
     UCT_CHECK_IOV_SIZE(iovcnt, 1ul, "tag_recv_zcopy");
@@ -3141,35 +3166,6 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
     priv->recv_addr         = (uint64_t)(uintptr_t)iov[0].buffer;
     iface->tag.ctx[slot] = ctx;
 
-    le.command.opcode        = C_CMD_TGT_APPEND;
-    le.ptl_list              = C_PTL_LIST_PRIORITY;
-    le.ptlte_index           = iface->tag.pte->ptn;
-    le.op_put                = 1;
-    le.op_get                = 0;
-    le.use_once              = 1;
-    le.manage_local          = 1; /* mandatory even for a single-message LE
-                                   * -- makes Cassini ignore initiator
-                                   * remote_offset (libfabric's own
-                                   * _cxip_recv_req() comment) */
-    le.unexpected_hdr_disable = 0; /* empirically confirmed to have no
-                                     * effect on priority-list APPENDs
-                                     * either way -- left at the real
-                                     * default */
-    le.unrestricted_body_ro  = 1;
-    le.unrestricted_end_ro   = 1;
-    le.event_link_disable    = 1; /* no append-ack needed */
-    le.event_unlink_disable  = 1; /* Suppress the event for the automatic
-                                   * (use_once-on-match) unlinkevent.
-                                   * The separate, explicit C_CMD_TGT_UNLINK
-                                   * issued by tag_recv_cancel() has its
-                                   * own event_unlink_disable setting left
-                                   * on. Thus, every C_EVENT_UNLINK on PTE
-                                   * priority list is a cancel confirmation. */
-    le.no_truncate           = 0; /* allow truncated delivery so
-                                   * UCS_ERR_TRUNCATED can be reported,
-                                   * unlike AM which rejects outright */
-    le.restart_seq           = 0;
-    le.match_id              = CXI_MATCH_ID_ANY;
     le.buffer_id             = slot;
     le.lac                   = memh->cxi_md->lac;
     le.start                 = memh->iova_offset +
@@ -3182,7 +3178,7 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
     if (ucs_unlikely(ret != 0)) {
         iface->tag.ctx[slot] = NULL;
         iface->tag.free_list[iface->tag.free_count++] = slot;
-        ucs_error("cxi TAG priority LE APPEND slot %u: %d", slot, ret);
+        uct_cxi_tx_emit_error(NULL, "tag_recv_zcopy priority LE append", ret);
         return UCS_ERR_NO_RESOURCE;
     }
     cxi_cq_ring(iface->tgt.cmdq);
@@ -3215,7 +3211,7 @@ ucs_status_t uct_cxi_iface_tag_recv_cancel(uct_iface_h tl_iface,
 
     cmd.command.opcode = C_CMD_TGT_UNLINK;
     cmd.ptl_list       = C_PTL_LIST_PRIORITY;
-    cmd.ptlte_index    = iface->tag.pte->ptn;
+    cmd.ptlte_index    = iface->tag.ptn;
     cmd.buffer_id      = priv->slot;
 
     /* The UNLINK must not be lost to a full command queue: for force=1 the

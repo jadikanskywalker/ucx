@@ -499,6 +499,14 @@ typedef struct uct_cxi_iface {
      * for why this is a real overflow list, unlike the AM ring. */
     struct {
         struct cxil_pte     *pte;          /**< NULL until HW tag offload enabled */
+        int32_t              ptn;          /**< pte->ptn, or -1 while there is no
+                                                pte: what an event's ptlte_index is
+                                                compared with, without going
+                                                through pte */
+        struct c_target_cmd  recv_le;      /**< The priority-list entry every
+                                                posted receive is, but for the
+                                                buffer and the tag to match
+                                                (see tag_recv_zcopy) */
         struct cxil_pte_map *pte_map;
         int                  enabled;      /**< Opened this run: UCP supplied both
                                                 HW_TM callbacks and TAG_ENABLE!=no */
@@ -660,6 +668,8 @@ typedef struct uct_cxi_iface {
      * cxi_tag.c. */
     struct {
         struct cxil_pte      *pte;        /**< NULL until HW tag offload enabled */
+        int32_t               ptn;        /**< pte->ptn, or -1 while there is no
+                                               pte (see tag.ptn) */
         struct cxil_pte_map  *pte_map;
         int                   enabled;
 
@@ -770,11 +780,29 @@ static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
 
 BEGIN_C_DECLS
 
+/** Slow path of uct_cxi_tx_emit_error(). */
+void uct_cxi_tx_emit_failed(const void *obj, const char *what, int ret);
+
 /** Slow path of uct_cxi_iface_tgt_post(); \a ret is the failed emit's result. */
 ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
                                          const void *cmd, int ret);
 
 END_C_DECLS
+
+/**
+ * A command could not be written to the TX command queue (\a ret is what the
+ * emit returned) and the send is going back to its caller as
+ * UCS_ERR_NO_RESOURCE. A full queue (-ENOSPC) is the ordinary reason, a
+ * resource shortage like any other the caller retries from its pending queue,
+ * and says nothing; anything else is unexpected and is logged.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_tx_emit_error(const void *obj, const char *what, int ret)
+{
+    if (ucs_unlikely(ret != -ENOSPC)) {
+        uct_cxi_tx_emit_failed(obj, what, ret);
+    }
+}
 
 /**
  * Submit a 64-byte target command (struct c_target_cmd or struct
