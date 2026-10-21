@@ -41,6 +41,7 @@
 #include <ucs/datastruct/list.h>
 #include <ucs/datastruct/mpool.h>
 #include <ucs/time/time.h>
+#include <ucs/time/timer_wheel.h>
 
 #include <libcxi/libcxi.h>
 #include <cassini_user_defs.h>
@@ -62,7 +63,9 @@
 #define UCT_CXI_CTRL_SLOTS    16u
 
 /* Connection retry: a CREQ with no CREP yet is resent after this long,
- * doubling per attempt up to the cap. */
+ * doubling per attempt up to the cap. The retries are timers of a timer wheel
+ * (uct_cxi_fc_iface_t::twheel) whose resolution is this base delay, so every
+ * delay is at least one slot. */
 #define UCT_CXI_CTRL_RETRY_BASE_US  50
 #define UCT_CXI_CTRL_RETRY_MAX_US   50000
 
@@ -149,39 +152,35 @@ typedef struct uct_cxi_fc_rx {
     uint32_t  acked_units;
 } uct_cxi_fc_rx_t;
 
+
 struct uct_cxi_ep;
+struct uct_cxi_peer_conn;
 
 /**
  * One remote interface. Shared by all endpoints to it and kept for the life
  * of the local interface: the remote may keep sending after our last endpoint
  * to it is gone, so its record must outlive them (the same reasoning as
- * tag.rndv_peer_cache). Memory is proportional to the number of distinct
- * remote interfaces ever contacted, not to endpoints.
+ * tag.rndv_peer_cache). So its size is a cost of every connection, and holds
+ * only what is needed for as long as the peer is used: what the handshake
+ * needs lives in a uct_cxi_peer_conn_t, taken from a pool for as long as the
+ * handshake lasts, and the peer's NID and PID, and where its control PTE is,
+ * are worked out from \a key when a control message is sent.
  */
 typedef struct uct_cxi_peer {
     uint32_t          key;          /**< CXI_MATCH_ID(pid_bits, pid, nid) --
                                          the value hardware reports as an
                                          event's initiator */
-    uint32_t          nid;
-    uint32_t          pid;
     uint8_t           state;        /**< uct_cxi_peer_state_t */
-    union c_fab_addr  dfa_ctrl;     /**< the peer's control PTE */
-    uint8_t           dfa_ctrl_idx_ext;
-
-    /* Handshake in progress (state DOWN or CREQ_SENT) */
-    ucs_list_link_t   connecting;   /**< link in fc.connecting */
-    ucs_time_t        next_attempt; /**< when to (re)send the CREQ */
-    ucs_time_t        deadline;     /**< give up (FAILED) after this */
-    unsigned          attempts;
 
     /* Learned from the peer */
     uint32_t          remote_epoch; /**< CREP: the peer's epoch, low 24 bits */
-    uint32_t          msg_window;   /**< CREP: message credits granted to us */
-    uint32_t          unit_window;  /**< CREP: byte credits granted, in units */
     uint32_t          rx_epoch;     /**< CREQ: the peer's own epoch */
 
     uct_cxi_fc_tx_t   tx;           /**< what we may send to the peer */
     uct_cxi_fc_rx_t   rx;           /**< what we owe the peer */
+
+    /* Handshake in progress (state DOWN or CREQ_SENT), NULL otherwise */
+    struct uct_cxi_peer_conn *conn;
 
     /* Pure GRANT waiting to be sent (no ctrl slot or command queue room) */
     ucs_list_link_t   grants;       /**< link in fc.grants */
@@ -192,6 +191,19 @@ typedef struct uct_cxi_peer {
      * through uct_cxi_ep_t::next_blocked, so an ep costs one pointer. */
     struct uct_cxi_ep *blocked;
 } uct_cxi_peer_t;
+
+/**
+ * A peer's handshake while it lasts: from the first CREQ until the CREP (or
+ * a verdict of LEGACY or FAILED). The CREQ is resent on a timer until
+ * answered.
+ */
+typedef struct uct_cxi_peer_conn {
+    ucs_wtimer_t      timer;        /**< next CREQ (re)send, or the deadline */
+    struct uct_cxi_iface *iface;
+    uct_cxi_peer_t   *peer;
+    ucs_time_t        deadline;     /**< give up (FAILED) after this */
+    unsigned          attempts;
+} uct_cxi_peer_conn_t;
 
 KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
 
@@ -223,7 +235,10 @@ typedef struct uct_cxi_fc_iface {
     uint32_t          grant_units;  /**<   this many units: send a GRANT */
     ucs_time_t        connect_timeout;
     khash_t(uct_cxi_peer_hash) peers;
-    ucs_list_link_t   connecting;   /**< peers with a handshake in progress */
+    ucs_twheel_t      twheel;       /**< CREQ resends and handshake deadlines */
+    unsigned          num_connecting; /**< handshakes in progress: the wheel is
+                                         only swept while there are any */
+    ucs_mpool_t       conn_pool;    /**< uct_cxi_peer_conn_t */
     ucs_list_link_t   grants;       /**< peers with a GRANT still to send */
 
     /* One-entry cache for the receive path: the peer the last Active Message

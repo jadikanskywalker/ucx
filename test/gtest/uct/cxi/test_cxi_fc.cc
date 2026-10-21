@@ -89,9 +89,10 @@ UCS_TEST_P(test_cxi_fc, handshake_basic)
         return peer->state == UCT_CXI_PEER_UP;
     })) << "handshake did not complete, peer state " << (int)peer->state;
 
+    /* Nothing has been spent yet: what the target granted is what is left. */
     uct_cxi_iface_t *riface = cxi_iface(receiver());
-    EXPECT_EQ(riface->fc.msg_window, peer->msg_window);
-    EXPECT_EQ(riface->fc.unit_window, peer->unit_window);
+    EXPECT_EQ(riface->fc.msg_window, (uint32_t)peer->tx.avail_msgs);
+    EXPECT_EQ(riface->fc.unit_window, (uint32_t)peer->tx.avail_units);
     EXPECT_EQ(riface->fc.epoch & 0xffffff, peer->remote_epoch);
 
     /* The target knows the initiator, but has started nothing of its own. */
@@ -99,8 +100,9 @@ UCS_TEST_P(test_cxi_fc, handshake_basic)
     ASSERT_NE(nullptr, back) << "target never recorded the initiator";
     EXPECT_EQ(cxi_iface(sender())->fc.epoch, back->rx_epoch);
     EXPECT_EQ(UCT_CXI_PEER_DOWN, back->state);
-    EXPECT_TRUE(ucs_list_is_empty(&back->connecting));
-    EXPECT_TRUE(ucs_list_is_empty(&cxi_iface(sender())->fc.connecting));
+    EXPECT_EQ(nullptr, back->conn);
+    EXPECT_EQ(nullptr, peer->conn) << "the handshake's record outlived it";
+    EXPECT_EQ(0u, cxi_iface(sender())->fc.num_connecting);
 }
 
 /**
@@ -175,7 +177,80 @@ UCS_TEST_P(test_cxi_fc_legacy, peer_without_control_channel)
         return peer->state == UCT_CXI_PEER_LEGACY;
     })) << "peer state " << (int)peer->state << ", expected LEGACY ("
         << UCT_CXI_PEER_LEGACY << ")";
-    EXPECT_TRUE(ucs_list_is_empty(&cxi_iface(sender())->fc.connecting));
+    EXPECT_EQ(nullptr, peer->conn);
+    EXPECT_EQ(0u, cxi_iface(sender())->fc.num_connecting);
+}
+
+/**
+ * A CREQ that is not answered is sent again, on a timer, until it is. The
+ * target takes the CREQ but is not progressed, so it answers nothing: the
+ * initiator keeps resending (more than once in a few milliseconds, as the
+ * delay starts at 50 microseconds and doubles) and has a record of the
+ * handshake until the answer arrives, which then goes away with it.
+ */
+UCS_TEST_P(test_cxi_fc, handshake_resends_until_answered)
+{
+    sender().connect_to_iface(0, receiver());
+    uct_cxi_peer_t *peer = peer_of(sender(), 0);
+    ASSERT_NE(nullptr, peer);
+
+    /* Only the initiator is progressed. */
+    ucs_time_t until = ucs_get_time() + ucs_time_from_msec(20);
+    while (ucs_get_time() < until) {
+        uct_iface_progress(sender().iface());
+    }
+    ASSERT_NE(nullptr, peer->conn) << "the handshake ended without an answer";
+    EXPECT_EQ(UCT_CXI_PEER_CREQ_SENT, peer->state);
+    EXPECT_GE(peer->conn->attempts, 3u) << "the CREQ was not resent";
+    EXPECT_EQ(1u, cxi_iface(sender())->fc.num_connecting);
+
+    /* Now the target answers (the first of the CREQs it has waiting). */
+    ASSERT_TRUE(progress_until([&]() {
+        return peer->state == UCT_CXI_PEER_UP;
+    })) << "no handshake after the target was progressed, state "
+        << (int)peer->state;
+    EXPECT_EQ(nullptr, peer->conn);
+    EXPECT_EQ(0u, cxi_iface(sender())->fc.num_connecting);
+}
+
+/**
+ * A handshake that is never answered is given up on at its deadline: the peer
+ * is FAILED, sends to it fail instead of waiting, and its record is gone.
+ */
+class test_cxi_fc_timeout : public test_cxi_fc {
+public:
+    void init() override
+    {
+        modify_config("CXI_FC_CONNECT_TIMEOUT", "0.2");
+        test_cxi_rma_base::init();
+    }
+};
+
+UCS_TEST_P(test_cxi_fc_timeout, unanswered_handshake_fails)
+{
+    sender().connect_to_iface(0, receiver());
+    uct_cxi_peer_t *peer = peer_of(sender(), 0);
+    ASSERT_NE(nullptr, peer);
+
+    /* The target is never progressed. Giving up is reported with a warning. */
+    {
+        scoped_log_handler wrap_warn(wrap_warns_logger);
+        ucs_time_t         until = ucs_get_time() + ucs_time_from_sec(1.0);
+
+        while ((peer->state != UCT_CXI_PEER_FAILED) &&
+               (ucs_get_time() < until)) {
+            uct_iface_progress(sender().iface());
+        }
+    }
+
+    EXPECT_EQ(UCT_CXI_PEER_FAILED, peer->state);
+    EXPECT_EQ(nullptr, peer->conn);
+    EXPECT_EQ(0u, cxi_iface(sender())->fc.num_connecting);
+
+    uint64_t payload = 0;
+    EXPECT_EQ(UCS_ERR_ENDPOINT_TIMEOUT,
+              uct_ep_am_short(sender().ep(0), 1, 0, &payload,
+                              sizeof(payload)));
 }
 
 /**
@@ -653,6 +728,7 @@ _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_bytes, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_piggyback, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_ring, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_timeout, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_legacy, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_off, cxi)
 

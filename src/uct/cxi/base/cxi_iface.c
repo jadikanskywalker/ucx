@@ -2476,7 +2476,7 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 #ifndef UCT_CXI_DISABLE_FC
     /* Resend handshake requests that have gone unanswered, and credit grants
      * that found no control slot. */
-    if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.connecting) ||
+    if (ucs_unlikely((iface->fc.num_connecting != 0) ||
                      !ucs_list_is_empty(&iface->fc.grants))) {
         uct_cxi_fc_progress(iface);
     }
