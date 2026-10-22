@@ -286,7 +286,7 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
                                                        (size_t)buf_idx *
                                                        self->tag.buf_size);
     le.length                 = self->tag.buf_size;
-    le.min_free               = UCT_CXI_TAG_OVF_MIN_FREE;
+    le.min_free               = self->tag.max_msg;
     le.ignore_bits            = UINT64_MAX;
     le.match_bits             = 0;
 
@@ -302,6 +302,20 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
     return UCS_OK;
 }
 
+int uct_cxi_iface_tag_requested(const uct_cxi_iface_config_t *config,
+                                const uct_iface_params_t *params)
+{
+    return (config->tag_enable != UCS_NO) &&
+           ucs_test_all_flags(params->field_mask,
+                              UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB |
+                              UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB);
+}
+
+size_t uct_cxi_tag_max_msg(const uct_cxi_iface_config_t *config)
+{
+    return ucs_min(config->tag_eager_max, (size_t)UCT_CXI_AM_MAX_MSG_LIMIT);
+}
+
 ucs_status_t
 uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                            const uct_cxi_iface_config_t *config,
@@ -315,10 +329,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     memset(&self->tag, 0, sizeof(self->tag));
     self->tag.ptn = -1;
 
-    if ((config->tag_enable == UCS_NO) ||
-        !ucs_test_all_flags(params->field_mask,
-                            UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB |
-                            UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB)) {
+    if (!uct_cxi_iface_tag_requested(config, params)) {
         /* UCP didn't request HW tag offload (didn't supply both unexpected
          * callbacks), or the operator forced it off -- tag.pte stays NULL,
          * iface_query never advertises the TAG capability flags, and UCP
@@ -340,8 +351,19 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                                         UCT_CXI_TAG_OVF_NUM_BUFS_MAX);
     self->tag.max_outstanding = ucs_min(config->tag_max_outstanding,
                                         UCT_CXI_TAG_MAX_OUTSTANDING_MAX);
-    self->tag.buf_size        = ucs_max(config->tag_ovf_buf_size,
-                                        config->tag_eager_max);
+
+    /* A message always fits what is left of the buffer it matched if that is
+     * at least the LE's min_free, which is the largest message; and a buffer
+     * of twice that holds at least one message before it is retired, as for
+     * the AM ring. */
+    self->tag.max_msg = uct_cxi_tag_max_msg(config);
+    if (self->tag.max_msg < config->tag_eager_max) {
+        ucs_warn("cxi TAG_EAGER_MAX=%zu exceeds the %u bytes that min_free can "
+                 "express: limiting the eager size to it",
+                 config->tag_eager_max, UCT_CXI_AM_MAX_MSG_LIMIT);
+    }
+    self->tag.buf_size = ucs_max(config->tag_ovf_buf_size,
+                                 2 * self->tag.max_msg);
 
     /* Outstanding priority-LE tracking. */
     self->tag.ctx = ucs_calloc(self->tag.max_outstanding,
@@ -504,8 +526,9 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
 
     self->tag.enabled = 1;
     ucs_debug("cxi TAG PTE ptn %u enabled: %u overflow bufs x %zu bytes, "
-             "max_outstanding=%u", self->tag.pte->ptn, self->tag.num_bufs,
-             self->tag.buf_size, self->tag.max_outstanding);
+             "min_free %zu, max_outstanding=%u", self->tag.pte->ptn,
+             self->tag.num_bufs, self->tag.buf_size, self->tag.max_msg,
+             self->tag.max_outstanding);
     return UCS_OK;
 
 err_unmap_pte:
@@ -935,6 +958,50 @@ uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
 }
 
 /*
+ * uct_cxi_tag_credit_return -- the credits \a initiator was charged for a
+ * message that went to the overflow list, which the target tracks, are ours
+ * to give back now that we are done with it: \a slots event slots and the
+ * buffer space of its \a length bytes (as sent: a receive posted too small
+ * for it takes fewer, but its sender was charged them all). A sender without flow control has no
+ * record and was charged nothing. (A message that matched a posted receive is
+ * never tracked: its sender takes the charge back when its ACK says so.)
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_tag_credit_return(uct_cxi_iface_t *iface, uint32_t initiator,
+                          unsigned slots, uint32_t length)
+{
+#ifndef UCT_CXI_DISABLE_FC
+    uct_cxi_peer_t *peer;
+
+    if (ucs_likely(iface->fc.enabled)) {
+        peer = uct_cxi_fc_rx_peer(iface, initiator);
+        if (peer != NULL) {
+            uct_cxi_fc_rx_done(iface, peer, UCT_CXI_FC_TAG, slots, length);
+        }
+    }
+#endif
+}
+
+/*
+ * uct_cxi_tag_ovf_done -- an unexpected eager message is done with: the
+ * reference it holds on its overflow buffer generation is released (\a
+ * buf_idx, or -1 for a message with no data there), and its sender's credits
+ * given back. They go together because they end together: the message is out
+ * of the NIC's unexpected list and its data has been copied out or given up
+ * on. The release comes first, so that the credit is never back before the
+ * buffer can be reused.
+ */
+static void uct_cxi_tag_ovf_done(uct_cxi_iface_t *iface, int buf_idx,
+                                 uint32_t initiator, uint32_t length)
+{
+    if (buf_idx >= 0) {
+        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+    }
+    uct_cxi_tag_credit_return(iface, initiator, UCT_CXI_FC_SLOTS_TAG_EAGER,
+                              length);
+}
+
+/*
  * uct_cxi_iface_tag_report_unexp_eager -- report an unexpected eager message
  * to UCP: the work of uct_cxi_iface_tag_handle_search_delete_confirm_eager()
  * (below), done at once or, if the message has to wait behind an unexpected
@@ -976,13 +1043,15 @@ uct_cxi_iface_tag_ovf_release(uct_cxi_iface_t *iface, int buf_idx)
  * arrival (real hardware search-on-append can never also independently
  * claim an entry our own use_once=1 SEARCH_AND_DELETE already found and
  * deleted), so this is also where the arrival's own overflow-buffer
- * reference is released.
+ * reference is released and its sender's credits are given back.
  */
 static void
 uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
                                      const union c_event *event)
 {
     uint32_t len      = event->tgt_long.mlength;
+    uint32_t initiator = event->tgt_long.initiator.initiator.process;
+    uint32_t sent_len  = event->tgt_long.rlength;
     /* From where the message sits, not from the command's buffer_id: the
      * SEARCH_AND_DELETE took the oldest entry with this tag, which need not
      * be the arrival it was posted for, and the reference to release is
@@ -1000,7 +1069,9 @@ uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
          * this buf_idx otherwise. Guarded on len>0 like every other release
          * here -- a reference was only ever taken for this arrival if its
          * own mlength was >0 (see ovf_refcnt's doc comment in cxi_iface.h),
-         * and len is that same mlength. */
+         * and len is that same mlength. No credits go back: if no message was
+         * in fact taken off the list, the one still there will be, and give
+         * them back then. */
         ucs_error("cxi TAG [SEARCH-DELETE-UNEXPECTED-RC] tag=0x%lx rc=%d "
                  "buf_idx=%d -- C_EVENT_PUT_OVERFLOW with use_once=1 "
                  "reported a non-OK rc, which real-hardware testing never "
@@ -1035,9 +1106,8 @@ uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
                               len, UCT_CB_PARAM_FLAG_FIRST, tag, imm,
                               &context);
 
-    if (len > 0) {
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
-    }
+    /* Copied out by eager_cb: the sender's credits are free to go back. */
+    uct_cxi_tag_ovf_done(iface, buf_idx, initiator, sent_len);
 }
 
 /* -------------------------------------------------------------------------
@@ -1189,10 +1259,23 @@ static void uct_cxi_unexp_unlink(uct_cxi_iface_t *iface,
     }
 }
 
-/* Give back an entry that is off its chain. */
+/*
+ * Give back an entry that is off its chain. For a rendezvous that has arrived
+ * this is where the sender's credits go back: every event the message leaves
+ * in the receive event queue has been handled by now (its arrival, the outcome
+ * of the search for it, the completion of the read of its source address, which
+ * for a message a receive took is the last to come), and it holds no more of
+ * the table. All the ways of leaving the table end here, so the credits go
+ * back once.
+ */
 static void uct_cxi_unexp_free(uct_cxi_iface_t *iface,
                                uct_cxi_unexp_report_t *e)
 {
+    if (e->is_rndv && (e->flags & UCT_CXI_UNEXP_ARRIVED)) {
+        uct_cxi_tag_credit_return(iface, e->initiator,
+                                  UCT_CXI_FC_SLOTS_TAG_RNDV, 0);
+    }
+
     e->next_free          = iface->tag.unexp_free;
     iface->tag.unexp_free = e;
 }
@@ -1542,6 +1625,11 @@ static void uct_cxi_unexp_rndv_arrived(uct_cxi_iface_t *iface,
                       "rendezvous, tag=0x%lx initiator=0x%x",
                       (unsigned long)event->tgt_long.match_bits,
                       (unsigned)event->tgt_long.initiator.initiator.process);
+            /* Nothing will ever free an entry for it: its credits go back
+             * now. */
+            uct_cxi_tag_credit_return(
+                    iface, event->tgt_long.initiator.initiator.process,
+                    UCT_CXI_FC_SLOTS_TAG_RNDV, 0);
             return;
         }
         uct_cxi_unexp_start(iface, e);
@@ -1558,7 +1646,7 @@ static void uct_cxi_unexp_rndv_arrived(uct_cxi_iface_t *iface,
 
 /* The rendezvous \a event is about was found and deleted by our own
  * SEARCH_AND_DELETE: it is ours to report. */
-static void uct_cxi_unexp_rndv_owned(uct_cxi_iface_t *iface,
+static UCS_F_ALWAYS_INLINE void uct_cxi_unexp_rndv_owned(uct_cxi_iface_t *iface,
                                      const union c_event *event)
 {
     uct_cxi_unexp_stream_t *stream =
@@ -1869,6 +1957,34 @@ uct_cxi_iface_tag_handle_search_delete_confirm_rndv(uct_cxi_iface_t *iface,
 }
 
 /*
+ * uct_cxi_iface_tag_ovf_failed -- a Put the NIC could not place in an overflow
+ * buffer. Rare, kept out of line. The event reports the failure and carries
+ * no message: there is nothing to look for or to hand on, no data to protect,
+ * and nothing to give back (the sender is told of the failure in its own ACK,
+ * and takes its credits back itself). The usual cause is a message longer than
+ * what is left of the buffer it matched, which is not tried against the next
+ * one; the buffers' min_free is the largest message to prevent that.
+ */
+static UCS_F_NOINLINE void
+uct_cxi_iface_tag_ovf_failed(uct_cxi_iface_t *iface, const union c_event *event)
+{
+    int buf_idx = (int)event->tgt_long.buffer_id;
+
+    ucs_error("cxi TAG overflow Put failed: rc=%d buf=%d tag=0x%lx "
+              "rlength=%u mlength=%u, message dropped",
+              (int)cxi_event_rc(event), buf_idx,
+              (unsigned long)event->tgt_long.match_bits,
+              (unsigned)event->tgt_long.rlength,
+              (unsigned)event->tgt_long.mlength);
+
+    /* The buffer's fate does not depend on how this Put went. */
+    if (ucs_unlikely(event->tgt_long.auto_unlinked)) {
+        iface->tag.ovf_repost_pending[buf_idx] = 1;
+        uct_cxi_iface_tag_ovf_maybe_repost(iface, buf_idx);
+    }
+}
+
+/*
  * uct_cxi_iface_tag_handle_ovf_arrival -- an unexpected message landed in
  * the overflow ring (C_EVENT_PUT, ptl_list==C_PTL_LIST_OVERFLOW). Takes a
  * reference on the buffer generation when mlength>0 (see cxi_iface.h's
@@ -1893,6 +2009,11 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     uint64_t seq      = iface->tag.unexp_seq++; /* the order of arrivals */
     struct c_target_cmd sd = {};
     ucs_status_t status;
+
+    if (ucs_unlikely(cxi_event_rc(event) != C_RC_OK)) {
+        uct_cxi_iface_tag_ovf_failed(iface, event);
+        return;
+    }
 
     if (event->tgt_long.mlength > 0) {
         iface->tag.ovf_refcnt[buf_idx]++;
@@ -1969,20 +2090,16 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
     /* uct_cxi_iface_tgt_post() waits out a full target command queue. There
      * is no safe way to confirm exclusive ownership of this message without
      * the SEARCH_AND_DELETE landing, so only if the queue stays wedged for
-     * the whole timeout is the message dropped rather than handed off
-     * racily. */
+     * the whole timeout is the message not handed off at all. It is then
+     * still in the NIC's unexpected list: whatever claims it later (a receive
+     * posted for its tag) finds it there and ends it as for any other, so its
+     * buffer reference and its sender's credits are left for that, and
+     * nothing is released or given back here. */
     status = uct_cxi_iface_tgt_post(iface, &sd);
     if (ucs_unlikely(UCS_STATUS_IS_ERR(status))) {
-        ucs_error("cxi TAG SEARCH_AND_DELETE post failed: %s -- dropping "
-                 "unexpected message tag=0x%lx", ucs_status_string(status),
-                 (unsigned long)tag);
-        if (event->tgt_long.mlength > 0) {
-            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
-        }
-        if (event->tgt_long.rendezvous) {
-            uct_cxi_unexp_rndv_lost(iface, event);
-        }
-        return;
+        ucs_error("cxi TAG SEARCH_AND_DELETE post failed: %s -- unexpected "
+                  "message tag=0x%lx is not reported unless a receive claims "
+                  "it", ucs_status_string(status), (unsigned long)tag);
     }
 
     if (event->tgt_long.rendezvous) {
@@ -2210,8 +2327,22 @@ static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
     ucs_status_t             status;
     int                      buf_idx;
 
+    int                      delayed = (event->hdr.event_type ==
+                                        C_EVENT_PUT_OVERFLOW);
+    uint32_t                 initiator = event->tgt_long.initiator.initiator.
+                                         process;
+    uint32_t                 sent_len  = event->tgt_long.rlength;
+
     ctx = uct_cxi_iface_tag_match_lookup(iface, event, &slot);
     if (ctx == NULL) {
+        /* The receive is gone, but the message it matched is still ours to be
+         * done with. */
+        if (delayed) {
+            buf_idx = (event->tgt_long.mlength > 0) ?
+                      uct_cxi_iface_tag_ovf_buf_idx(iface,
+                                                    event->tgt_long.start) : -1;
+            uct_cxi_tag_ovf_done(iface, buf_idx, initiator, sent_len);
+        }
         return;
     }
 
@@ -2220,16 +2351,17 @@ static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
 
     if (ucs_unlikely(iface->tag.cancel_ctx[slot].force)) {
         iface->tag.cancel_ctx[slot].force = 0;
-        if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
-            (event->tgt_long.mlength > 0)) {
+        if (delayed) {
             /* Force-cancelled: the normal path below (which would
-             * otherwise do this release after its copy) never runs, but
-             * the reference taken at arrival still needs releasing or this
-             * buffer generation can never repost. No copy needed -- ctx is
-             * never read on this branch. */
-            buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface,
-                                                    event->tgt_long.start);
-            uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+             * otherwise do this after its copy) never runs, but the
+             * reference taken at arrival still needs releasing or this
+             * buffer generation can never repost, and the sender's credits
+             * are due back all the same. No copy needed -- ctx is never read
+             * on this branch. */
+            buf_idx = (event->tgt_long.mlength > 0) ?
+                      uct_cxi_iface_tag_ovf_buf_idx(iface,
+                                                    event->tgt_long.start) : -1;
+            uct_cxi_tag_ovf_done(iface, buf_idx, initiator, sent_len);
         }
         ucs_debug("cxi TAG [MATCH-RACED-CANCEL] slot=%d -- force-cancelled, "
                  "dropping match silently", slot);
@@ -2244,21 +2376,25 @@ static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
              slot, (unsigned long)event->tgt_long.match_bits,
              (unsigned)event->tgt_long.mlength);
 
-    if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
-        (event->tgt_long.mlength > 0)) {
-        /* Delayed match: copy out of the overflow buffer, then release --
-         * see this function's own doc comment and uct_cxi_iface_tag_ovf_
-         * release()'s. Gated on mlength>0 like the arrival side's own
-         * increment (cxi_iface.h's ovf_refcnt doc comment): an mlength==0
-         * delayed match never took a reference to begin with. */
-        void *data;
+    if (delayed) {
+        /* Delayed match: copy out of the overflow buffer, then release it and
+         * give the sender's credits back -- see this function's own doc
+         * comment and uct_cxi_tag_ovf_done(). The buffer is gated on
+         * mlength>0 like the arrival side's own increment (cxi_iface.h's
+         * ovf_refcnt doc comment): an mlength==0 delayed match never took a
+         * reference to begin with. */
+        buf_idx = -1;
+        if (event->tgt_long.mlength > 0) {
+            void *data;
 
-        buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface, event->tgt_long.start);
-        data    = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
-                                             event->tgt_long.start);
-        memcpy((void *)(uintptr_t)priv->recv_addr, data,
-              event->tgt_long.mlength);
-        uct_cxi_iface_tag_ovf_release(iface, buf_idx);
+            buf_idx = uct_cxi_iface_tag_ovf_buf_idx(iface,
+                                                    event->tgt_long.start);
+            data    = uct_cxi_iface_tag_ovf_data(iface, buf_idx,
+                                                 event->tgt_long.start);
+            memcpy((void *)(uintptr_t)priv->recv_addr, data,
+                   event->tgt_long.mlength);
+        }
+        uct_cxi_tag_ovf_done(iface, buf_idx, initiator, sent_len);
     }
 
     stag    = event->tgt_long.match_bits;
@@ -2698,7 +2834,9 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
 {
     uct_cxi_ep_t    *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t *iface = uct_cxi_tag_ep_iface(ep);
+    unsigned         units = UCT_CXI_FC_UNITS(length);
     ucs_status_t     status;
+    int              credited;
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, "tag_eager_short");
 
@@ -2706,12 +2844,21 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_ERR_NO_RESOURCE;
     }
 
-    status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_tag, ep->dfa_tag_idx_ext,
-                                 tag, data, length, 0, 0 /* tag credits: later */,
-                                 "tag_eager_short");
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG,
+                                UCT_CXI_FC_SLOTS_TAG_EAGER, units, &credited);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
+
+    status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_tag, ep->dfa_tag_idx_ext,
+                                 tag, data, length, UCT_CXI_FC_TAG, units,
+                                 credited, "tag_eager_short");
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
+    }
+
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_TAG, UCT_CXI_FC_SLOTS_TAG_EAGER,
+                     units);
 
     ucs_debug("cxi TAG [SEND-SHORT] ep=%p tag=0x%lx len=%zu", ep,
              (unsigned long)tag, length);
@@ -2730,10 +2877,22 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     uct_cxi_iface_t      *iface = uct_cxi_tag_ep_iface(ep);
     uct_cxi_send_desc_t  *desc;
     size_t                length;
+    unsigned              units;
+    ucs_status_t          status;
+    int                   credited;
     int                   ret;
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
+    }
+
+    /* As for an Active Message: the length is only known once it is packed,
+     * which must happen once, so ask for one unit now and charge the real
+     * cost afterwards. */
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG,
+                                UCT_CXI_FC_SLOTS_TAG_EAGER, 1, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return (ssize_t)status;
     }
 
     desc = ucs_mpool_get(&iface->tx.desc_pool);
@@ -2743,6 +2902,9 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     }
 
     length = pack_cb(desc + 1, arg);
+    ucs_assertv(length <= iface->tag.max_msg, "length=%zu max_msg=%zu", length,
+                iface->tag.max_msg);
+    units  = UCT_CXI_FC_UNITS(length);
 
     desc->op.ep      = ep;
     desc->op.comp    = NULL;
@@ -2777,6 +2939,10 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_TAG, UCT_CXI_FC_SLOTS_TAG_EAGER,
+                     units);
+    uct_cxi_op_fc_set(&desc->op, credited, UCT_CXI_FC_TAG,
+                      UCT_CXI_FC_SLOTS_TAG_EAGER, units);
     ucs_debug("cxi TAG [SEND-BCOPY] ep=%p tag=0x%lx imm=0x%lx len=%zu", ep,
              (unsigned long)tag, (unsigned long)imm, length);
     return (ssize_t)length;
@@ -2795,13 +2961,23 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     uct_cxi_iface_t      *iface  = uct_cxi_tag_ep_iface(ep);
     uct_cxi_mem_handle_t *memh   = (uct_cxi_mem_handle_t *)iov[0].memh;
     size_t                length = uct_iov_get_length(iov);
+    unsigned              units  = UCT_CXI_FC_UNITS(length);
     uct_cxi_send_op_t    *op;
+    ucs_status_t          status;
+    int                   credited;
     int                   ret;
 
     UCT_CHECK_IOV_SIZE(iovcnt, 1ul, "tag_eager_zcopy");
+    UCT_CHECK_LENGTH(length, 0, iface->tag.max_msg, "tag_eager_zcopy");
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
+    }
+
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG,
+                                UCT_CXI_FC_SLOTS_TAG_EAGER, units, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return status;
     }
 
     op = ucs_mpool_get(&iface->tx.op_pool);
@@ -2842,6 +3018,10 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_TAG, UCT_CXI_FC_SLOTS_TAG_EAGER,
+                     units);
+    uct_cxi_op_fc_set(op, credited, UCT_CXI_FC_TAG, UCT_CXI_FC_SLOTS_TAG_EAGER,
+                      units);
     ucs_debug("cxi TAG [SEND-ZCOPY] ep=%p tag=0x%lx imm=0x%lx len=%zu", ep,
              (unsigned long)tag, (unsigned long)imm, length);
     return UCS_INPROGRESS;
@@ -2945,6 +3125,8 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     uint32_t              id;
     uct_cxi_rdzv_op_t    *rop;
     uint64_t              header_data;
+    ucs_status_t          status;
+    int                   credited;
     int                   ret;
 
     if (ucs_unlikely(iovcnt != 1ul)) {
@@ -2964,13 +3146,21 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     header_data = hdr_w->req_id;
 
     if (ucs_unlikely(!ep->rndv_hdr_announced)) {
-        ucs_status_t status = uct_cxi_ep_send_rndv_hdr_announce(
-                ep, hdr_w->ep_id, hdr_w->md_index);
+        status = uct_cxi_ep_send_rndv_hdr_announce(ep, hdr_w->ep_id,
+                                                   hdr_w->md_index);
         if (ucs_unlikely(status != UCS_OK)) {
             return UCS_STATUS_PTR(status); /* no id consumed yet -- caller
                                              * (UCP) will retry this send */
         }
         ep->rndv_hdr_announced = 1;
+    }
+
+    /* After the announce, which takes an event slot of its own. No buffer
+     * space: a rendezvous message carries none of the data. */
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG,
+                                UCT_CXI_FC_SLOTS_TAG_RNDV, 0, &credited);
+    if (ucs_unlikely(status != UCS_OK)) {
+        return UCS_STATUS_PTR(status);
     }
 
     if (ucs_unlikely(iface->rdzv.free_count == 0)) {
@@ -3037,6 +3227,10 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_TAG, UCT_CXI_FC_SLOTS_TAG_RNDV,
+                     0);
+    uct_cxi_op_fc_set(&rop->op, credited, UCT_CXI_FC_TAG,
+                      UCT_CXI_FC_SLOTS_TAG_RNDV, 0);
     ucs_debug("cxi TAG [RNDV-SEND] ep=%p tag=0x%lx id=%u local_addr=0x%lx "
              "len=%zu", ep, (unsigned long)tag, id,
              (unsigned long)local_addr, length);

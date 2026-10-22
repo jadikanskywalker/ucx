@@ -13,9 +13,9 @@
  * TAG_OVERFLOW_NUM_BUFS is shrunk to 1 (so every arrival in these tests
  * lands in the same, easily-identified ring slot, buf_idx 0) and
  * TAG_OVERFLOW_BUF_SIZE/TAG_EAGER_MAX to a small fixed value (so crossing
- * the fixed UCT_CXI_TAG_OVF_MIN_FREE == 256 B auto-unlink margin is
- * reachable with a couple of small sends instead of needing kilobytes of
- * traffic against the default 512k buffer) via modify_config(), matching
+ * the auto-unlink margin, min_free == TAG_EAGER_MAX, is reachable with a
+ * couple of small sends instead of needing megabytes of traffic against the
+ * default buffers) via modify_config(), matching
  * test_cxi_pending's own precedent for shrinking a CXI-specific config value
  * ahead of entity creation.
  */
@@ -93,7 +93,7 @@ protected:
     {
         modify_config("CXI_TAG_OVERFLOW_NUM_BUFS", "1");
         modify_config("CXI_TAG_OVERFLOW_BUF_SIZE", "1024");
-        modify_config("CXI_TAG_EAGER_MAX", "1024");
+        modify_config("CXI_TAG_EAGER_MAX", "512");
 
         /* Deliberately not calling test_cxi_rma_base::init() -- it uses the
          * no-arg create_entity(), which substitutes a dummy eager_cb we
@@ -146,7 +146,7 @@ protected:
 /*
  * Fills the single overflow ring buffer with two unexpected messages back
  * to back, before the receiver's software ever looks at the EQ -- the
- * second one crosses UCT_CXI_TAG_OVF_MIN_FREE and triggers auto_unlinked on
+ * second one crosses min_free (TAG_EAGER_MAX) and triggers auto_unlinked on
  * its own arrival event. Confirms the ref-counting design: the generation
  * must not be reposted (and its memory made eligible for reuse) until BOTH
  * messages have actually been resolved via their own SEARCH_AND_DELETE
@@ -160,7 +160,7 @@ UCS_TEST_P(test_cxi_tag_ovf, no_premature_repost)
     static const uct_tag_t TAG_C  = 0xC000000000000003ULL;
     static const size_t    LEN_A  = 300;
     static const size_t    LEN_B  = 500; /* 300+500=800; buf_size(1024)-800
-                                           * =224 < MIN_FREE(256) -- triggers
+                                           * =224 < min_free(512) -- triggers
                                            * auto_unlinked on B's own Put. */
     static const size_t    LEN_C  = 64;
     static const uint8_t   FILL_A = 0xAA;
@@ -737,3 +737,296 @@ UCS_TEST_P(test_cxi_tag_ovf, tgt_post_waits_for_full_cmdq)
 }
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_ovf, cxi)
+
+#ifndef UCT_CXI_DISABLE_FC
+
+/**
+ * test_cxi_tag_ack -- which list a tag message matched, as the sender and as
+ * the target see it.
+ *
+ * Tag flow control charges every message when it is sent, and what happens to
+ * the charge depends on the list the message matched: a message that matched a
+ * posted receive (priority list) is not tracked by the target, and the sender
+ * takes its credits back when the message's ACK says so; one that went to the
+ * overflow list is tracked by the target, which gives the credits back when
+ * it is done with the message. That only works if the ACK's ptl_list and the
+ * target's arrival event's ptl_list are always the same, for every way a tag
+ * message is sent. These tests check that on the hardware.
+ *
+ * Nothing here calls uct_iface_progress() while a message is in flight: the
+ * sender's TX queue and the receiver's RX queue are read directly, so the
+ * events are what the NIC produced and not what our dispatch made of them.
+ * What the dispatch would have done at the sender (given back the pooled
+ * descriptor, counted the send complete) is done by hand afterwards, so that
+ * the interfaces close cleanly.
+ */
+class test_cxi_tag_ack : public test_cxi_tag_ovf {
+protected:
+    enum send_kind {
+        SEND_SHORT,
+        SEND_BCOPY,
+        SEND_ZCOPY,
+        SEND_RNDV
+    };
+
+    static const size_t PAY_LEN  = 32;
+    static const size_t RNDV_LEN = 4096;
+
+    struct ack_rec {
+        uint64_t user_ptr;
+        int      rc;
+        int      ptl_list;
+        int      rendezvous;
+        unsigned mlength;
+    };
+
+    unsigned m_case;
+
+    void init() override
+    {
+        m_case = 0;
+        test_cxi_tag_ovf::init();
+        check_caps_skip(UCT_IFACE_FLAG_TAG_RNDV_ZCOPY);
+    }
+
+    /** Let the handshake's own traffic (and its ACKs) go through the normal
+     * dispatch before the raw queue reading starts. */
+    void settle()
+    {
+        ucs_time_t end = ucs_get_time() + ucs_time_from_sec(0.2);
+
+        while (ucs_get_time() < end) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+    }
+
+    static const char *kind_name(send_kind kind)
+    {
+        static const char *names[] = {"eager_short", "eager_bcopy",
+                                      "eager_zcopy", "rndv_zcopy"};
+        return names[kind];
+    }
+
+    void run_case(send_kind kind, bool receive_posted)
+    {
+        uct_cxi_iface_t *siface = cxi_iface(sender());
+        uct_cxi_iface_t *riface = cxi_iface(receiver());
+        uct_ep_h         uep    = sender().ep(0);
+        uct_cxi_ep_t    *ep     = ucs_derived_of(uep, uct_cxi_ep_t);
+        uct_tag_t        tag    = 0xAC00000000000000ULL + m_case++;
+        size_t           len    = (kind == SEND_RNDV) ? RNDV_LEN : PAY_LEN;
+        std::vector<uint8_t> rx_buf(len, 0);
+        std::vector<uint8_t> tx_buf(len, 0x5A);
+        uct_mem_h            rx_memh = UCT_MEM_HANDLE_NULL;
+        uct_mem_h            tx_memh = UCT_MEM_HANDLE_NULL;
+        uct_cxi_tag_recv_ctx rctx;
+        uct_completion_t     comp;
+        uct_iov_t            siov, riov;
+        void                *rop = NULL;
+
+        memset(&rctx, 0, sizeof(rctx));
+        comp.func   = [](uct_completion_t *) {};
+        comp.count  = 1;
+        comp.status = UCS_OK;
+
+        if (receive_posted) {
+            rx_memh     = reg(receiver(), rx_buf.data(), len);
+            riov.buffer = rx_buf.data();
+            riov.length = len;
+            riov.memh   = rx_memh;
+            riov.stride = 0;
+            riov.count  = 1;
+            ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
+                                                   UCS_MASK(64), &riov, 1,
+                                                   &rctx.super));
+            usleep(100000); /* the priority entry is in place */
+        }
+
+        if ((kind == SEND_ZCOPY) || (kind == SEND_RNDV)) {
+            tx_memh     = reg(sender(), tx_buf.data(), len);
+            siov.buffer = tx_buf.data();
+            siov.length = len;
+            siov.memh   = tx_memh;
+            siov.stride = 0;
+            siov.count  = 1;
+        }
+
+        switch (kind) {
+        case SEND_SHORT:
+            ASSERT_UCS_OK(uct_ep_tag_eager_short(uep, tag, tx_buf.data(),
+                                                 len));
+            break;
+        case SEND_BCOPY: {
+            auto pack = [](void *dst, void *arg) -> size_t {
+                size_t n = *static_cast<size_t *>(arg);
+                memset(dst, 0x5A, n);
+                return n;
+            };
+            ASSERT_EQ(static_cast<ssize_t>(len),
+                      uct_ep_tag_eager_bcopy(uep, tag, 0, +pack, &len, 0));
+            break;
+        }
+        case SEND_ZCOPY: {
+            ucs_status_t status = uct_ep_tag_eager_zcopy(uep, tag, 0, &siov, 1,
+                                                         0, &comp);
+            ASSERT_TRUE((status == UCS_OK) || (status == UCS_INPROGRESS))
+                    << ucs_status_string(status);
+            break;
+        }
+        case SEND_RNDV: {
+            uct_cxi_rndv_hdr_wire_t hdr;
+            hdr.ep_id    = 0x1111111111111111ULL;
+            hdr.req_id   = tag;
+            hdr.md_index = 1;
+            ucs_status_ptr_t sp = uct_ep_tag_rndv_zcopy(uep, tag, &hdr,
+                                                        sizeof(hdr), &siov, 1,
+                                                        0, &comp);
+            ASSERT_FALSE(UCS_PTR_IS_ERR(sp)) << ucs_status_string(
+                    UCS_PTR_STATUS(sp));
+            rop = sp;
+            break;
+        }
+        }
+
+        /* The first send on an endpoint of a rendezvous also sends the
+         * announce, which has an ACK of its own. */
+        size_t                want_acks = (kind == SEND_RNDV) ? 2 : 1;
+        std::vector<ack_rec>  acks;
+        bool                  put_seen = false;
+        ack_rec               put      = {};
+        ucs_time_t            deadline = ucs_get_time() + ucs_time_from_sec(3.0);
+
+        while (((acks.size() < want_acks) || !put_seen) &&
+               (ucs_get_time() < deadline)) {
+            const union c_event *ev;
+
+            while ((ev = cxi_eq_get_event(siface->tx_eq.evtq)) != NULL) {
+                if (ev->hdr.event_type == C_EVENT_ACK) {
+                    ack_rec a;
+                    a.user_ptr   = ev->init_short.user_ptr;
+                    a.rc         = cxi_event_rc(ev);
+                    a.ptl_list   = ev->init_short.ptl_list;
+                    a.rendezvous = ev->init_short.rendezvous;
+                    a.mlength    = ev->init_short.mlength;
+                    acks.push_back(a);
+                }
+            }
+            cxi_eq_ack_events(siface->tx_eq.evtq);
+
+            while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
+                if (!put_seen && (ev->hdr.event_type == C_EVENT_PUT) &&
+                    (ev->tgt_long.ptlte_index ==
+                     static_cast<unsigned>(riface->tag.ptn))) {
+                    put.rc         = cxi_event_rc(ev);
+                    put.ptl_list   = ev->tgt_long.ptl_list;
+                    put.rendezvous = ev->tgt_long.rendezvous;
+                    put.mlength    = ev->tgt_long.mlength;
+                    put_seen       = true;
+                }
+            }
+            cxi_eq_ack_events(riface->rx_eq.evtq);
+        }
+
+        /* The ACK of the message itself: the only one, or for a rendezvous
+         * the one whose user_ptr is the rendezvous operation. */
+        const ack_rec *mine = NULL;
+        for (size_t i = 0; i < acks.size(); i++) {
+            EXPECT_FALSE(acks[i].user_ptr & UCT_CXI_USER_PTR_CTRL)
+                    << "a control message's ACK was read raw";
+            if ((kind != SEND_RNDV) ||
+                (acks[i].user_ptr == (uint64_t)(uintptr_t)rop)) {
+                mine = &acks[i];
+            }
+        }
+
+        EXPECT_NE(static_cast<const ack_rec *>(NULL), mine)
+                << kind_name(kind) << ": no ACK seen";
+        EXPECT_TRUE(put_seen) << kind_name(kind) << ": no arrival seen";
+        if ((mine != NULL) && put_seen) {
+            int expected_list = receive_posted ? C_PTL_LIST_PRIORITY :
+                                                 C_PTL_LIST_OVERFLOW;
+
+            UCS_TEST_MESSAGE << kind_name(kind)
+                             << (receive_posted ? " [receive posted]" :
+                                                  " [unexpected]")
+                             << ": ACK rc=" << mine->rc << " ptl_list="
+                             << mine->ptl_list << " rendezvous="
+                             << mine->rendezvous << " mlength="
+                             << mine->mlength << "; arrival rc=" << put.rc
+                             << " ptl_list=" << put.ptl_list
+                             << " rendezvous=" << put.rendezvous
+                             << " mlength=" << put.mlength;
+            EXPECT_EQ(C_RC_OK, mine->rc);
+            EXPECT_EQ(C_RC_OK, put.rc);
+            EXPECT_EQ(expected_list, put.ptl_list)
+                    << "the arrival was not on the list the receive implies";
+            EXPECT_EQ(put.ptl_list, mine->ptl_list)
+                    << "the sender's ACK and the target's arrival disagree "
+                       "on the list";
+        }
+
+        /* What the dispatch would have done with the ACKs read above. */
+        for (size_t i = 0; i < acks.size(); i++) {
+            ep->outstanding--;
+            siface->tx.outstanding--;
+        }
+        if (acks.size() > 0) {
+            if ((kind == SEND_BCOPY) || (kind == SEND_ZCOPY)) {
+                ucs_mpool_put(reinterpret_cast<void *>(acks[0].user_ptr));
+            }
+        }
+        if (kind == SEND_RNDV) {
+            usleep(50000); /* a pull of the source may be on its way */
+            ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(uep, rop));
+        }
+
+        if (receive_posted) {
+            for (unsigned i = 0; i < riface->tag.max_outstanding; i++) {
+                if (riface->tag.ctx[i] == &rctx.super) {
+                    riface->tag.ctx[i] = NULL;
+                    riface->tag.free_list[riface->tag.free_count++] =
+                            static_cast<uint16_t>(i);
+                    break;
+                }
+            }
+            dereg(receiver(), rx_memh);
+        }
+        if (tx_memh != UCT_MEM_HANDLE_NULL) {
+            dereg(sender(), tx_memh);
+        }
+    }
+
+    void check_kind(send_kind kind)
+    {
+        cxi_connect(sender(), 0, receiver());
+        settle();
+        run_case(kind, true);
+        run_case(kind, false);
+    }
+};
+
+UCS_TEST_P(test_cxi_tag_ack, ack_list_eager_short)
+{
+    check_kind(SEND_SHORT);
+}
+
+UCS_TEST_P(test_cxi_tag_ack, ack_list_eager_bcopy)
+{
+    check_kind(SEND_BCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_ack, ack_list_eager_zcopy)
+{
+    check_kind(SEND_ZCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_ack, ack_list_rndv_zcopy)
+{
+    check_kind(SEND_RNDV);
+}
+
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_ack, cxi)
+
+#endif /* UCT_CXI_DISABLE_FC */
+

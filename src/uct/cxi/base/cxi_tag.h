@@ -28,14 +28,13 @@
 #include <uct/api/uct.h>
 #include <ucs/datastruct/queue.h>
 
-/* min_free threshold for the overflow ring: a small fixed margin.
- *
- * Too small for any message larger than it: a Put that does not fit what is
- * left of the buffer it matched is not tried against the next buffer, it fails
- * with NO_SPACE (seen on hardware; see uct_cxi_iface_post_am_le()). The AM ring
- * sets min_free to its largest message; this ring still has to, once tag
- * matching is credited and sized like the AM ring. */
-#define UCT_CXI_TAG_OVF_MIN_FREE      256u
+/* The overflow ring's min_free is the largest eager message
+ * (uct_cxi_iface_t::tag.max_msg). A Put that does not fit what is left of the
+ * buffer it matched is not tried against the next buffer, it fails with
+ * NO_SPACE (seen on hardware; see uct_cxi_iface_post_am_le()); a buffer is
+ * retired as soon as less than min_free is left, so while one is linked every
+ * message of at most that size fits. The 24-bit field limits it to
+ * UCT_CXI_AM_MAX_MSG_LIMIT. */
 
 /* Cap on the number of overflow ring buffers (TAG_OVERFLOW_NUM_BUFS). */
 #define UCT_CXI_TAG_OVF_NUM_BUFS_MAX      1024u
@@ -305,6 +304,14 @@ ucs_status_t uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self,
                                          struct cxil_lni *lni,
                                          const uct_cxi_iface_config_t *config,
                                          const uct_iface_params_t *params);
+
+/* Will open_tag_pte offload tag matching for this configuration? */
+int uct_cxi_iface_tag_requested(const uct_cxi_iface_config_t *config,
+                                const uct_iface_params_t *params);
+
+/* The largest eager tag message (TAG_EAGER_MAX), within what min_free can
+ * express. */
+size_t uct_cxi_tag_max_msg(const uct_cxi_iface_config_t *config);
 void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self);
 
 /*

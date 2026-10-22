@@ -103,7 +103,8 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
         return UCS_ERR_NO_RESOURCE;
     }
 
-    status = uct_cxi_fc_reserve(ep, iface, units, &credited);
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_AM,
+                                UCT_CXI_FC_SLOTS_AM, units, &credited);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
@@ -122,14 +123,15 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
 
     status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_am, ep->dfa_am_idx_ext,
                                  (uint64_t)id | fcbits, buf,
-                                 sizeof(uint64_t) + length, units, credited,
-                                 "am_short");
+                                 sizeof(uint64_t) + length, UCT_CXI_FC_AM,
+                                 units, credited, "am_short");
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
 
-    uct_cxi_fc_debit(ep, credited, units);
-    uct_cxi_fc_pb_sent(ep, fcbits);
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_AM, UCT_CXI_FC_SLOTS_AM,
+                     units);
+    uct_cxi_fc_pb_sent(ep, iface, fcbits);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, SHORT, sizeof(uint64_t) + length);
@@ -167,7 +169,8 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
     /* An ordinary Active Message as far as the target is concerned: it uses
      * an AM buffer and an event, and the target hands its credits back like
      * any other's. */
-    status = uct_cxi_fc_reserve(ep, iface, units, &credited);
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_AM,
+                                UCT_CXI_FC_SLOTS_AM, units, &credited);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
@@ -181,14 +184,15 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
 
     status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_am, ep->dfa_am_idx_ext,
                                  UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG | fcbits,
-                                 &payload, sizeof(payload), units, credited,
-                                 "rndv_hdr_announce");
+                                 &payload, sizeof(payload), UCT_CXI_FC_AM,
+                                 units, credited, "rndv_hdr_announce");
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
 
-    uct_cxi_fc_debit(ep, credited, units);
-    uct_cxi_fc_pb_sent(ep, fcbits);
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_AM, UCT_CXI_FC_SLOTS_AM,
+                     units);
+    uct_cxi_fc_pb_sent(ep, iface, fcbits);
     ucs_debug("cxi TAG [RNDV-HDR-ANNOUNCE] ep=%p ep_id=0x%lx md_index=%u "
              "table_iova=0x%lx", ep, (unsigned long)ep_id,
              (unsigned)md_index, (unsigned long)payload.table_iova);
@@ -237,7 +241,8 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
      * (max_bcopy bytes), which the byte window's slack absorbs; what matters
      * is that a 1-byte message is never refused for want of room for a big
      * one. */
-    status = uct_cxi_fc_reserve(ep, iface, 1, &credited);
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_AM,
+                                UCT_CXI_FC_SLOTS_AM, 1, &credited);
     if (ucs_unlikely(status != UCS_OK)) {
         return (ssize_t)status;
     }
@@ -294,9 +299,11 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
-    uct_cxi_fc_debit(ep, credited, units);
-    uct_cxi_op_fc_set(&desc->op, credited, units);
-    uct_cxi_fc_pb_sent(ep, fcbits);
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_AM, UCT_CXI_FC_SLOTS_AM,
+                     units);
+    uct_cxi_op_fc_set(&desc->op, credited, UCT_CXI_FC_AM,
+                      UCT_CXI_FC_SLOTS_AM, units);
+    uct_cxi_fc_pb_sent(ep, iface, fcbits);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, BCOPY, length);
@@ -361,7 +368,8 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     wire_len   = contiguous ? (header_length + iov_length) : iov_length;
     units      = UCT_CXI_FC_UNITS(wire_len);
 
-    status = uct_cxi_fc_reserve(ep, iface, units, &credited);
+    status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_AM,
+                                UCT_CXI_FC_SLOTS_AM, units, &credited);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
@@ -420,9 +428,11 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     cxi_cq_ring(iface->tx.cmdq);
     ep->outstanding++;
     iface->tx.outstanding++;
-    uct_cxi_fc_debit(ep, credited, units);
-    uct_cxi_op_fc_set(op, credited, units);
-    uct_cxi_fc_pb_sent(ep, fcbits);
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_AM, UCT_CXI_FC_SLOTS_AM,
+                     units);
+    uct_cxi_op_fc_set(op, credited, UCT_CXI_FC_AM, UCT_CXI_FC_SLOTS_AM,
+                      units);
+    uct_cxi_fc_pb_sent(ep, iface, fcbits);
 
     UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t),
                       AM, ZCOPY, header_length + iov_length);

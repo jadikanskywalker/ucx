@@ -212,13 +212,17 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
 
     {"TAG_OVERFLOW_BUF_SIZE", "512k",
      "Size of each overflow-list buffer in bytes.\n"
-     "Automatically increased to TAG_EAGER_MAX if that is larger.",
+     "Automatically increased to twice TAG_EAGER_MAX if that is larger.",
      ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_buf_size),
      UCS_CONFIG_TYPE_MEMUNITS},
 
-    {"TAG_EAGER_MAX", "512k",
-     "Maximum eager tag bcopy/zcopy payload in bytes.  Also the minimum\n"
-     "size of each overflow-list buffer.",
+    {"TAG_EAGER_MAX", "256k",
+     "Maximum eager tag message in bytes, as advertised (bcopy is also\n"
+     "limited by MAX_BCOPY). Larger messages use rendezvous. The default is\n"
+     "the most UCP sends eagerly unless told to (UCX_RNDV_SEND_NBR_THRESH).\n"
+     "Also the overflow buffers' min_free, so that any message fits in what\n"
+     "is left of a linked buffer, and half their minimum size. Peers must\n"
+     "use the same value.",
      ucs_offsetof(uct_cxi_iface_config_t, tag_eager_max),
      UCS_CONFIG_TYPE_MEMUNITS},
 
@@ -240,16 +244,25 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      UCS_CONFIG_TYPE_BOOL},
 
     {"FC_MSG_WINDOW", "512",
-     "Message credits granted to each peer: how many messages one peer may\n"
-     "have outstanding to this interface at a time.",
+     "Receive event queue slots granted to each peer: how many events one\n"
+     "peer may have outstanding in this interface's queue at a time. Shared\n"
+     "by Active Messages (one slot each) and tag matching.",
      ucs_offsetof(uct_cxi_iface_config_t, fc_msg_window),
      UCS_CONFIG_TYPE_UINT},
 
     {"FC_BYTE_WINDOW", "1m",
-     "Byte credits granted to each peer: how many bytes one peer may have\n"
-     "outstanding to this interface at a time (counted in 64-byte units).\n"
-     "Must be at least the largest message a peer may send.",
+     "Active Message buffer credits granted to each peer: how many bytes\n"
+     "one peer may have outstanding in this interface's AM receive buffers\n"
+     "at a time (counted in 64-byte units). Must be at least the largest\n"
+     "Active Message a peer may send.",
      ucs_offsetof(uct_cxi_iface_config_t, fc_byte_window),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"FC_TAG_BYTE_WINDOW", "1m",
+     "Tag matching buffer credits granted to each peer: how many bytes one\n"
+     "peer may have outstanding in this interface's tag overflow buffers at\n"
+     "a time (counted in 64-byte units). Must be at least TAG_EAGER_MAX.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_tag_byte_window),
      UCS_CONFIG_TYPE_MEMUNITS},
 
     {"FC_ACTIVE_SENDERS", "8",
@@ -592,7 +605,7 @@ static void uct_cxi_send_desc_init(uct_iface_h tl_iface, void *obj,
     desc->iova = cxi_mh->iova_offset + (uint64_t)(uintptr_t)(desc + 1);
     desc->lac  = cxi_mh->cxi_md->lac;
 #ifndef UCT_CXI_DISABLE_FC
-    desc->op.fc_credited = 0;
+    desc->op.fc_slots = 0;
 #endif
 }
 
@@ -601,7 +614,7 @@ static void uct_cxi_send_desc_init(uct_iface_h tl_iface, void *obj,
  * one clears it again (see uct_cxi_op_fc_take). */
 static void uct_cxi_send_op_init(ucs_mpool_t *mp, void *obj, void *chunk)
 {
-    ((uct_cxi_send_op_t *)obj)->fc_credited = 0;
+    ((uct_cxi_send_op_t *)obj)->fc_slots = 0;
 }
 #endif
 
@@ -994,8 +1007,8 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     size_t                     msg_credits  = 0;
     size_t                     byte_credits = 0;
 #ifndef UCT_CXI_DISABLE_FC
-    uint32_t                   msg_window   = 0;
-    uint32_t                   unit_window  = 0;
+    uint32_t                   slot_window  = 0;
+    uint32_t                   unit_window[UCT_CXI_FC_NUM_CLASSES] = {};
 #endif
 
     UCT_CHECK_PARAM(params->field_mask & UCT_IFACE_PARAM_FIELD_OPEN_MODE,
@@ -1037,10 +1050,13 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     if (config->fc_enable) {
         unsigned active_senders = ucs_max(config->fc_active_senders, 1u);
 
-        uct_cxi_fc_windows(config, self->am.max_msg, &msg_window,
-                           &unit_window);
-        msg_credits  = (size_t)active_senders * msg_window;
-        byte_credits = (size_t)active_senders * unit_window * UCT_CXI_FC_UNIT;
+        uct_cxi_fc_windows(config, self->am.max_msg,
+                           uct_cxi_iface_tag_requested(config, params) ?
+                                   uct_cxi_tag_max_msg(config) : 0,
+                           &slot_window, unit_window);
+        msg_credits  = (size_t)active_senders * slot_window;
+        byte_credits = (size_t)active_senders * unit_window[UCT_CXI_FC_AM] *
+                       UCT_CXI_FC_UNIT;
     }
 #endif
 
@@ -1345,7 +1361,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
 #ifndef UCT_CXI_DISABLE_FC
     /* Step 17: connected-endpoint flow control -- per-peer state and the
      * control PTE its handshake runs on. */
-    status = uct_cxi_fc_init(self, config, msg_window, unit_window);
+    status = uct_cxi_fc_init(self, config, slot_window, unit_window);
     if (status != UCS_OK) {
         goto err_rdzv_pte;
     }
@@ -1599,7 +1615,11 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
                                  UCT_IFACE_FLAG_TAG_EAGER_ZCOPY;
 
         iface_attr->cap.tag.recv.min_recv       = 0;
-        iface_attr->cap.tag.recv.max_zcopy      = iface->tag.buf_size;
+        iface_attr->cap.tag.recv.max_zcopy      = UINT32_MAX; /* any rendezvous
+                                                 message must fit a posted
+                                                 receive (UCP asserts it):
+                                                 bounded by posted_len, not
+                                                 by the overflow ring */
         iface_attr->cap.tag.recv.max_iov        = 1; /* no send/recv SG anywhere
                                                           in this transport */
         iface_attr->cap.tag.recv.max_outstanding = iface->tag.max_outstanding;
@@ -1607,8 +1627,9 @@ ucs_status_t uct_cxi_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_a
         iface_attr->cap.tag.eager.max_short = C_MAX_IDC_PAYLOAD_UNR; /* no
                                                  header reservation needed,
                                                  unlike AM -- see cxi_tag.c */
-        iface_attr->cap.tag.eager.max_bcopy = iface->tag.buf_size;
-        iface_attr->cap.tag.eager.max_zcopy = iface->tag.buf_size;
+        iface_attr->cap.tag.eager.max_bcopy = ucs_min(iface->tag.max_msg,
+                                                      iface->tx.max_bcopy);
+        iface_attr->cap.tag.eager.max_zcopy = iface->tag.max_msg;
         iface_attr->cap.tag.eager.max_iov   = 1;
 
         /* max_hdr must be >= sizeof(ucp_tag_offload_unexp_rndv_hdr_t) (17
@@ -2050,23 +2071,38 @@ uct_cxi_iface_am_put_failed(uct_cxi_iface_t *iface, const union c_event *event)
 /*
  * uct_cxi_iface_ep_tx_done -- account one completed send against its ep:
  * the part common to every send, whether it was tracked by an op or by a
- * tagged user_ptr (IDC shorts).
+ * tagged user_ptr (IDC shorts). \a slots (0 if it was not charged), \a cls
+ * and \a units are the flow-control charge the send carries.
  */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_iface_ep_tx_done(uct_cxi_iface_t *iface, const union c_event *event,
-                         uct_cxi_ep_t *ep, ucs_status_t status, int credited,
-                         unsigned units)
+                         uct_cxi_ep_t *ep, ucs_status_t status, unsigned cls,
+                         unsigned slots, unsigned units)
 {
     if (ucs_unlikely(status != UCS_OK)) {
         uct_cxi_iface_tx_error(iface, event, ep);
 #ifndef UCT_CXI_DISABLE_FC
         /* The message did not reach the target's software, so the target will
          * never hand back what it cost: take it back. */
-        if (credited) {
-            uct_cxi_fc_refund(iface, ep, units);
+        if (slots != 0) {
+            uct_cxi_fc_refund(iface, ep, cls, slots, units);
         }
 #endif
     }
+#ifndef UCT_CXI_DISABLE_FC
+    else if ((slots != 0) && (cls == UCT_CXI_FC_TAG) &&
+             (event->init_short.ptl_list == C_PTL_LIST_PRIORITY)) {
+        /* A tag message that matched a receive that was posted: the target
+         * does not track it, the receive's own slots pay for what it leaves
+         * there, and its data went straight to the receive's buffer. Nothing
+         * will be handed back, so it is ours to take back now. (Hardware
+         * reports the same list to the sender as to the target: see
+         * test_cxi_tag_ack.) One that went to the overflow list is tracked
+         * by the target, which hands its credits back when it is done with
+         * it. */
+        uct_cxi_fc_reclaim(iface, ep->peer, cls, slots, units);
+    }
+#endif
     /* Target PTE in graceful recovery (en_flowctrl) or any
      * other completion status feeds this EP's adaptive
      * concurrency cap / retry cadence — see
@@ -2095,17 +2131,20 @@ uct_cxi_iface_ep_tx_done(uct_cxi_iface_t *iface, const union c_event *event,
 }
 
 /* The flow-control charge an op carries, cleared as it is read so a pooled op
- * is never mistaken for a charged one later. */
-static UCS_F_ALWAYS_INLINE int
-uct_cxi_op_fc_take(uct_cxi_send_op_t *op, unsigned *units_p)
+ * is never mistaken for a charged one later. Returns its event slots (0: not
+ * charged). */
+static UCS_F_ALWAYS_INLINE unsigned
+uct_cxi_op_fc_take(uct_cxi_send_op_t *op, unsigned *cls_p, unsigned *units_p)
 {
 #ifndef UCT_CXI_DISABLE_FC
-    int credited = op->fc_credited;
+    unsigned slots = op->fc_slots;
 
-    *units_p        = op->fc_units;
-    op->fc_credited = 0;
-    return credited;
+    *cls_p       = op->fc_class;
+    *units_p     = op->fc_units;
+    op->fc_slots = 0;
+    return slots;
 #else
+    *cls_p   = 0;
     *units_p = 0;
     return 0;
 #endif
@@ -2158,6 +2197,8 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
         uint64_t     user_ptr = event->init_short.user_ptr;
         ucs_status_t status   = uct_cxi_rc_to_status(cxi_event_rc(event));
         uct_cxi_ep_t *ep;
+        unsigned      fc_cls;
+        unsigned      fc_slots;
         unsigned      fc_units;
 
         /* Every command that reports on the TX queue carries a user_ptr. */
@@ -2169,12 +2210,21 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
              * byte. */
             ep = (uct_cxi_ep_t *)(uintptr_t)(
                     user_ptr & UCT_CXI_USER_PTR_PTR_MASK &
-                    ~UCT_CXI_USER_PTR_SHORT);
+                    ~(UCT_CXI_USER_PTR_SHORT | UCT_CXI_USER_PTR_TAG));
             fc_units = (unsigned)((user_ptr >> UCT_CXI_USER_PTR_UNITS_SHIFT) &
                                   UCT_CXI_USER_PTR_UNITS_MASK);
-            uct_cxi_iface_ep_tx_done(iface, event, ep, status,
-                                     (user_ptr & UCT_CXI_USER_PTR_CREDITED) != 0,
-                                     fc_units);
+            if (user_ptr & UCT_CXI_USER_PTR_TAG) {
+                fc_cls   = UCT_CXI_FC_TAG;
+                fc_slots = UCT_CXI_FC_SLOTS_TAG_EAGER;
+            } else {
+                fc_cls   = UCT_CXI_FC_AM;
+                fc_slots = UCT_CXI_FC_SLOTS_AM;
+            }
+            if (!(user_ptr & UCT_CXI_USER_PTR_CREDITED)) {
+                fc_slots = 0;
+            }
+            uct_cxi_iface_ep_tx_done(iface, event, ep, status, fc_cls,
+                                     fc_slots, fc_units);
             uct_cxi_iface_ep_release(iface, ep);
 #ifndef UCT_CXI_DISABLE_FC
         } else if (ucs_unlikely(user_ptr & UCT_CXI_USER_PTR_CTRL)) {
@@ -2196,10 +2246,10 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
                  * ep==NULL. */
                 op->handler(op, status);
             } else {
-                int credited = uct_cxi_op_fc_take(op, &fc_units);
+                fc_slots = uct_cxi_op_fc_take(op, &fc_cls, &fc_units);
 
-                uct_cxi_iface_ep_tx_done(iface, event, ep, status, credited,
-                                         fc_units);
+                uct_cxi_iface_ep_tx_done(iface, event, ep, status, fc_cls,
+                                         fc_slots, fc_units);
                 if (op->handler != NULL) {
                     op->handler(op, status); /* bcopy: handler owns comp + mpool_put */
                 } else {
@@ -2319,7 +2369,7 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
 #ifndef UCT_CXI_DISABLE_FC
         /* Processed: the sender's credits for this message go back to it. */
         if (peer != NULL) {
-            uct_cxi_fc_rx_done(iface, peer, mlength);
+            uct_cxi_fc_rx_done(iface, peer, UCT_CXI_FC_AM, 1, mlength);
         }
 #endif
 

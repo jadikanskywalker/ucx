@@ -59,6 +59,66 @@ static inline void cxi_connect(Entity &from, unsigned idx, Entity &to)
 }
 
 
+#ifndef UCT_CXI_DISABLE_FC
+
+/** The record \a ent's iface holds for the iface of \a remote, or NULL. */
+template<typename Entity>
+static inline uct_cxi_peer_t *cxi_find_peer(Entity &ent, Entity &remote)
+{
+    uct_cxi_iface_t *iface  = ucs_derived_of(ent.iface(), uct_cxi_iface_t);
+    uct_cxi_iface_t *riface = ucs_derived_of(remote.iface(), uct_cxi_iface_t);
+    uint32_t         key    = CXI_MATCH_ID(uct_cxi_iface_md(iface)->pid_bits,
+                                           riface->domain->pid,
+                                           uct_cxi_iface_md(riface)->
+                                                   device.nid);
+    khiter_t         iter   = kh_get(uct_cxi_peer_hash, &iface->fc.peers, key);
+
+    return (iter == kh_end(&iface->fc.peers)) ?
+           NULL : kh_value(&iface->fc.peers, iter);
+}
+
+/**
+ * Once everything \a from sent to \a to has been dealt with, what \a from
+ * was charged for it and what \a to has given back agree, in every pool: no
+ * credit was lost, none made up. A message may still be on its way, so both are
+ * progressed until they agree, for at most \a timeout_sec. (What the
+ * receiver owes has not necessarily reached the sender: that is a matter of
+ * grants, not of whether the credits were given back.)
+ */
+template<typename Entity>
+static inline void cxi_expect_conserved(Entity &from, Entity &to,
+                                        double timeout_sec = 5.0)
+{
+    uct_cxi_peer_t *tx = ucs_derived_of(from.ep(0), uct_cxi_ep_t)->peer;
+    uct_cxi_peer_t *rx = cxi_find_peer(to, from);
+
+    ASSERT_NE(nullptr, tx);
+    ASSERT_NE(nullptr, rx);
+
+    auto conserved = [&]() {
+        return (tx->tx.used_slots == rx->rx.ret_slots) &&
+               (tx->tx.used_units[UCT_CXI_FC_AM] ==
+                rx->rx.ret_units[UCT_CXI_FC_AM]) &&
+               (tx->tx.used_units[UCT_CXI_FC_TAG] ==
+                rx->rx.ret_units[UCT_CXI_FC_TAG]);
+    };
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(timeout_sec);
+
+    while (!conserved() && (ucs_get_time() < deadline)) {
+        uct_iface_progress(from.iface());
+        uct_iface_progress(to.iface());
+    }
+
+    EXPECT_EQ(tx->tx.used_slots, rx->rx.ret_slots) << "event slots";
+    EXPECT_EQ(tx->tx.used_units[UCT_CXI_FC_AM],
+              rx->rx.ret_units[UCT_CXI_FC_AM]) << "Active Message space";
+    EXPECT_EQ(tx->tx.used_units[UCT_CXI_FC_TAG],
+              rx->rx.ret_units[UCT_CXI_FC_TAG]) << "tag matching space";
+}
+
+#endif /* UCT_CXI_DISABLE_FC */
+
+
 /**
  * test_cxi_rma_base — two-entity fixture for CXI loopback tests.
  *

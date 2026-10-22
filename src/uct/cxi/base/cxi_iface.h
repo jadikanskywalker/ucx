@@ -40,12 +40,36 @@
  * (handshake, grants) are not credited. */
 #define UCT_CXI_EQ_SLACK       128U
 /* Flow-control credit unit: byte windows are counted in these, and a message
- * costs one message credit plus UCT_CXI_FC_UNITS(len) byte credits. Defined
- * here, outside the UCT_CXI_DISABLE_FC guard, because the send paths compute
- * the cost whether or not it is charged. */
+ * costs event slots plus UCT_CXI_FC_UNITS(len) byte credits of its class.
+ * Defined here, outside the UCT_CXI_DISABLE_FC guard, because the send paths
+ * compute the cost whether or not it is charged. */
 #define UCT_CXI_FC_UNIT       64u
 #define UCT_CXI_FC_UNITS(_len) \
     ((unsigned)(((_len) + UCT_CXI_FC_UNIT - 1) / UCT_CXI_FC_UNIT))
+
+/* The event slots a message is charged: the most events it can leave in the
+ * receive event queue until it has been processed. An Active Message leaves
+ * its arrival. An eager tag message that matches no posted receive leaves its
+ * arrival and the outcome of the search we make for it; a rendezvous also the
+ * completion of the read of its source address. (A message that matches a
+ * posted receive leaves events too, but the receive's own slots pay for
+ * those, and the sender takes its charge back when it is told so.) */
+#define UCT_CXI_FC_SLOTS_AM          1u
+#define UCT_CXI_FC_SLOTS_TAG_EAGER   2u
+#define UCT_CXI_FC_SLOTS_TAG_RNDV    3u
+#define UCT_CXI_FC_MAX_SLOTS         UCT_CXI_FC_SLOTS_TAG_RNDV
+
+/**
+ * What a message is charged against. The receive event queue is one resource
+ * shared by everything a peer sends, so event slots are one pool for all
+ * classes; the receive buffers are not, each class has its own ring, so each
+ * has its own byte pool.
+ */
+typedef enum {
+    UCT_CXI_FC_AM,           /**< Active Messages: the AM ring */
+    UCT_CXI_FC_TAG,          /**< tag matching: the overflow ring */
+    UCT_CXI_FC_NUM_CLASSES
+} uct_cxi_fc_class_t;
 
 /* How long a command posted from an event handler (uct_cxi_iface_tgt_post(),
  * the address read of an unexpected rendezvous) waits for room in a full
@@ -182,19 +206,25 @@ typedef struct uct_cxi_iface_config {
                                               falls back to SW tag matching over AM */
     unsigned                  tag_ovf_num_bufs; /**< # overflow-ring buffers        */
     size_t                    tag_ovf_buf_size; /**< Size of each overflow buffer   */
-    size_t                    tag_eager_max;    /**< Max eager bcopy/zcopy payload;
-                                              also sizes the overflow ring
-                                              buffers if larger                     */
+    size_t                    tag_eager_max;    /**< Max eager tag message; the
+                                              overflow ring buffers are at least
+                                              twice as large (see
+                                              uct_cxi_iface_open_tag_pte)           */
     unsigned                  tag_max_outstanding; /**< Max simultaneously-posted
                                               priority LEs (hard ceiling 65535 --
                                               buffer_id is uint16_t)                */
 #ifndef UCT_CXI_DISABLE_FC
     int                       fc_enable;       /**< Handshake with peers and
                                                     open the control PTE       */
-    unsigned                  fc_msg_window;   /**< Message credits granted to
-                                                    each peer                  */
-    size_t                    fc_byte_window;  /**< Byte credits granted to
-                                                    each peer                  */
+    unsigned                  fc_msg_window;   /**< Event slot credits granted
+                                                    to each peer, shared by
+                                                    all message classes        */
+    size_t                    fc_byte_window;  /**< Active Message buffer
+                                                    credits granted to each
+                                                    peer                       */
+    size_t                    fc_tag_byte_window; /**< Tag matching buffer
+                                                    credits granted to each
+                                                    peer                       */
     double                    fc_connect_timeout; /**< Give up on a peer's
                                                     handshake after this long
                                                     (seconds)                  */
@@ -569,6 +599,11 @@ typedef struct uct_cxi_iface {
         uct_cxi_mem_handle_t  rx_mh;
         unsigned              num_bufs;
         size_t                buf_size;
+        size_t                max_msg;     /**< Largest eager message: what is
+                                                advertised, and the LEs'
+                                                min_free, so that one always
+                                                fits in what is left of the
+                                                buffer it matched */
 
         /* Per-buffer-generation reference count -- mirrors libfabric's own
          * cxip_ptelist_buf refcount/consumed design (cxip_ptelist_buf.c).
@@ -848,11 +883,13 @@ BEGIN_C_DECLS
 
 /* cxi_peer.c */
 void         uct_cxi_fc_windows(const uct_cxi_iface_config_t *config,
-                                size_t max_msg, uint32_t *msg_window_p,
-                                uint32_t *unit_window_p);
+                                size_t am_max_msg, size_t tag_max_msg,
+                                uint32_t *slot_window_p,
+                                uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES]);
 ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
                              const uct_cxi_iface_config_t *config,
-                             uint32_t msg_window, uint32_t unit_window);
+                             uint32_t slot_window,
+                             const uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES]);
 void         uct_cxi_fc_cleanup(uct_cxi_iface_t *iface);
 ucs_status_t uct_cxi_iface_open_ctrl_pte(uct_cxi_iface_t *iface,
                                          struct cxil_lni *lni);
@@ -894,9 +931,28 @@ void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
 /** Make runnable the endpoints of \a peer that were waiting for credits. */
 void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
 
+/**
+ * Take back the credits of a send to \a peer that the target will never hand
+ * back: it never arrived, or the target does not track it (a tag message that
+ * matched a posted receive).
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_reclaim(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer, unsigned cls,
+                   unsigned slots, unsigned units)
+{
+    peer->tx.avail_slots      += (int32_t)slots;
+    peer->tx.avail_units[cls] += (int32_t)units;
+    peer->tx.used_slots       -= slots;
+    peer->tx.used_units[cls]  -= units;
+
+    if (ucs_unlikely(peer->blocked != NULL)) {
+        uct_cxi_peer_resume(iface, peer);
+    }
+}
+
 /** Give back the credits of a send to \a ep's peer that never arrived. */
 void uct_cxi_fc_refund(uct_cxi_iface_t *iface, struct uct_cxi_ep *ep,
-                       unsigned units);
+                       unsigned cls, unsigned slots, unsigned units);
 
 /** Forget that we told \a peer anything we cannot be sure it received. */
 void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
@@ -926,22 +982,23 @@ uct_cxi_fc_rx_peer(uct_cxi_iface_t *iface, uint32_t process)
 }
 
 /**
- * An Active Message of \a mlength bytes from \a peer has been processed:
- * the sender's credits for it are now ours to give back.
+ * A message of class \a cls and \a mlength bytes from \a peer, which the
+ * sender charged \a slots event slots, has been processed: the sender's
+ * credits for it are now ours to give back.
  */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_fc_rx_done(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
-                   uint32_t mlength)
+                   unsigned cls, unsigned slots, uint32_t mlength)
 {
     uct_cxi_fc_rx_t *rx = &peer->rx;
 
-    rx->ret_msgs++;
-    rx->ret_units += UCT_CXI_FC_UNITS(mlength);
+    rx->ret_slots      += slots;
+    rx->ret_units[cls] += UCT_CXI_FC_UNITS(mlength);
 
-    if (ucs_unlikely(((uint32_t)(rx->ret_msgs  - rx->adv_msgs)  >=
-                      iface->fc.grant_msgs) ||
-                     ((uint32_t)(rx->ret_units - rx->adv_units) >=
-                      iface->fc.grant_units))) {
+    if (ucs_unlikely(((uint32_t)(rx->ret_slots - rx->adv_slots) >=
+                      iface->fc.grant_slots) ||
+                     ((uint32_t)(rx->ret_units[cls] - rx->adv_units[cls]) >=
+                      iface->fc.grant_units[cls]))) {
         uct_cxi_fc_grant_wanted(iface, peer);
     }
 }

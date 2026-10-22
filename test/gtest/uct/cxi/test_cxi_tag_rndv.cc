@@ -823,6 +823,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, cold_start)
     dereg(receiver(), dst_memh);
     dereg(sender(), tx_memh);
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 
@@ -925,6 +928,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
     }
 
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 
@@ -1069,6 +1075,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
         }
     }
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 /*
@@ -1128,6 +1137,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_rendezvous_reported_in_send_order)
         delete sends[i];
     }
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 
@@ -1259,6 +1271,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, rendezvous_vs_posted_receive)
                      << " were reported (" << reported_first
                      << " before the receive was posted)";
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 
@@ -1370,6 +1385,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_behind_rendezvous_taken_by_receive)
         dereg(sender(), tx_memh);
     }
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 /*
@@ -1506,6 +1524,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, search_delete_finds_the_other_kind)
         }
     }
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 /*
@@ -1576,6 +1597,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_streams_each_in_order)
         delete sends[i];
     }
     flush_ep(sender(), sep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
 }
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_rndv_unexp, cxi)

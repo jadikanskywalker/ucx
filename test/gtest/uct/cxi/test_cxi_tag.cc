@@ -22,8 +22,10 @@
 #include <uct/cxi/base/cxi_ep.h>
 #include <uct/cxi/base/cxi_iface.h>
 #include <uct/cxi/base/cxi_md.h>
+#include <uct/cxi/base/cxi_tag.h>
 
 #include <cstring>
+#include <functional>
 #include <vector>
 #include <unistd.h>
 
@@ -296,7 +298,7 @@ UCS_TEST_P(test_cxi_tag, unexpected_burst_sizes)
     /* bcopy is limited to the bounce buffer size, zcopy goes up to the eager
      * limit. */
     static const size_t    BCOPY_SIZES[] = {1, 100, 1024, 8192};
-    static const size_t    ZCOPY_SIZES[] = {100 * 1024, 400 * 1024};
+    static const size_t    ZCOPY_SIZES[] = {100 * 1024, 250 * 1024};
 
     struct sent_msg {
         uct_tag_t            tag;
@@ -751,4 +753,647 @@ UCS_TEST_P(test_cxi_tag, forced_race_search_delete_vs_priority_append)
 }
 
 
+
+#ifndef UCT_CXI_DISABLE_FC
+
+/* ------------------------------------------------------------------------
+ * Flow control of tag messages: what a send is charged, and what happens to
+ * the charge depending on the list the message matched.
+ * ------------------------------------------------------------------------
+ */
+
+/**
+ * Tag sends are charged event slots (two for an eager message, three for a
+ * rendezvous one) and buffer space of the tag class (the message's length in
+ * units; none for a rendezvous). A message that matches a posted receive is
+ * not tracked by the target, and its sender takes the charge back when its ACK
+ * says so; one that does not stays charged until the target is done with it.
+ */
+class test_cxi_tag_credits : public test_cxi_tag_base {
+protected:
+    enum send_kind {
+        SEND_SHORT,
+        SEND_BCOPY,
+        SEND_ZCOPY,
+        SEND_RNDV
+    };
+
+    static const size_t   PAY_LEN  = 100;  /* two units */
+    static const size_t   RNDV_LEN = 4096;
+    static const uint64_t TAG      = 0x5AC0000000000001ULL;
+
+    struct sent_t {
+        std::vector<uint8_t>   buf;
+        uct_mem_h              memh;
+        uct_cxi_rndv_send_ctx  sctx;
+        void                  *rop;
+    };
+
+    uct_cxi_peer_t *tx_peer()
+    {
+        return ucs_derived_of(sender().ep(0), uct_cxi_ep_t)->peer;
+    }
+
+    /** The record the receiver holds for the sender. */
+    uct_cxi_peer_t *rx_peer()
+    {
+        return cxi_find_peer(receiver(), sender());
+    }
+
+    static size_t kind_len(send_kind kind)
+    {
+        return (kind == SEND_RNDV) ? RNDV_LEN : PAY_LEN;
+    }
+
+    static unsigned kind_slots(send_kind kind)
+    {
+        return (kind == SEND_RNDV) ? UCT_CXI_FC_SLOTS_TAG_RNDV :
+                                     UCT_CXI_FC_SLOTS_TAG_EAGER;
+    }
+
+    static unsigned kind_units(send_kind kind)
+    {
+        return (kind == SEND_RNDV) ? 0 : UCT_CXI_FC_UNITS(PAY_LEN);
+    }
+
+    /** A rendezvous also sends the endpoint's one announce, an Active
+     * Message the target gives back credits for on its own. */
+    static unsigned kind_extra_slots(send_kind kind)
+    {
+        return (kind == SEND_RNDV) ? UCT_CXI_FC_SLOTS_AM : 0;
+    }
+
+    /** Send one message of \a kind with tag \a tag. */
+    void send_one(send_kind kind, uct_tag_t tag, sent_t &sent,
+                  ucs_status_t *status_p = NULL)
+    {
+        uct_ep_h     ep     = sender().ep(0);
+        size_t       len    = kind_len(kind);
+        ucs_status_t status = UCS_OK;
+        uct_iov_t    iov;
+
+        sent.buf.assign(len, 0x5A);
+        sent.memh = UCT_MEM_HANDLE_NULL;
+        sent.rop  = NULL;
+        init_rndv_send_ctx(sent.sctx);
+
+        if ((kind == SEND_ZCOPY) || (kind == SEND_RNDV)) {
+            sent.memh  = reg(sender(), sent.buf.data(), len);
+            iov.buffer = sent.buf.data();
+            iov.length = len;
+            iov.memh   = sent.memh;
+            iov.stride = 0;
+            iov.count  = 1;
+        }
+
+        switch (kind) {
+        case SEND_SHORT:
+            status = uct_ep_tag_eager_short(ep, tag, sent.buf.data(), len);
+            break;
+        case SEND_BCOPY: {
+            auto pack = [](void *dst, void *arg) -> size_t {
+                size_t n = *static_cast<size_t *>(arg);
+                memset(dst, 0x5A, n);
+                return n;
+            };
+            ssize_t ret = uct_ep_tag_eager_bcopy(ep, tag, 0, +pack, &len, 0);
+            status = (ret < 0) ? static_cast<ucs_status_t>(ret) : UCS_OK;
+            break;
+        }
+        case SEND_ZCOPY:
+            status = uct_ep_tag_eager_zcopy(ep, tag, 0, &iov, 1, 0,
+                                            &sent.sctx.super);
+            if (status == UCS_INPROGRESS) {
+                status = UCS_OK;
+            }
+            break;
+        case SEND_RNDV: {
+            uct_cxi_rndv_hdr_wire_t hdr;
+            hdr.ep_id    = 0x1111111111111111ULL;
+            hdr.req_id   = tag;
+            hdr.md_index = 1;
+            ucs_status_ptr_t sp = uct_ep_tag_rndv_zcopy(ep, tag, &hdr,
+                                                        sizeof(hdr), &iov, 1,
+                                                        0, &sent.sctx.super);
+            if (UCS_PTR_IS_ERR(sp)) {
+                status = UCS_PTR_STATUS(sp);
+            } else {
+                sent.rop = sp;
+            }
+            break;
+        }
+        }
+
+        if (status_p != NULL) {
+            *status_p = status;
+        } else {
+            ASSERT_UCS_OK(status);
+        }
+    }
+
+    void release(send_kind kind, sent_t &sent)
+    {
+        if (sent.memh != UCT_MEM_HANDLE_NULL) {
+            dereg(sender(), sent.memh);
+        }
+    }
+
+    /** Progress only the sender until its sends are all acknowledged. */
+    void sender_acked()
+    {
+        uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(),
+                                                 uct_cxi_iface_t);
+        ucs_time_t       until  = ucs_get_time() + ucs_time_from_sec(5.0);
+
+        while ((siface->tx.outstanding != 0) && (ucs_get_time() < until)) {
+            uct_iface_progress(sender().iface());
+        }
+        ASSERT_EQ(0u, siface->tx.outstanding) << "sends never acknowledged";
+    }
+
+    void check_matched_is_given_back(send_kind kind)
+    {
+        cxi_connect(sender(), 0, receiver());
+        uct_cxi_peer_t *tx    = tx_peer();
+        const int32_t   slots = tx->tx.avail_slots;
+        const int32_t   tag   = tx->tx.avail_units[UCT_CXI_FC_TAG];
+        size_t          len   = kind_len(kind);
+
+        std::vector<uint8_t> rx_buf(len, 0);
+        uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), len);
+        uct_cxi_tag_recv_ctx rctx;
+        uct_iov_t            riov;
+        sent_t               sent;
+
+        init_recv_ctx(rctx);
+        riov.buffer = rx_buf.data();
+        riov.length = len;
+        riov.memh   = rx_memh;
+        riov.stride = 0;
+        riov.count  = 1;
+        ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                               UCS_MASK(64), &riov, 1,
+                                               &rctx.super));
+        usleep(50000); /* the receive is in place: the message will match it */
+
+        send_one(kind, TAG, sent);
+        poll_until(rctx.completed);
+        if (kind == SEND_RNDV) {
+            poll_until(sent.sctx.fired);
+        }
+        ASSERT_TRUE(progress_until_acked());
+
+        /* What it was charged is back; only the announce is still out. */
+        EXPECT_EQ(slots - (int32_t)kind_extra_slots(kind), tx->tx.avail_slots);
+        EXPECT_EQ(tag, tx->tx.avail_units[UCT_CXI_FC_TAG]);
+        EXPECT_EQ(kind_extra_slots(kind), tx->tx.used_slots);
+        EXPECT_EQ(0u, tx->tx.used_units[UCT_CXI_FC_TAG]);
+
+        /* The target never tracked it. */
+        uct_cxi_peer_t *rx = rx_peer();
+        ASSERT_NE(nullptr, rx);
+        EXPECT_EQ(0u, rx->rx.ret_units[UCT_CXI_FC_TAG]);
+        EXPECT_EQ(kind_extra_slots(kind), rx->rx.ret_slots);
+
+        release(kind, sent);
+        dereg(receiver(), rx_memh);
+    }
+
+    void check_unmatched_stays_charged(send_kind kind)
+    {
+        cxi_connect(sender(), 0, receiver());
+        uct_cxi_peer_t *tx    = tx_peer();
+        const int32_t   slots = tx->tx.avail_slots;
+        const int32_t   tag   = tx->tx.avail_units[UCT_CXI_FC_TAG];
+        sent_t          sent;
+
+        /* Only the sender makes progress: the target does not get to give
+         * anything back, whatever it would do. */
+        send_one(kind, TAG, sent);
+        sender_acked();
+
+        unsigned total = kind_slots(kind) + kind_extra_slots(kind);
+        EXPECT_EQ(slots - (int32_t)total, tx->tx.avail_slots);
+        EXPECT_EQ(tag - (int32_t)kind_units(kind),
+                  tx->tx.avail_units[UCT_CXI_FC_TAG]);
+        EXPECT_EQ(total, tx->tx.used_slots);
+        EXPECT_EQ(kind_units(kind), tx->tx.used_units[UCT_CXI_FC_TAG]);
+
+        if (kind == SEND_RNDV) {
+            ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(sender().ep(0), sent.rop));
+        }
+        release(kind, sent);
+    }
+
+    /** Send the sender what the receiver owes it, in a GRANT. */
+    void grant_now()
+    {
+        uct_cxi_fc_grant_wanted(ucs_derived_of(receiver().iface(),
+                                               uct_cxi_iface_t),
+                                rx_peer());
+    }
+
+    /** Progress both until \a done, or give up. */
+    bool progress_until(const std::function<bool()> &done,
+                        double timeout_sec = 5.0)
+    {
+        ucs_time_t until = ucs_get_time() + ucs_time_from_sec(timeout_sec);
+
+        while (!done() && (ucs_get_time() < until)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        return done();
+    }
+
+    /** What the receiver gave back for the message of \a kind, and then the
+     * sender got in a GRANT, is all that it was charged. */
+    void check_given_back(send_kind kind, int32_t slots, int32_t tag)
+    {
+        uct_cxi_peer_t *tx = tx_peer();
+        uct_cxi_peer_t *rx = rx_peer();
+
+        ASSERT_NE(nullptr, rx);
+        cxi_expect_conserved(sender(), receiver());
+        EXPECT_EQ(kind_slots(kind) + kind_extra_slots(kind), rx->rx.ret_slots);
+        EXPECT_EQ(kind_units(kind), rx->rx.ret_units[UCT_CXI_FC_TAG]);
+
+        grant_now();
+        ASSERT_TRUE(progress_until([&]() {
+            return (tx->tx.avail_slots == slots) &&
+                   (tx->tx.avail_units[UCT_CXI_FC_TAG] == tag);
+        })) << "the sender's credits did not all come back";
+        EXPECT_EQ(0u, tx->tx.used_slots - rx->rx.ret_slots);
+    }
+
+    /** A message nothing was waiting for, reported to the receiver's user. */
+    void check_unmatched_is_given_back(send_kind kind)
+    {
+        cxi_connect(sender(), 0, receiver());
+        uct_cxi_peer_t *tx    = tx_peer();
+        const int32_t   slots = tx->tx.avail_slots;
+        const int32_t   tag   = tx->tx.avail_units[UCT_CXI_FC_TAG];
+        sent_t          sent;
+
+        send_one(kind, TAG, sent);
+        check_given_back(kind, slots, tag);
+
+        if (kind == SEND_RNDV) {
+            ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(sender().ep(0), sent.rop));
+        }
+        release(kind, sent);
+    }
+
+    /** A message that landed unexpected and was taken by a receive posted
+     * after it. */
+    void check_claimed_later_is_given_back(send_kind kind)
+    {
+        cxi_connect(sender(), 0, receiver());
+        uct_cxi_peer_t *tx    = tx_peer();
+        const int32_t   slots = tx->tx.avail_slots;
+        const int32_t   tag   = tx->tx.avail_units[UCT_CXI_FC_TAG];
+        size_t          len   = kind_len(kind);
+        sent_t          sent;
+
+        send_one(kind, TAG, sent);
+        sender_acked(); /* it is in the target's hands, unseen by its software */
+
+        std::vector<uint8_t> rx_buf(len, 0);
+        uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), len);
+        uct_cxi_tag_recv_ctx rctx;
+        uct_iov_t            riov;
+
+        init_recv_ctx(rctx);
+        riov.buffer = rx_buf.data();
+        riov.length = len;
+        riov.memh   = rx_memh;
+        riov.stride = 0;
+        riov.count  = 1;
+        ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                               UCS_MASK(64), &riov, 1,
+                                               &rctx.super));
+        poll_until(rctx.completed);
+        if (kind == SEND_RNDV) {
+            poll_until(sent.sctx.fired);
+        }
+
+        check_given_back(kind, slots, tag);
+
+        release(kind, sent);
+        dereg(receiver(), rx_memh);
+    }
+
+    bool progress_until_acked()
+    {
+        uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(),
+                                                 uct_cxi_iface_t);
+        ucs_time_t       until  = ucs_get_time() + ucs_time_from_sec(5.0);
+
+        while ((siface->tx.outstanding != 0) && (ucs_get_time() < until)) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        return siface->tx.outstanding == 0;
+    }
+};
+
+UCS_TEST_P(test_cxi_tag_credits, matched_short_is_given_back)
+{
+    check_matched_is_given_back(SEND_SHORT);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, matched_bcopy_is_given_back)
+{
+    check_matched_is_given_back(SEND_BCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, matched_zcopy_is_given_back)
+{
+    check_matched_is_given_back(SEND_ZCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, matched_rndv_is_given_back)
+{
+    check_matched_is_given_back(SEND_RNDV);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_short_stays_charged)
+{
+    check_unmatched_stays_charged(SEND_SHORT);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_bcopy_stays_charged)
+{
+    check_unmatched_stays_charged(SEND_BCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_zcopy_stays_charged)
+{
+    check_unmatched_stays_charged(SEND_ZCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_rndv_stays_charged)
+{
+    check_unmatched_stays_charged(SEND_RNDV);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_short_is_given_back)
+{
+    check_unmatched_is_given_back(SEND_SHORT);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_bcopy_is_given_back)
+{
+    check_unmatched_is_given_back(SEND_BCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_zcopy_is_given_back)
+{
+    check_unmatched_is_given_back(SEND_ZCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, unmatched_rndv_is_given_back)
+{
+    check_unmatched_is_given_back(SEND_RNDV);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, claimed_later_short_is_given_back)
+{
+    check_claimed_later_is_given_back(SEND_SHORT);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, claimed_later_bcopy_is_given_back)
+{
+    check_claimed_later_is_given_back(SEND_BCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, claimed_later_zcopy_is_given_back)
+{
+    check_claimed_later_is_given_back(SEND_ZCOPY);
+}
+
+UCS_TEST_P(test_cxi_tag_credits, claimed_later_rndv_is_given_back)
+{
+    check_claimed_later_is_given_back(SEND_RNDV);
+}
+
+/**
+ * What a send costs decides whether it can go: with two slots left an eager
+ * message goes and a rendezvous one waits; the Active Message pool and the
+ * tag pool are separate.
+ */
+UCS_TEST_P(test_cxi_tag_credits, cost_decides_what_can_go)
+{
+    cxi_connect(sender(), 0, receiver());
+    uct_cxi_peer_t *tx = tx_peer();
+    sent_t          sent;
+    ucs_status_t    status;
+
+    /* Two slots: the first rendezvous send takes one for its announce, and
+     * has too few left for itself. */
+    tx->tx.avail_slots = 2;
+    send_one(SEND_RNDV, TAG, sent, &status);
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status) << "a rendezvous needs 3 slots";
+    release(SEND_RNDV, sent);
+    EXPECT_EQ(2 - (int32_t)UCT_CXI_FC_SLOTS_AM, tx->tx.avail_slots);
+
+    /* Two slots are enough for an eager message. */
+    tx->tx.avail_slots = UCT_CXI_FC_SLOTS_TAG_EAGER;
+    send_one(SEND_SHORT, TAG, sent, &status);
+    EXPECT_EQ(UCS_OK, status);
+    EXPECT_EQ(0, tx->tx.avail_slots);
+    release(SEND_SHORT, sent);
+
+    /* Out of tag space but not of slots: an eager waits, an Active Message
+     * does not. */
+    tx->tx.avail_slots = 10;
+    const int32_t tag = tx->tx.avail_units[UCT_CXI_FC_TAG];
+    tx->tx.avail_units[UCT_CXI_FC_TAG] = 1;
+    send_one(SEND_SHORT, TAG, sent, &status);
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status) << "100 bytes need 2 units";
+    uint64_t payload = 0;
+    EXPECT_EQ(UCS_OK, uct_ep_am_short(sender().ep(0), 1, 0, &payload,
+                                      sizeof(payload)));
+    tx->tx.avail_units[UCT_CXI_FC_TAG] = tag;
+    sender_acked();
+}
+
+/**
+ * Sends that are answered from the priority list do not run a window out, as
+ * long as their ACKs come back: a window of two eager messages carries four
+ * through, the last waiting in the pending queue for the slots the first ones
+ * give back.
+ */
+class test_cxi_tag_small_window : public test_cxi_tag_credits {
+public:
+    void init() override
+    {
+        modify_config("CXI_FC_MSG_WINDOW", "6");
+        test_cxi_tag_base::init();
+    }
+};
+
+struct tag_pending_t {
+    uct_pending_req_t super;
+    uct_ep_h          ep;
+    uct_tag_t         tag;
+    const void       *data;
+    size_t            len;
+    volatile bool     sent;
+};
+
+static ucs_status_t tag_pending_cb(uct_pending_req_t *self)
+{
+    tag_pending_t *req = reinterpret_cast<tag_pending_t *>(self);
+    ucs_status_t   status = uct_ep_tag_eager_short(req->ep, req->tag,
+                                                   req->data, req->len);
+
+    req->sent = (status == UCS_OK);
+    return status;
+}
+
+UCS_TEST_P(test_cxi_tag_small_window, matched_sends_flow_through_a_small_window)
+{
+    static const unsigned N = 4;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_cxi_peer_t *tx = tx_peer();
+    ASSERT_EQ(6, tx->tx.avail_slots);
+
+    std::vector<uint8_t>  rx_buf[N];
+    uct_mem_h             rx_memh[N];
+    uct_cxi_tag_recv_ctx  rctx[N];
+    std::vector<uint8_t>  data(PAY_LEN, 0x5A);
+
+    for (unsigned i = 0; i < N; i++) {
+        rx_buf[i].assign(PAY_LEN, 0);
+        rx_memh[i] = reg(receiver(), rx_buf[i].data(), PAY_LEN);
+        init_recv_ctx(rctx[i]);
+
+        uct_iov_t iov;
+        iov.buffer = rx_buf[i].data();
+        iov.length = PAY_LEN;
+        iov.memh   = rx_memh[i];
+        iov.stride = 0;
+        iov.count  = 1;
+        ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                               UCS_MASK(64), &iov, 1,
+                                               &rctx[i].super));
+    }
+    usleep(50000);
+
+    for (unsigned i = 0; i < 3; i++) {
+        ASSERT_UCS_OK(uct_ep_tag_eager_short(sender().ep(0), TAG, data.data(),
+                                             PAY_LEN));
+    }
+    EXPECT_EQ(0, tx->tx.avail_slots);
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE,
+              uct_ep_tag_eager_short(sender().ep(0), TAG, data.data(),
+                                     PAY_LEN));
+
+    tag_pending_t req = {};
+    req.super.func = tag_pending_cb;
+    req.ep         = sender().ep(0);
+    req.tag        = TAG;
+    req.data       = data.data();
+    req.len        = PAY_LEN;
+    ASSERT_UCS_OK(uct_ep_pending_add(sender().ep(0), &req.super, 0));
+
+    poll_until(req.sent);
+    for (unsigned i = 0; i < N; i++) {
+        poll_until(rctx[i].completed);
+        EXPECT_EQ(UCS_OK, rctx[i].status);
+        dereg(receiver(), rx_memh[i]);
+    }
+    ASSERT_TRUE(progress_until_acked());
+    EXPECT_EQ(6, tx->tx.avail_slots);
+    EXPECT_EQ(0u, tx->tx.used_slots);
+}
+
+/**
+ * Nothing is waiting for these messages, so they all go to the overflow list,
+ * which the target tracks: the window carries three at a time, and the rest
+ * wait for the target to give credits back, as GRANTs, for the ones it has
+ * reported.
+ */
+UCS_TEST_P(test_cxi_tag_small_window, unmatched_sends_flow_through_a_small_window)
+{
+    static const unsigned N = 12;
+
+    cxi_connect(sender(), 0, receiver());
+    std::vector<uint8_t> data(PAY_LEN, 0x5A);
+
+    for (unsigned i = 0; i < N; i++) {
+        ucs_time_t   until = ucs_get_time() + ucs_time_from_sec(5.0);
+        ucs_status_t status;
+
+        /* One send per round: a send is not something to repeat to test it. */
+        do {
+            status = uct_ep_tag_eager_short(sender().ep(0), TAG, data.data(),
+                                            PAY_LEN);
+            if (status == UCS_ERR_NO_RESOURCE) {
+                uct_iface_progress(sender().iface());
+                uct_iface_progress(receiver().iface());
+            }
+        } while ((status == UCS_ERR_NO_RESOURCE) && (ucs_get_time() < until));
+        ASSERT_EQ(UCS_OK, status) << "message " << i
+                                  << ": credits never came back";
+    }
+
+    ASSERT_TRUE(progress_until([&]() { return m_unexp.all.size() == N; }))
+            << m_unexp.all.size() << " of " << N << " reported";
+    cxi_expect_conserved(sender(), receiver());
+}
+
+/**
+ * A tag send that fails is not the target's to give back: it is refunded to
+ * the tag pool by its sender.
+ */
+UCS_TEST_P(test_cxi_tag_credits, failed_send_is_refunded)
+{
+    cxi_connect(sender(), 0, receiver());
+    uct_cxi_peer_t  *tx     = tx_peer();
+    uct_cxi_iface_t *riface = ucs_derived_of(receiver().iface(),
+                                             uct_cxi_iface_t);
+    const int32_t    slots  = tx->tx.avail_slots;
+    const int32_t    tag    = tx->tx.avail_units[UCT_CXI_FC_TAG];
+    sent_t           sent;
+
+    struct c_set_state_cmd ss = {};
+    ss.command.opcode = C_CMD_TGT_SETSTATE;
+    ss.ptlte_index    = riface->tag.ptn;
+    ss.ptlte_state    = C_PTLTE_DISABLED;
+    ASSERT_EQ(UCS_OK, uct_cxi_iface_tgt_post(riface, &ss));
+    usleep(100000); /* let the PTE reach the disabled state */
+
+    {
+        scoped_log_handler wrap_err(wrap_errors_logger);
+        scoped_log_handler wrap_warn(wrap_warns_logger);
+
+        send_one(SEND_SHORT, TAG, sent);
+        EXPECT_EQ(slots - (int32_t)UCT_CXI_FC_SLOTS_TAG_EAGER,
+                  tx->tx.avail_slots) << "charged when sent";
+        ASSERT_TRUE(progress_until_acked());
+
+        /* Let the receiver finish re-enabling its PTE while still wrapped. */
+        ucs_time_t until = ucs_get_time() + ucs_time_from_sec(0.5);
+        while (ucs_get_time() < until) {
+            uct_iface_progress(receiver().iface());
+        }
+    }
+
+    EXPECT_EQ(slots, tx->tx.avail_slots)
+            << "a send that never arrived must give its credits back";
+    EXPECT_EQ(tag, tx->tx.avail_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(0u, tx->tx.used_slots);
+    EXPECT_EQ(0u, tx->tx.used_units[UCT_CXI_FC_TAG]);
+    release(SEND_SHORT, sent);
+}
+
+#endif /* UCT_CXI_DISABLE_FC */
+
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_tag, cxi)
+#ifndef UCT_CXI_DISABLE_FC
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_credits, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_tag_small_window, cxi)
+#endif

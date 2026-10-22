@@ -91,9 +91,16 @@ UCS_TEST_P(test_cxi_fc, handshake_basic)
 
     /* Nothing has been spent yet: what the target granted is what is left. */
     uct_cxi_iface_t *riface = cxi_iface(receiver());
-    EXPECT_EQ(riface->fc.msg_window, (uint32_t)peer->tx.avail_msgs);
-    EXPECT_EQ(riface->fc.unit_window, (uint32_t)peer->tx.avail_units);
+    EXPECT_EQ(riface->fc.slot_window, (uint32_t)peer->tx.avail_slots);
+    EXPECT_EQ(riface->fc.unit_window[UCT_CXI_FC_AM],
+              (uint32_t)peer->tx.avail_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(riface->fc.unit_window[UCT_CXI_FC_TAG],
+              (uint32_t)peer->tx.avail_units[UCT_CXI_FC_TAG]);
     EXPECT_EQ(riface->fc.epoch & 0xffffff, peer->remote_epoch);
+    for (unsigned i = 0; i < UCT_CXI_FC_NUM_POOLS; i++) {
+        EXPECT_EQ(riface->fc.pb_shift[i], peer->pb_shift[i])
+                << "the two sides disagree on the granule of counter " << i;
+    }
 
     /* The target knows the initiator, but has started nothing of its own. */
     uct_cxi_peer_t *back = find_peer(receiver(), sender());
@@ -336,7 +343,7 @@ UCS_TEST_P(test_cxi_fc_credits, sends_block_without_credits_then_resume)
     uct_ep_h        ep   = sender().ep(0);
     uct_cxi_peer_t *peer = peer_of(sender(), 0);
     ASSERT_EQ(UCT_CXI_PEER_UP, peer->state);
-    EXPECT_EQ((int)MSG_WINDOW, peer->tx.avail_msgs);
+    EXPECT_EQ((int)MSG_WINDOW, peer->tx.avail_slots);
 
     /* The receiver never runs, so processes nothing and returns nothing. */
     unsigned     sent = 0;
@@ -346,7 +353,7 @@ UCS_TEST_P(test_cxi_fc_credits, sends_block_without_credits_then_resume)
     }
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, st);
     EXPECT_EQ(MSG_WINDOW, sent) << "exactly the window may be outstanding";
-    EXPECT_EQ(0, peer->tx.avail_msgs);
+    EXPECT_EQ(0, peer->tx.avail_slots);
 
     for (unsigned i = 0; i < 1000; i++) {
         uct_iface_progress(sender().iface());
@@ -356,7 +363,7 @@ UCS_TEST_P(test_cxi_fc_credits, sends_block_without_credits_then_resume)
 
     /* The receiver processes the messages, which hands the credits back. */
     ASSERT_TRUE(progress_until([&]() { return m_received == sent; }));
-    ASSERT_TRUE(progress_until([&]() { return peer->tx.avail_msgs > 0; }))
+    ASSERT_TRUE(progress_until([&]() { return peer->tx.avail_slots > 0; }))
             << "no credits came back";
     EXPECT_EQ(UCS_OK, send_short(ep));
 }
@@ -394,13 +401,13 @@ UCS_TEST_P(test_cxi_fc_credits, grant_waits_for_tx_room_then_goes)
         uct_iface_progress(sender().iface());
         uct_iface_progress(receiver().iface());
     }
-    EXPECT_EQ((int)(MSG_WINDOW - sent), peer->tx.avail_msgs)
+    EXPECT_EQ((int)(MSG_WINDOW - sent), peer->tx.avail_slots)
             << "credits came back although there was no room to send them";
     EXPECT_FALSE(ucs_list_is_empty(&riface->fc.grants));
 
     riface->tx.max_inflight = saved;
     ASSERT_TRUE(progress_until([&]() {
-        return peer->tx.avail_msgs == (int)MSG_WINDOW;
+        return peer->tx.avail_slots == (int)MSG_WINDOW;
     })) << "the waiting grant was never sent";
     EXPECT_TRUE(ucs_list_is_empty(&riface->fc.grants));
 }
@@ -483,21 +490,89 @@ UCS_TEST_P(test_cxi_fc_credits, credits_are_conserved)
     ASSERT_EQ(TOTAL, sent);
     ASSERT_TRUE(progress_until([&]() { return m_received == TOTAL; }));
 
-    EXPECT_EQ(TOTAL, tx->tx.used_msgs);
-    EXPECT_EQ(rx->rx.ret_msgs, tx->tx.used_msgs)
+    EXPECT_EQ(TOTAL, tx->tx.used_slots);
+    EXPECT_EQ(rx->rx.ret_slots, tx->tx.used_slots)
             << "the receiver must have processed exactly what was spent";
-    EXPECT_EQ(rx->rx.ret_units, tx->tx.used_units);
+    EXPECT_EQ(rx->rx.ret_units[UCT_CXI_FC_AM], tx->tx.used_units[UCT_CXI_FC_AM]);
 
     /* The sender has been handed back no more than was processed, and what it
      * has not been handed is below a grant threshold (else a GRANT is due, and
      * may still be on its way). */
-    unsigned threshold = cxi_iface(receiver())->fc.grant_msgs;
+    unsigned threshold = cxi_iface(receiver())->fc.grant_slots;
     ASSERT_TRUE(progress_until([&]() {
-        return (uint32_t)(rx->rx.ret_msgs - tx->tx.ret_msgs) < threshold;
+        return (uint32_t)(rx->rx.ret_slots - tx->tx.ret_slots) < threshold;
     })) << "a grant was due but never arrived";
-    EXPECT_LE((int32_t)(tx->tx.ret_msgs - rx->rx.ret_msgs), 0);
+    EXPECT_LE((int32_t)(tx->tx.ret_slots - rx->rx.ret_slots), 0);
     EXPECT_EQ((int32_t)MSG_WINDOW,
-              tx->tx.avail_msgs + (int32_t)(tx->tx.used_msgs - tx->tx.ret_msgs));
+              tx->tx.avail_slots + (int32_t)(tx->tx.used_slots - tx->tx.ret_slots));
+}
+
+/**
+ * Event slots are one pool for every class of message; buffer space is a pool
+ * of its own for each. Tag sends are not charged yet, so the charges are made
+ * by hand, against a tag pool filled in by hand.
+ */
+UCS_TEST_P(test_cxi_fc_credits, slots_are_shared_and_buffer_space_is_per_class)
+{
+    cxi_connect(sender(), 0, receiver());
+
+    uct_cxi_ep_t    *ep    = ucs_derived_of(sender().ep(0), uct_cxi_ep_t);
+    uct_cxi_iface_t *iface = cxi_iface(sender());
+    uct_cxi_peer_t  *peer  = ep->peer;
+    const int32_t    slots = peer->tx.avail_slots;
+    const int32_t    am    = peer->tx.avail_units[UCT_CXI_FC_AM];
+    int              credited;
+
+    ASSERT_EQ((int32_t)MSG_WINDOW, slots);
+    peer->tx.avail_units[UCT_CXI_FC_TAG] = 100;
+
+    /* A tag message that needs more tag space than there is waits, although
+     * there are slots and Active Message space for it. */
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE,
+              uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG, 2, 101, &credited));
+    EXPECT_TRUE(iface->tx.credit_block);
+    iface->tx.credit_block = 0;
+
+    /* One that fits is charged its two slots and its tag space, nothing of
+     * the Active Message pool. */
+    ASSERT_EQ(UCS_OK,
+              uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG, 2, 100, &credited));
+    EXPECT_TRUE(credited);
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_TAG, 2, 100);
+    EXPECT_EQ(slots - 2, peer->tx.avail_slots);
+    EXPECT_EQ(0, peer->tx.avail_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(am, peer->tx.avail_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(2u, peer->tx.used_slots);
+    EXPECT_EQ(100u, peer->tx.used_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(0u, peer->tx.used_units[UCT_CXI_FC_AM]);
+
+    /* Another tag message is out of tag space; an Active Message is not, and
+     * it takes its slot from the same pool the tag message did. */
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE,
+              uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG, 2, 1, &credited));
+    iface->tx.credit_block = 0;
+    ASSERT_EQ(UCS_OK,
+              uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_AM, 1, 1, &credited));
+    uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_AM, 1, 1);
+    EXPECT_EQ(slots - 3, peer->tx.avail_slots);
+    EXPECT_EQ(am - 1, peer->tx.avail_units[UCT_CXI_FC_AM]);
+
+    /* And slots run out for everyone together. */
+    peer->tx.avail_slots = 1;
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE,
+              uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_TAG, 2, 0, &credited));
+    iface->tx.credit_block = 0;
+    peer->tx.avail_slots = slots - 3;
+
+    /* A refund puts each charge back where it came from. */
+    uct_cxi_fc_refund(iface, ep, UCT_CXI_FC_TAG, 2, 100);
+    uct_cxi_fc_refund(iface, ep, UCT_CXI_FC_AM, 1, 1);
+    EXPECT_EQ(slots, peer->tx.avail_slots);
+    EXPECT_EQ(100, peer->tx.avail_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(am, peer->tx.avail_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(0u, peer->tx.used_slots);
+    EXPECT_EQ(0u, peer->tx.used_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(0u, peer->tx.used_units[UCT_CXI_FC_AM]);
 }
 
 /**
@@ -537,15 +612,163 @@ UCS_TEST_P(test_cxi_fc_piggyback, credits_ride_on_a_reverse_message)
         uct_iface_progress(sender().iface());
         uct_iface_progress(receiver().iface());
     }
-    EXPECT_EQ(0u, tx->tx.ret_msgs);
+    EXPECT_EQ(0u, tx->tx.ret_slots);
 
     /* A message from the receiver carries them. */
     uint64_t payload = 0;
     ASSERT_UCS_OK(uct_ep_am_short(receiver().ep(0), AM_ID, 0, &payload,
                                   sizeof(payload)));
     ASSERT_TRUE(progress_until([&]() { return back == 1; }));
-    EXPECT_EQ(N, tx->tx.ret_msgs) << "the piggybacked credits were not applied";
-    EXPECT_EQ((int32_t)64, tx->tx.avail_msgs);
+    EXPECT_EQ(N, tx->tx.ret_slots) << "the piggybacked credits were not applied";
+    EXPECT_EQ((int32_t)64, tx->tx.avail_slots);
+}
+
+/**
+ * Every counter a peer owes rides on a message going the other way, not only
+ * the Active Message ones: event slots, and the buffer space of each class.
+ * Nothing is sent from the sender here; what the receiver owes is set by hand,
+ * as if it had processed that much.
+ */
+UCS_TEST_P(test_cxi_fc_piggyback, every_counter_rides_a_reverse_message)
+{
+    unsigned back = 0;
+
+    ASSERT_UCS_OK(uct_iface_set_am_handler(sender().iface(), AM_ID,
+                                           count_am_handler, &back, 0));
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_cxi_peer_t *tx = peer_of(sender(), 0);
+    uct_cxi_peer_t *rx = find_peer(receiver(), sender());
+    ASSERT_NE(nullptr, rx);
+
+    const int32_t slots = tx->tx.avail_slots;
+    const int32_t am    = tx->tx.avail_units[UCT_CXI_FC_AM];
+    const int32_t tag   = tx->tx.avail_units[UCT_CXI_FC_TAG];
+    ASSERT_GT(tag, 0) << "the CREP did not grant a tag pool";
+
+    rx->rx.ret_slots                 += 3;
+    rx->rx.ret_units[UCT_CXI_FC_AM]  += 5;
+    rx->rx.ret_units[UCT_CXI_FC_TAG] += 7;
+
+    uint64_t payload = 0;
+    ASSERT_UCS_OK(uct_ep_am_short(receiver().ep(0), AM_ID, 0, &payload,
+                                  sizeof(payload)));
+    ASSERT_TRUE(progress_until([&]() { return back == 1; }));
+
+    EXPECT_EQ(3u, tx->tx.ret_slots);
+    EXPECT_EQ(5u, tx->tx.ret_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(7u, tx->tx.ret_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(slots + 3, tx->tx.avail_slots);
+    EXPECT_EQ(am + 5, tx->tx.avail_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(tag + 7, tx->tx.avail_units[UCT_CXI_FC_TAG]);
+
+    /* The receiver now counts all of it as told. */
+    EXPECT_EQ(rx->rx.ret_slots, rx->rx.adv_slots);
+    EXPECT_EQ(rx->rx.ret_units[UCT_CXI_FC_AM], rx->rx.adv_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(rx->rx.ret_units[UCT_CXI_FC_TAG],
+              rx->rx.adv_units[UCT_CXI_FC_TAG]);
+}
+
+/**
+ * A pure GRANT carries the same counters, whole.
+ */
+UCS_TEST_P(test_cxi_fc_piggyback, grant_carries_every_counter)
+{
+    cxi_connect(sender(), 0, receiver());
+    uct_cxi_peer_t *tx = peer_of(sender(), 0);
+    uct_cxi_peer_t *rx = find_peer(receiver(), sender());
+    ASSERT_NE(nullptr, rx);
+
+    const int32_t tag = tx->tx.avail_units[UCT_CXI_FC_TAG];
+
+    rx->rx.ret_slots                 += 3;
+    rx->rx.ret_units[UCT_CXI_FC_AM]  += 5;
+    rx->rx.ret_units[UCT_CXI_FC_TAG] += 7;
+    uct_cxi_fc_grant_wanted(cxi_iface(receiver()), rx);
+
+    ASSERT_TRUE(progress_until([&]() {
+        return tx->tx.ret_units[UCT_CXI_FC_TAG] == 7u;
+    })) << "the GRANT did not arrive";
+    EXPECT_EQ(3u, tx->tx.ret_slots);
+    EXPECT_EQ(5u, tx->tx.ret_units[UCT_CXI_FC_AM]);
+    EXPECT_EQ(tag + 7, tx->tx.avail_units[UCT_CXI_FC_TAG]);
+    ASSERT_TRUE(progress_until([&]() {
+        return rx->rx.acked_units[UCT_CXI_FC_TAG] == 7u;
+    })) << "the GRANT's delivery was not recorded";
+}
+
+/**
+ * No window is too large for the counters: a window of 1 GiB (far above what
+ * 17 bits can tell apart) is counted in granules instead. What a piggyback
+ * carries is rounded down to a granule and the rest stays owed, until a GRANT
+ * says it exactly.
+ */
+class test_cxi_fc_large_window : public test_cxi_fc_piggyback {
+public:
+    void init() override
+    {
+        modify_config("CXI_FC_TAG_BYTE_WINDOW", "1g");
+        m_received = 0;
+        test_cxi_rma_base::init();
+    }
+};
+
+UCS_TEST_P(test_cxi_fc_large_window, counters_are_carried_in_granules)
+{
+    static const unsigned SHIFT = 9; /* 2^24 units: 2^15 granules of 2^9 */
+    unsigned back = 0;
+
+    ASSERT_UCS_OK(uct_iface_set_am_handler(sender().iface(), AM_ID,
+                                           count_am_handler, &back, 0));
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_cxi_peer_t *tx = peer_of(sender(), 0);
+    uct_cxi_peer_t *rx = find_peer(receiver(), sender());
+    ASSERT_NE(nullptr, rx);
+
+    const uint32_t window = 1u << 24;
+    ASSERT_EQ(window, cxi_iface(receiver())->fc.unit_window[UCT_CXI_FC_TAG]);
+    ASSERT_EQ((int32_t)window, tx->tx.avail_units[UCT_CXI_FC_TAG])
+            << "the CREP did not carry the whole window";
+    EXPECT_EQ(SHIFT, (unsigned)tx->pb_shift[1 + UCT_CXI_FC_TAG]);
+    EXPECT_EQ(0u, (unsigned)tx->pb_shift[1 + UCT_CXI_FC_AM]);
+    EXPECT_EQ(0u, (unsigned)tx->pb_shift[0]);
+
+    uint64_t payload = 0;
+
+    /* Less than a granule: nothing is worth sending. */
+    rx->rx.ret_units[UCT_CXI_FC_TAG] = 100;
+    ASSERT_UCS_OK(uct_ep_am_short(receiver().ep(0), AM_ID, 0, &payload,
+                                  sizeof(payload)));
+    ASSERT_TRUE(progress_until([&]() { return back == 1; }));
+    EXPECT_EQ(0u, tx->tx.ret_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(0u, rx->rx.adv_units[UCT_CXI_FC_TAG]);
+
+    /* Two and a bit granules: the two go, the bit stays owed. */
+    rx->rx.ret_units[UCT_CXI_FC_TAG] = (2u << SHIFT) + 100;
+    ASSERT_UCS_OK(uct_ep_am_short(receiver().ep(0), AM_ID, 0, &payload,
+                                  sizeof(payload)));
+    ASSERT_TRUE(progress_until([&]() { return back == 2; }));
+    EXPECT_EQ(2u << SHIFT, tx->tx.ret_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(window + (2u << SHIFT),
+              (uint32_t)tx->tx.avail_units[UCT_CXI_FC_TAG]);
+    EXPECT_EQ(2u << SHIFT, rx->rx.adv_units[UCT_CXI_FC_TAG]);
+
+    /* A GRANT is exact, and the sender takes it from there. */
+    uct_cxi_fc_grant_wanted(cxi_iface(receiver()), rx);
+    ASSERT_TRUE(progress_until([&]() {
+        return tx->tx.ret_units[UCT_CXI_FC_TAG] == (2u << SHIFT) + 100;
+    })) << "the GRANT did not arrive";
+    EXPECT_EQ(window + (2u << SHIFT) + 100,
+              (uint32_t)tx->tx.avail_units[UCT_CXI_FC_TAG]);
+
+    /* A piggyback after that, short of the next granule, adds nothing and
+     * does not take back what the GRANT told. */
+    rx->rx.ret_units[UCT_CXI_FC_TAG] += 10;
+    ASSERT_UCS_OK(uct_ep_am_short(receiver().ep(0), AM_ID, 0, &payload,
+                                  sizeof(payload)));
+    ASSERT_TRUE(progress_until([&]() { return back == 3; }));
+    EXPECT_EQ((2u << SHIFT) + 100, tx->tx.ret_units[UCT_CXI_FC_TAG]);
 }
 
 /**
@@ -576,7 +799,7 @@ UCS_TEST_P(test_cxi_fc_bytes, byte_credits_limit_large_sends)
     uct_ep_h        ep   = sender().ep(0);
     uct_cxi_peer_t *peer = peer_of(sender(), 0);
 
-    ASSERT_EQ(32u * 1024 / UCT_CXI_FC_UNIT, (unsigned)peer->tx.avail_units);
+    ASSERT_EQ(32u * 1024 / UCT_CXI_FC_UNIT, (unsigned)peer->tx.avail_units[UCT_CXI_FC_AM]);
 
     std::vector<uint8_t> buf(len, 0x5A);
     uct_mem_h            memh = reg(sender(), buf.data(), len);
@@ -590,12 +813,12 @@ UCS_TEST_P(test_cxi_fc_bytes, byte_credits_limit_large_sends)
     }
     EXPECT_EQ(UCS_ERR_NO_RESOURCE, st);
     EXPECT_EQ(4u, sent) << "the byte window holds four";
-    EXPECT_EQ(0, peer->tx.avail_units);
-    EXPECT_GT(peer->tx.avail_msgs, 0) << "messages, not bytes, ran out";
+    EXPECT_EQ(0, peer->tx.avail_units[UCT_CXI_FC_AM]);
+    EXPECT_GT(peer->tx.avail_slots, 0) << "messages, not bytes, ran out";
 
     ASSERT_TRUE(progress_until([&]() { return received == sent; }));
     ASSERT_TRUE(progress_until([&]() {
-        return peer->tx.avail_units >= (int32_t)UCT_CXI_FC_UNITS(len);
+        return peer->tx.avail_units[UCT_CXI_FC_AM] >= (int32_t)UCT_CXI_FC_UNITS(len);
     })) << "byte credits never came back";
     EXPECT_EQ(UCS_INPROGRESS,
               uct_ep_am_zcopy(ep, 1, NULL, 0, &iov, 1, 0, NULL));
@@ -640,7 +863,7 @@ UCS_TEST_P(test_cxi_fc_credits, failed_send_is_refunded)
         for (unsigned i = 0; i < 3; i++) {
             ASSERT_EQ(UCS_OK, send_short(ep));
         }
-        EXPECT_EQ((int)MSG_WINDOW - 3, peer->tx.avail_msgs)
+        EXPECT_EQ((int)MSG_WINDOW - 3, peer->tx.avail_slots)
                 << "charged when sent";
 
         ASSERT_TRUE(progress_until([&]() { return siface->tx.outstanding == 0; }));
@@ -652,9 +875,9 @@ UCS_TEST_P(test_cxi_fc_credits, failed_send_is_refunded)
         }
     }
 
-    EXPECT_EQ((int)MSG_WINDOW, peer->tx.avail_msgs)
+    EXPECT_EQ((int)MSG_WINDOW, peer->tx.avail_slots)
             << "a send that never arrived must give its credits back";
-    EXPECT_EQ(0u, peer->tx.used_msgs);
+    EXPECT_EQ(0u, peer->tx.used_slots);
     EXPECT_EQ(0u, m_received);
 }
 
@@ -751,7 +974,7 @@ UCS_TEST_P(test_cxi_fc_ring, failed_put_is_not_delivered)
 
     /* The sender gave back what failed, so what it still has charged is what
      * got through -- which is what the handler saw, whole. */
-    unsigned delivered = tx->tx.used_msgs;
+    unsigned delivered = tx->tx.used_slots;
     EXPECT_GE(delivered, 1u) << "the first message always fits";
     EXPECT_LT(delivered, N) << "the tail of the buffer should have run out";
     EXPECT_EQ(delivered, rx.received)
@@ -759,10 +982,10 @@ UCS_TEST_P(test_cxi_fc_ring, failed_put_is_not_delivered)
     EXPECT_EQ(0u, rx.wrong_length) << "a failed Put reached the handler";
 
     /* Credits come back only for what was processed. */
-    EXPECT_EQ(rx.received, rxpeer->rx.ret_msgs);
-    EXPECT_EQ((int32_t)cxi_iface(receiver())->fc.msg_window,
-              tx->tx.avail_msgs + (int32_t)(tx->tx.used_msgs -
-                                            tx->tx.ret_msgs));
+    EXPECT_EQ(rx.received, rxpeer->rx.ret_slots);
+    EXPECT_EQ((int32_t)cxi_iface(receiver())->fc.slot_window,
+              tx->tx.avail_slots + (int32_t)(tx->tx.used_slots -
+                                            tx->tx.ret_slots));
 
     dereg(sender(), memh);
 }
@@ -770,6 +993,7 @@ UCS_TEST_P(test_cxi_fc_ring, failed_put_is_not_delivered)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_credits, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_bytes, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_piggyback, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_large_window, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_ring, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_fc_timeout, cxi)

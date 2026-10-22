@@ -380,7 +380,7 @@ UCS_TEST_P(test_cxi_iface_big_buffers, buffer_size_is_not_message_size)
 
     EXPECT_EQ(2u * 1024 * 1024, iface->am.buf_size);
     EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
-    EXPECT_EQ(1024u * 1024 / UCT_CXI_FC_UNIT, iface->fc.unit_window);
+    EXPECT_EQ(1024u * 1024 / UCT_CXI_FC_UNIT, iface->fc.unit_window[UCT_CXI_FC_AM]);
 }
 
 #endif /* UCT_CXI_DISABLE_FC */
