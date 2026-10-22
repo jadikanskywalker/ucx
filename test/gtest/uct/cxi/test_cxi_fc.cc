@@ -708,7 +708,12 @@ public:
     void init() override
     {
         modify_config("CXI_FC_TAG_BYTE_WINDOW", "1g");
+        /* A tag ring for 8 peers at such a window would be 8 GiB: this test is
+         * about the counters, not the ring, and takes a small one, which it
+         * is warned about. */
+        modify_config("CXI_TAG_OVERFLOW_NUM_BUFS", "2");
         m_received = 0;
+        scoped_log_handler wrap_warn(wrap_warns_logger);
         test_cxi_rma_base::init();
     }
 };

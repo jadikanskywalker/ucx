@@ -91,13 +91,15 @@ protected:
 
     void init() override
     {
-        /* A deliberately tiny ring, which flow control would size larger. */
-#ifndef UCT_CXI_DISABLE_FC
-        modify_config("CXI_FC_ENABLE", "n");
-#endif
         modify_config("CXI_TAG_OVERFLOW_NUM_BUFS", "1");
         modify_config("CXI_TAG_OVERFLOW_BUF_SIZE", "1024");
         modify_config("CXI_TAG_EAGER_MAX", "512");
+
+        /* The ring set above is deliberately tiny, far below what the credit
+         * windows need, which each interface says in a warning. */
+#ifndef UCT_CXI_DISABLE_FC
+        scoped_log_handler wrap_warn(wrap_warns_logger);
+#endif
 
         /* Deliberately not calling test_cxi_rma_base::init() -- it uses the
          * no-arg create_entity(), which substitutes a dummy eager_cb we

@@ -374,7 +374,12 @@ static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
         num_bufs = UCT_CXI_TAG_OVF_NUM_BUFS_MAX;
     }
 
-    self->tag.num_bufs = (unsigned)ucs_max(num_bufs, 2ul);
+    /* A ring of one would have nothing linked while its buffer is being
+     * reposted; that is for the user to ask for, not for sizing to derive. */
+    if (config->tag_ovf_num_bufs == UCS_ULUNITS_AUTO) {
+        num_bufs = ucs_max(num_bufs, 2ul);
+    }
+    self->tag.num_bufs = (unsigned)num_bufs;
     self->tag.buf_size = buf_size;
 }
 
