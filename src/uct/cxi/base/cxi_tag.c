@@ -57,6 +57,7 @@
 #include <uct/base/uct_iov.inl>
 #include <ucs/debug/log.h>
 #include <ucs/sys/math.h>
+#include <ucs/sys/string.h>
 
 #include <cassini_user_defs.h>
 #include <cxi_prov_hw.h>
@@ -90,8 +91,11 @@ static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
 /*
  * uct_cxi_iface_tag_unexp_init -- the entries that hold unexpected messages
  * until they are reported (see uct_cxi_unexp_report_t in cxi_tag.h): one
- * registered array of tag.max_outstanding, the same bound as the pools beside
- * it, as every message in it is an unexpected arrival we are yet to report.
+ * registered array of tag.unexp_max, as every message in it is an unexpected
+ * arrival we are yet to report, and that is as many as the credits let senders
+ * have outstanding (each holds at least the slots of an eager message), or
+ * tag.max_outstanding, the bound of the pools beside it, without flow
+ * control.
  * Registered because each entry is also the landing buffer of its own address
  * read. Only LAC 0 can be reached by the senders' RMA PTEs.
  *
@@ -105,7 +109,7 @@ static ucs_status_t
 uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
     size_t       page = ucs_get_page_size();
-    size_t       len  = ucs_align_up(self->tag.max_outstanding *
+    size_t       len  = ucs_align_up(self->tag.unexp_max *
                                      sizeof(uct_cxi_unexp_report_t), page);
     ucs_status_t status;
     unsigned     i;
@@ -126,21 +130,21 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
     self->tag.unexp_stream_pool = NULL;
     self->tag.unexp_stream_free = NULL;
 
-    self->tag.unexp_stream_pool = ucs_calloc(self->tag.max_outstanding,
+    self->tag.unexp_stream_pool = ucs_calloc(self->tag.unexp_max,
                                              sizeof(uct_cxi_unexp_stream_t),
                                              "cxi-tag-unexp-streams");
     if (self->tag.unexp_stream_pool == NULL) {
         status = UCS_ERR_NO_MEMORY;
         goto err_streams;
     }
-    for (i = 0; i < self->tag.max_outstanding; i++) {
+    for (i = 0; i < self->tag.unexp_max; i++) {
         self->tag.unexp_stream_pool[i].next_free =
-                (i + 1 < self->tag.max_outstanding) ?
+                (i + 1 < self->tag.unexp_max) ?
                 &self->tag.unexp_stream_pool[i + 1] : NULL;
     }
     self->tag.unexp_stream_free = &self->tag.unexp_stream_pool[0];
     if (kh_resize(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams,
-                  2 * self->tag.max_outstanding) < 0) {
+                  2 * self->tag.unexp_max) < 0) {
         status = UCS_ERR_NO_MEMORY;
         goto err_streams;
     }
@@ -170,9 +174,9 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
     }
 
     self->tag.unexp_ents_len = len;
-    for (i = 0; i < self->tag.max_outstanding; i++) {
+    for (i = 0; i < self->tag.unexp_max; i++) {
         self->tag.unexp_ents[i].next_free =
-                (i + 1 < self->tag.max_outstanding) ?
+                (i + 1 < self->tag.unexp_max) ?
                 &self->tag.unexp_ents[i + 1] : NULL;
     }
     self->tag.unexp_free = &self->tag.unexp_ents[0];
@@ -302,6 +306,78 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
     return UCS_OK;
 }
 
+/*
+ * uct_cxi_iface_size_tag_ring -- resolve the number and size of the overflow
+ * buffers. \a outstanding is the most bytes that the peers allowed to send at
+ * once may have sent and not yet had processed (active senders x tag byte
+ * window), or 0 when flow control is off and nothing bounds it.
+ *
+ * Messages are placed back to back, and the NIC retires a buffer once less
+ * than max_msg is left in it, so every buffer takes at least
+ * (buf_size - max_msg) bytes before it is retired. A message is processed in
+ * the order the NIC matched it, and a retired buffer is reposted when the last
+ * message in it has been, so the unprocessed bytes sit in the buffers after the
+ * one being processed. Allow for those, for the buffer being processed (it may
+ * be mostly processed and yet cannot be reposted), and for one more that is
+ * linked to take the next message:
+ *
+ *    num_bufs = floor(outstanding / (buf_size - max_msg)) + 2
+ *
+ * (The same as for the AM ring, whose messages have an 8-byte header.)
+ */
+static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
+                                        const uct_cxi_iface_config_t *config,
+                                        size_t outstanding)
+{
+    size_t        max_msg  = self->tag.max_msg;
+    size_t        min_size = 2 * max_msg;
+    size_t        buf_size;
+    unsigned long num_bufs;
+    unsigned long needed   = 0;
+
+    if (config->tag_ovf_buf_size != UCS_MEMUNITS_AUTO) {
+        buf_size = config->tag_ovf_buf_size;
+    } else if (outstanding != 0) {
+        buf_size = ucs_max((size_t)UCT_CXI_TAG_OVF_BUF_SIZE_MIN,
+                           UCT_CXI_TAG_OVF_BUF_PER_MSG * max_msg);
+    } else {
+        buf_size = UCT_CXI_TAG_OVF_BUF_SIZE_DEFAULT;
+    }
+
+    if (buf_size < min_size) {
+        if (config->tag_ovf_buf_size != UCS_MEMUNITS_AUTO) {
+            ucs_warn("cxi TAG_OVERFLOW_BUF_SIZE=%zu is too small for %zu-byte "
+                     "messages: using %zu", buf_size, max_msg, min_size);
+        }
+        buf_size = min_size;
+    }
+
+    if (outstanding != 0) {
+        needed = outstanding / (buf_size - max_msg) + 2;
+    }
+
+    if (config->tag_ovf_num_bufs == UCS_ULUNITS_AUTO) {
+        num_bufs = (outstanding != 0) ? needed : UCT_CXI_TAG_OVF_NUM_BUFS_DEFAULT;
+    } else {
+        num_bufs = config->tag_ovf_num_bufs;
+        if (needed > num_bufs) {
+            ucs_warn("cxi TAG_OVERFLOW_NUM_BUFS=%lu is below the %lu that "
+                     "FC_ACTIVE_SENDERS peers at their full window need: the "
+                     "ring can run out of buffers under load", num_bufs,
+                     needed);
+        }
+    }
+
+    if (num_bufs > UCT_CXI_TAG_OVF_NUM_BUFS_MAX) {
+        ucs_warn("cxi tag overflow ring wants %lu buffers, limited to %u",
+                 num_bufs, UCT_CXI_TAG_OVF_NUM_BUFS_MAX);
+        num_bufs = UCT_CXI_TAG_OVF_NUM_BUFS_MAX;
+    }
+
+    self->tag.num_bufs = (unsigned)ucs_max(num_bufs, 2ul);
+    self->tag.buf_size = buf_size;
+}
+
 int uct_cxi_iface_tag_requested(const uct_cxi_iface_config_t *config,
                                 const uct_iface_params_t *params)
 {
@@ -319,7 +395,8 @@ size_t uct_cxi_tag_max_msg(const uct_cxi_iface_config_t *config)
 ucs_status_t
 uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                            const uct_cxi_iface_config_t *config,
-                           const uct_iface_params_t *params)
+                           const uct_iface_params_t *params,
+                           size_t slot_credits, size_t byte_credits)
 {
     const union c_event *ev;
     ucs_status_t         status;
@@ -343,12 +420,9 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     self->tag.rndv_cb   = params->rndv_cb;
     self->tag.rndv_arg  = params->rndv_arg;
 
-    /* num_bufs must be clamped before max_outstanding is computed --
-     * UCT_CXI_TAG_MAX_OUTSTANDING_MAX leaves the one buffer_id that
+    /* UCT_CXI_TAG_MAX_OUTSTANDING_MAX leaves the one buffer_id that
      * SEARCH_AND_DELETE uses (UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID) below
      * the hardware's real 65535 ceiling. */
-    self->tag.num_bufs        = ucs_min(config->tag_ovf_num_bufs,
-                                        UCT_CXI_TAG_OVF_NUM_BUFS_MAX);
     self->tag.max_outstanding = ucs_min(config->tag_max_outstanding,
                                         UCT_CXI_TAG_MAX_OUTSTANDING_MAX);
 
@@ -362,8 +436,22 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                  "express: limiting the eager size to it",
                  config->tag_eager_max, UCT_CXI_AM_MAX_MSG_LIMIT);
     }
-    self->tag.buf_size = ucs_max(config->tag_ovf_buf_size,
-                                 2 * self->tag.max_msg);
+    uct_cxi_iface_size_tag_ring(self, config, byte_credits);
+
+    /* What can be unexpected at once: every message the peers' windows allow
+     * that goes to the overflow list holds at least an eager message's slots
+     * until it is reported; a receive posted for each is the most there are
+     * without flow control. */
+    self->tag.unexp_max = self->tag.max_outstanding;
+    if (slot_credits != 0) {
+        self->tag.unexp_max = ucs_max(self->tag.unexp_max,
+                                      slot_credits / UCT_CXI_FC_SLOTS_TAG_EAGER);
+    }
+    if (self->tag.unexp_max > UCT_CXI_TAG_UNEXP_MAX_LIMIT) {
+        ucs_warn("cxi TAG wants room for %zu unexpected messages, limited to "
+                 "%u", self->tag.unexp_max, UCT_CXI_TAG_UNEXP_MAX_LIMIT);
+        self->tag.unexp_max = UCT_CXI_TAG_UNEXP_MAX_LIMIT;
+    }
 
     /* Outstanding priority-LE tracking. */
     self->tag.ctx = ucs_calloc(self->tag.max_outstanding,
@@ -395,6 +483,14 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
      * in cxi_iface.h. Growable, starts empty; never fails to init. */
     kh_init_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     kh_init_inplace(uct_cxi_eager_pair_hash, &self->tag.eager_pairs);
+    if ((slot_credits != 0) &&
+        (kh_resize(uct_cxi_eager_pair_hash, &self->tag.eager_pairs,
+                   self->tag.unexp_max) < 0)) {
+        /* Never more messages wait for their other event than are unexpected;
+         * sized for all of them, a put does not have to allocate. */
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_rndv_peer_cache;
+    }
 
     /* Software-issued (get_issued==0) rendezvous Get tracking pool -- see
      * uct_cxi_rdzv_get_op_t in cxi_tag.h. Capped the same as
@@ -525,10 +621,11 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     }
 
     self->tag.enabled = 1;
-    ucs_debug("cxi TAG PTE ptn %u enabled: %u overflow bufs x %zu bytes, "
-             "min_free %zu, max_outstanding=%u", self->tag.pte->ptn,
+    ucs_info("cxi TAG ring: %u buffers of %zu bytes, min_free %zu; %zu "
+             "unexpected messages, %u posted receives",
              self->tag.num_bufs, self->tag.buf_size, self->tag.max_msg,
-             self->tag.max_outstanding);
+             self->tag.unexp_max, self->tag.max_outstanding);
+    ucs_debug("cxi TAG PTE ptn %u enabled", self->tag.pte->ptn);
     return UCS_OK;
 
 err_unmap_pte:

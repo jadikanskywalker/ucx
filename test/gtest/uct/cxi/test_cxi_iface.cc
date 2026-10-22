@@ -290,8 +290,24 @@ UCS_TEST_P(test_cxi_iface_sized, sized_for_flow_control)
     EXPECT_EQ(1024u * 1024, iface->am.buf_size);
     EXPECT_EQ(10u, iface->am.num_bufs);
 
-    /* 8 x 512 messages, 1024 for the rest, 64 reserved, 128 slack. */
-    EXPECT_EQ(8u * 512 + 1024 + 64 + 128, iface->rx_eq.num_events);
+    /* The tag overflow ring: 8 x 512 KiB outstanding, 1 MiB buffers of which
+     * at least 1 MiB - 256 KiB are used before one is retired: 5, and 2, so no
+     * larger than the AM ring. Advertised sizes do not follow the ring. */
+    ASSERT_NE(nullptr, iface->tag.pte);
+    EXPECT_EQ(256u * 1024, iface->tag.max_msg);
+    EXPECT_EQ(1024u * 1024, iface->tag.buf_size);
+    EXPECT_EQ(7u, iface->tag.num_bufs);
+    EXPECT_LE(iface->tag.num_bufs * iface->tag.buf_size,
+              iface->am.num_bufs * iface->am.buf_size);
+    EXPECT_EQ((size_t)UINT32_MAX,
+              get_entity().iface_attr().cap.tag.recv.max_zcopy);
+
+    /* Unexpected messages the credits let be outstanding: 8 x 512 slots, at
+     * least one of them each. */
+    EXPECT_EQ(8u * 512, iface->tag.unexp_max);
+
+    /* 8 x 512 slots, 512 receives of 3 events each, 64 reserved, 128 slack. */
+    EXPECT_EQ(8u * 512 + 512 * 3 + 64 + 128, iface->rx_eq.num_events);
     EXPECT_EQ(64u, iface->rx_eq.reserved_slots);
 }
 
@@ -309,7 +325,10 @@ UCS_TEST_P(test_cxi_iface_16_senders, sized_for_more_senders)
 
     EXPECT_EQ(1024u * 1024, iface->am.buf_size);
     EXPECT_EQ(18u, iface->am.num_bufs);
-    EXPECT_EQ(16u * 512 + 1024 + 64 + 128, iface->rx_eq.num_events);
+    EXPECT_EQ(1024u * 1024, iface->tag.buf_size);
+    EXPECT_EQ(12u, iface->tag.num_bufs); /* 8 MiB / 768 KiB, and 2 */
+    EXPECT_EQ(16u * 512, iface->tag.unexp_max);
+    EXPECT_EQ(16u * 512 + 512 * 3 + 64 + 128, iface->rx_eq.num_events);
 }
 
 /** Sizes that are set explicitly are used as they are. */
@@ -323,7 +342,9 @@ protected:
         modify_config("CXI_FC_MSG_WINDOW", "64");
         modify_config("CXI_AM_RX_NUM_BUFS", "3");
         modify_config("CXI_AM_RX_BUF_SIZE", "64k");
-        modify_config("CXI_EQ_SIZE", "2048");
+        modify_config("CXI_TAG_OVERFLOW_NUM_BUFS", "3");
+        modify_config("CXI_TAG_OVERFLOW_BUF_SIZE", "1m");
+        modify_config("CXI_EQ_SIZE", "4096");
     }
 };
 
@@ -333,7 +354,9 @@ UCS_TEST_P(test_cxi_iface_explicit, explicit_sizes_are_used)
 
     EXPECT_EQ(3u, iface->am.num_bufs);
     EXPECT_EQ(64u * 1024, iface->am.buf_size);
-    EXPECT_EQ(2048u, iface->rx_eq.num_events);
+    EXPECT_EQ(3u, iface->tag.num_bufs);
+    EXPECT_EQ(1024u * 1024, iface->tag.buf_size);
+    EXPECT_EQ(4096u, iface->rx_eq.num_events);
 }
 
 /** ... even when they are too small for what the credits allow. */
@@ -342,6 +365,7 @@ protected:
     void configure() override
     {
         modify_config("CXI_AM_RX_NUM_BUFS", "2");
+        modify_config("CXI_TAG_OVERFLOW_NUM_BUFS", "2");
         modify_config("CXI_EQ_SIZE", "1024");
     }
 
@@ -358,6 +382,7 @@ UCS_TEST_P(test_cxi_iface_too_small, too_small_sizes_are_used_with_a_warning)
     uct_cxi_iface_t *iface = cxi_iface();
 
     EXPECT_EQ(2u, iface->am.num_bufs);
+    EXPECT_EQ(2u, iface->tag.num_bufs);
     EXPECT_EQ(1024u, iface->rx_eq.num_events);
 }
 
@@ -402,6 +427,9 @@ UCS_TEST_P(test_cxi_iface_no_fc, legacy_sizes)
 
     EXPECT_EQ(4u, iface->am.num_bufs);
     EXPECT_EQ(512u * 1024, iface->am.buf_size);
+    EXPECT_EQ(4u, iface->tag.num_bufs);
+    EXPECT_EQ(512u * 1024, iface->tag.buf_size);
+    EXPECT_EQ(512u, iface->tag.unexp_max);
     EXPECT_EQ(1024u, iface->rx_eq.num_events);
     EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
 }

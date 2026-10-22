@@ -1190,14 +1190,14 @@ UCS_TEST_P(test_cxi_tag_credits, cost_decides_what_can_go)
     ucs_status_t    status;
 
     /* Two slots: the first rendezvous send takes one for its announce, and
-     * has too few left for itself. */
-    tx->tx.avail_slots = 2;
+     * has too few left for itself, which needs two. */
+    tx->tx.avail_slots = UCT_CXI_FC_SLOTS_AM + UCT_CXI_FC_SLOTS_TAG_RNDV - 1;
     send_one(SEND_RNDV, TAG, sent, &status);
-    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status) << "a rendezvous needs 3 slots";
+    EXPECT_EQ(UCS_ERR_NO_RESOURCE, status) << "a rendezvous needs 2 slots";
     release(SEND_RNDV, sent);
-    EXPECT_EQ(2 - (int32_t)UCT_CXI_FC_SLOTS_AM, tx->tx.avail_slots);
+    EXPECT_EQ((int32_t)UCT_CXI_FC_SLOTS_TAG_RNDV - 1, tx->tx.avail_slots);
 
-    /* Two slots are enough for an eager message. */
+    /* One slot is enough for an eager message. */
     tx->tx.avail_slots = UCT_CXI_FC_SLOTS_TAG_EAGER;
     send_one(SEND_SHORT, TAG, sent, &status);
     EXPECT_EQ(UCS_OK, status);
@@ -1220,7 +1220,7 @@ UCS_TEST_P(test_cxi_tag_credits, cost_decides_what_can_go)
 
 /**
  * Sends that are answered from the priority list do not run a window out, as
- * long as their ACKs come back: a window of two eager messages carries four
+ * long as their ACKs come back: a window of three eager messages carries four
  * through, the last waiting in the pending queue for the slots the first ones
  * give back.
  */
@@ -1228,7 +1228,7 @@ class test_cxi_tag_small_window : public test_cxi_tag_credits {
 public:
     void init() override
     {
-        modify_config("CXI_FC_MSG_WINDOW", "6");
+        modify_config("CXI_FC_MSG_WINDOW", "3");
         test_cxi_tag_base::init();
     }
 };
@@ -1258,7 +1258,7 @@ UCS_TEST_P(test_cxi_tag_small_window, matched_sends_flow_through_a_small_window)
 
     cxi_connect(sender(), 0, receiver());
     uct_cxi_peer_t *tx = tx_peer();
-    ASSERT_EQ(6, tx->tx.avail_slots);
+    ASSERT_EQ(3, tx->tx.avail_slots);
 
     std::vector<uint8_t>  rx_buf[N];
     uct_mem_h             rx_memh[N];
@@ -1306,7 +1306,7 @@ UCS_TEST_P(test_cxi_tag_small_window, matched_sends_flow_through_a_small_window)
         dereg(receiver(), rx_memh[i]);
     }
     ASSERT_TRUE(progress_until_acked());
-    EXPECT_EQ(6, tx->tx.avail_slots);
+    EXPECT_EQ(3, tx->tx.avail_slots);
     EXPECT_EQ(0u, tx->tx.used_slots);
 }
 

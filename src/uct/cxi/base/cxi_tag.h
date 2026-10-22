@@ -39,6 +39,28 @@
 /* Cap on the number of overflow ring buffers (TAG_OVERFLOW_NUM_BUFS). */
 #define UCT_CXI_TAG_OVF_NUM_BUFS_MAX      1024u
 
+/* Overflow ring geometry when flow control does not size it: the previous
+ * fixed one. */
+#define UCT_CXI_TAG_OVF_BUF_SIZE_DEFAULT  (512u * 1024u)
+#define UCT_CXI_TAG_OVF_NUM_BUFS_DEFAULT  4u
+
+/* With flow control, the buffers are at least this, and four times the largest
+ * message if that is more, as for the AM ring. */
+#define UCT_CXI_TAG_OVF_BUF_SIZE_MIN      (1024u * 1024u)
+#define UCT_CXI_TAG_OVF_BUF_PER_MSG       4u
+
+/* The events a posted receive can leave in the receive event queue: the match
+ * (or the delayed match), the rendezvous, and the completion of its pull. (A
+ * cancel that loses the race to a match adds a confirmation; it is not
+ * counted, the slack takes it.) The sender of a message that matches a receive
+ * takes its charge back when its ACK comes, so these are not paid for by
+ * credits and are counted per receive instead. */
+#define UCT_CXI_TAG_RECV_EVENTS           3u
+
+/* The most unexpected messages tracked at once (entries and streams, which are
+ * memory per message), whatever the credits allow. */
+#define UCT_CXI_TAG_UNEXP_MAX_LIMIT       (1u << 20)
+
 /* buffer_id (uint16_t) is ours to choose on a command and comes back on its
  * events: real priority-LE slot ids are [0, max_outstanding), and the one id
  * above them is reserved for our own SEARCH_AND_DELETE commands. */
@@ -303,7 +325,9 @@ typedef struct uct_cxi_rdzv_get_op {
 ucs_status_t uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self,
                                          struct cxil_lni *lni,
                                          const uct_cxi_iface_config_t *config,
-                                         const uct_iface_params_t *params);
+                                         const uct_iface_params_t *params,
+                                         size_t slot_credits,
+                                         size_t byte_credits);
 
 /* Will open_tag_pte offload tag matching for this configuration? */
 int uct_cxi_iface_tag_requested(const uct_cxi_iface_config_t *config,

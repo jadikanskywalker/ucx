@@ -232,7 +232,7 @@ uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
  * set if it was charged at all. Userspace pointers have those bits clear. The
  * class it was charged to is bit 2, set for tag matching (an endpoint is at
  * least 8-byte aligned); its event slots are those of the class's short
- * message: one for an Active Message, two for an eager tag message.
+ * message: one, for an Active Message or an eager tag message.
  *
  * Tracked shorts exist to make connected-endpoint flow control possible --
  * without a completion there is nothing to refund a lost send's credit

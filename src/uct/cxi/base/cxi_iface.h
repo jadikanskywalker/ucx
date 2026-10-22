@@ -48,15 +48,19 @@
     ((unsigned)(((_len) + UCT_CXI_FC_UNIT - 1) / UCT_CXI_FC_UNIT))
 
 /* The event slots a message is charged: the most events it can leave in the
- * receive event queue until it has been processed. An Active Message leaves
- * its arrival. An eager tag message that matches no posted receive leaves its
- * arrival and the outcome of the search we make for it; a rendezvous also the
- * completion of the read of its source address. (A message that matches a
- * posted receive leaves events too, but the receive's own slots pay for
- * those, and the sender takes its charge back when it is told so.) */
+ * receive event queue at the same time until it has been processed, other than
+ * those of a posted receive. An Active Message leaves its arrival. An eager tag
+ * message that matches no posted receive leaves its arrival, and then the
+ * outcome of the search we make for it once the arrival has been handled: one
+ * at a time. A rendezvous leaves the outcome of the search and the completion
+ * of the read of its source address, both issued when the arrival is handled:
+ * two at a time. (The events of a receive, whether it matched on arrival or
+ * claimed an unexpected message later, are paid for by the receive's own
+ * budget, UCT_CXI_TAG_RECV_EVENTS each; the sender of a message that matches a
+ * posted receive takes its charge back when it is told so.) */
 #define UCT_CXI_FC_SLOTS_AM          1u
-#define UCT_CXI_FC_SLOTS_TAG_EAGER   2u
-#define UCT_CXI_FC_SLOTS_TAG_RNDV    3u
+#define UCT_CXI_FC_SLOTS_TAG_EAGER   1u
+#define UCT_CXI_FC_SLOTS_TAG_RNDV    2u
 #define UCT_CXI_FC_MAX_SLOTS         UCT_CXI_FC_SLOTS_TAG_RNDV
 
 /**
@@ -204,8 +208,10 @@ typedef struct uct_cxi_iface_config {
     ucs_ternary_auto_value_t  tag_enable;     /**< Force-disable HW tag offload
                                               even if UCP requests it (UCS_NO) --
                                               falls back to SW tag matching over AM */
-    unsigned                  tag_ovf_num_bufs; /**< # overflow-ring buffers        */
-    size_t                    tag_ovf_buf_size; /**< Size of each overflow buffer   */
+    unsigned long             tag_ovf_num_bufs; /**< # overflow-ring buffers, or
+                                              UCS_ULUNITS_AUTO                      */
+    size_t                    tag_ovf_buf_size; /**< Size of each overflow buffer, or
+                                              UCS_MEMUNITS_AUTO                     */
     size_t                    tag_eager_max;    /**< Max eager tag message; the
                                               overflow ring buffers are at least
                                               twice as large (see
@@ -599,6 +605,10 @@ typedef struct uct_cxi_iface {
         uct_cxi_mem_handle_t  rx_mh;
         unsigned              num_bufs;
         size_t                buf_size;
+        size_t                unexp_max;   /**< Unexpected messages that can be
+                                                held at once (entries, streams):
+                                                what the credits allow, if flow
+                                                control is on */
         size_t                max_msg;     /**< Largest eager message: what is
                                                 advertised, and the LEs'
                                                 min_free, so that one always

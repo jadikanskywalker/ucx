@@ -91,6 +91,10 @@ protected:
 
     void init() override
     {
+        /* A deliberately tiny ring, which flow control would size larger. */
+#ifndef UCT_CXI_DISABLE_FC
+        modify_config("CXI_FC_ENABLE", "n");
+#endif
         modify_config("CXI_TAG_OVERFLOW_NUM_BUFS", "1");
         modify_config("CXI_TAG_OVERFLOW_BUF_SIZE", "1024");
         modify_config("CXI_TAG_EAGER_MAX", "512");
