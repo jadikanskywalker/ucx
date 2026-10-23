@@ -30,6 +30,16 @@ struct uct_cxi_tag_unexp_msg {
     bool                  watched_consumed;
 };
 
+/** An unexpected rendezvous as rndv_cb is given it. */
+struct uct_cxi_tag_unexp_rndv {
+    uct_tag_t             tag;
+    std::vector<uint8_t>  hdr;
+    uint64_t              remote_addr;
+    size_t                length;
+    bool                  has_rkey;
+    unsigned              flags;
+};
+
 struct uct_cxi_tag_unexp_ctx {
     volatile bool        fired;
     uct_tag_t             tag;
@@ -38,6 +48,8 @@ struct uct_cxi_tag_unexp_ctx {
     /* Every message delivered so far, in delivery order -- for tests that
      * send several before the receiver progresses. */
     std::vector<uct_cxi_tag_unexp_msg> all;
+    /* Every unexpected rendezvous (hardware or software request) delivered. */
+    std::vector<uct_cxi_tag_unexp_rndv> rndv_all;
     /* Optional: a receive's consumed flag, recorded with every message, and a
      * hook called with every message delivered (the model of UCP matching it
      * to its own receives). */
@@ -71,10 +83,14 @@ uct_cxi_tag_rndv_cb(void *arg, unsigned flags, uint64_t stag,
 {
     /* Fires for a genuinely-unexpected rendezvous arrival (no priority LE
      * posted) -- e.g. test_cxi_tag_rndv.cc's cancel_unmatched, which
-     * deliberately never posts a receive. Most other tests here always
-     * post a receive first, so this stub is never meaningfully exercised
-     * by them -- present only because create_entity() requires a real
-     * callback (see rc_mlx5's identical HW_TM gating pattern). */
+     * deliberately never posts a receive, or a software rendezvous request
+     * nobody has a receive for. Recorded for the tests that look. */
+    uct_cxi_tag_unexp_ctx *ctx = static_cast<uct_cxi_tag_unexp_ctx *>(arg);
+    const uint8_t         *hdr = static_cast<const uint8_t *>(header);
+
+    ctx->rndv_all.push_back({stag, std::vector<uint8_t>(hdr,
+                                                        hdr + header_length),
+                             remote_addr, length, rkey_buf != NULL, flags});
     return UCS_OK;
 }
 
@@ -92,6 +108,11 @@ struct uct_cxi_tag_recv_ctx {
     uint64_t              imm;
     size_t                length;
     ucs_status_t          status;
+    /* Matched by a software rendezvous request (rndv_cb): what it was given. */
+    volatile bool         rndv_matched;
+    uint8_t               rndv_hdr[256];
+    size_t                rndv_hdr_len;
+    ucs_status_t          rndv_status;
 };
 
 static void uct_cxi_tag_consumed_cb(uct_tag_context_t *self)
@@ -100,6 +121,24 @@ static void uct_cxi_tag_consumed_cb(uct_tag_context_t *self)
     EXPECT_FALSE(ctx->completed) << "tag_consumed_cb fired after completed_cb";
     EXPECT_FALSE(ctx->consumed) << "tag_consumed_cb fired twice";
     ctx->consumed = true;
+}
+
+static void uct_cxi_tag_recv_rndv_cb(uct_tag_context_t *self, uct_tag_t stag,
+                                     const void *header,
+                                     unsigned header_length,
+                                     ucs_status_t status, unsigned flags)
+{
+    uct_cxi_tag_recv_ctx *ctx = reinterpret_cast<uct_cxi_tag_recv_ctx *>(self);
+
+    EXPECT_TRUE(ctx->consumed) << "rndv_cb fired before tag_consumed_cb";
+    EXPECT_FALSE(ctx->completed);
+    EXPECT_FALSE(ctx->rndv_matched) << "rndv_cb fired twice";
+    ctx->stag         = stag;
+    ctx->rndv_status  = status;
+    ctx->rndv_hdr_len = ucs_min(static_cast<size_t>(header_length),
+                                sizeof(ctx->rndv_hdr));
+    memcpy(ctx->rndv_hdr, header, ctx->rndv_hdr_len);
+    ctx->rndv_matched = true;
 }
 
 static void uct_cxi_tag_completed_cb(uct_tag_context_t *self, uct_tag_t stag,
@@ -194,7 +233,7 @@ protected:
         memset(&ctx, 0, sizeof(ctx));
         ctx.super.tag_consumed_cb = uct_cxi_tag_consumed_cb;
         ctx.super.completed_cb    = uct_cxi_tag_completed_cb;
-        ctx.super.rndv_cb         = NULL;
+        ctx.super.rndv_cb         = uct_cxi_tag_recv_rndv_cb;
     }
 
     /** Poll sender + receiver progress until @a flag is set or timeout. */

@@ -488,6 +488,8 @@ uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned cls,
  * the message itself, rung together, with the send counted against its ep and
  * tracked by its completion (see uct_cxi_idc_track_hdr; \a cls, \a units and
  * \a credited are its flow-control charge, which the caller applies).
+ * \a header_data travels out of band with the message, and is 0 for all but a
+ * tagged software rendezvous request.
  *
  * UCS_ERR_NO_RESOURCE if the command queue has no room, with nothing counted.
  * A c_state already written then stays in the queue, harmlessly: every IDC
@@ -497,7 +499,8 @@ uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned cls,
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
                     union c_fab_addr dfa, uint8_t idx_ext, uint64_t match_bits,
-                    const void *data, size_t length, unsigned cls,
+                    uint64_t header_data, const void *data, size_t length,
+                    unsigned cls,
                     unsigned units, int credited, const char *what)
 {
     struct c_cstate_cmd  cstate = {};
@@ -517,7 +520,8 @@ uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
     }
 
     hdr.dfa        = dfa;
-    hdr.match_bits = match_bits;
+    hdr.match_bits  = match_bits;
+    hdr.header_data = header_data;
     uct_cxi_idc_track_hdr(&hdr, ep, cls, units, credited);
 
     ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, data, length);

@@ -75,6 +75,16 @@
  * event queue, which is covered by the reserved slots (EQ_RESERVED_SLOTS). */
 #define UCT_CXI_TAG_FENCE_MAX_INFLIGHT    32u
 
+/* The header_data (imm) of a tagged Put that is a software rendezvous request
+ * (uct_ep_tag_rndv_request), not an eager message: the payload is UCP's RTS, and
+ * the receiver hands it to rndv_cb (or the matched receive's rndv_cb) with no
+ * remote address, instead of to eager_cb. No eager message carries it: the
+ * only immediate UCP sends is the remote endpoint id of a synchronous send, and
+ * eager_bcopy/eager_zcopy refuse it. Like InfiniBand TM's "send with immediate
+ * value 0" (UCT_RC_MLX5_TM_IS_SW_RNDV), which cannot be an eager message there
+ * either. */
+#define UCT_CXI_TAG_SW_RNDV_IMM           UINT64_MAX
+
 /* Advertised rndv.max_hdr -- must be >= sizeof(ucp_tag_offload_unexp_
  * rndv_hdr_t) (17 bytes), which UCP sends with every offloaded rendezvous
  * send and asserts on unconditionally; reporting less would silently

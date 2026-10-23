@@ -1012,6 +1012,203 @@ UCS_TEST_P(test_cxi_tag, spent_receive_does_not_claim)
 }
 
 
+/* -------------------------------------------------------------------------
+ * Software rendezvous request (uct_ep_tag_rndv_request): UCP's RTS sent as a
+ * tagged message, handled by the receiver's UCP through rndv_cb
+ * -------------------------------------------------------------------------
+ */
+
+/** A request of \a len bytes with a pattern \a seed tells apart. */
+static std::vector<uint8_t> sw_rts(size_t len, uint8_t seed)
+{
+    std::vector<uint8_t> rts(len);
+    for (size_t i = 0; i < len; i++) {
+        rts[i] = static_cast<uint8_t>(seed + i * 7);
+    }
+    return rts;
+}
+
+/** With no receive posted, the request reaches rndv_cb as the unexpected
+ * rendezvous it is: no remote address, no key, the RTS as the header, and not
+ * as an eager message. */
+UCS_TEST_P(test_cxi_tag, sw_rndv_request_unexpected)
+{
+    static const uct_tag_t TAG = 0xC1A5000000000001ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> rts = sw_rts(60, 0x21);
+    ASSERT_UCS_OK(uct_ep_tag_rndv_request(ep, TAG, rts.data(), rts.size(), 0));
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+    while (m_unexp.rndv_all.empty() && (ucs_get_time() < deadline)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    ASSERT_EQ(1u, m_unexp.rndv_all.size());
+
+    const uct_cxi_tag_unexp_rndv &r = m_unexp.rndv_all[0];
+    EXPECT_EQ(TAG, r.tag);
+    EXPECT_EQ(rts, r.hdr);
+    EXPECT_EQ(0u, r.remote_addr);
+    EXPECT_EQ(0u, r.length);
+    EXPECT_FALSE(r.has_rkey);
+    EXPECT_TRUE(m_unexp.all.empty()) << "reported as an eager message";
+
+    flush_ep(sender(), ep);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
+}
+
+/** Matched by a receive posted before it arrives: the RTS lands in the
+ * receive's buffer and reaches the receive's rndv_cb, not completed_cb. */
+UCS_TEST_P(test_cxi_tag, sw_rndv_request_direct_match)
+{
+    static const uct_tag_t TAG = 0xC1A5000000000002ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> rts     = sw_rts(60, 0x22);
+    std::vector<uint8_t> rx_buf(256, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), rx_buf.size());
+    uct_cxi_tag_recv_ctx rctx;
+    init_recv_ctx(rctx);
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = rx_buf.size();
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &rctx.super));
+
+    ASSERT_UCS_OK(uct_ep_tag_rndv_request(ep, TAG, rts.data(), rts.size(), 0));
+    poll_until(rctx.rndv_matched);
+
+    EXPECT_FALSE(rctx.completed);
+    EXPECT_EQ(UCS_OK, rctx.rndv_status);
+    EXPECT_EQ(TAG, rctx.stag);
+    EXPECT_EQ(rts, std::vector<uint8_t>(rctx.rndv_hdr,
+                                        rctx.rndv_hdr + rctx.rndv_hdr_len));
+    EXPECT_TRUE(std::equal(rts.begin(), rts.end(), rx_buf.begin()))
+            << "the request is not in the receive's buffer";
+    EXPECT_TRUE(m_unexp.all.empty() && m_unexp.rndv_all.empty());
+
+    flush_ep(sender(), ep);
+    dereg(receiver(), rx_memh);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
+}
+
+/** As above, matched by a receive posted after it arrived (a delayed match,
+ * copied from the overflow buffer). */
+UCS_TEST_P(test_cxi_tag, sw_rndv_request_delayed_match)
+{
+    static const uct_tag_t TAG = 0xC1A5000000000003ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> rts     = sw_rts(60, 0x23);
+    std::vector<uint8_t> rx_buf(256, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), rx_buf.size());
+
+    ASSERT_UCS_OK(uct_ep_tag_rndv_request(ep, TAG, rts.data(), rts.size(), 0));
+    usleep(200000); /* it is in the overflow list before the receive */
+
+    uct_cxi_tag_recv_ctx rctx;
+    init_recv_ctx(rctx);
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = rx_buf.size();
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &rctx.super));
+    poll_until(rctx.rndv_matched);
+
+    EXPECT_FALSE(rctx.completed);
+    EXPECT_EQ(UCS_OK, rctx.rndv_status);
+    EXPECT_EQ(rts, std::vector<uint8_t>(rctx.rndv_hdr,
+                                        rctx.rndv_hdr + rctx.rndv_hdr_len));
+    EXPECT_TRUE(m_unexp.all.empty() && m_unexp.rndv_all.empty());
+
+    flush_ep(sender(), ep);
+    dereg(receiver(), rx_memh);
+#ifndef UCT_CXI_DISABLE_FC
+    cxi_expect_conserved(sender(), receiver());
+#endif
+}
+
+/** A receive too small for the request is told so, rather than given a cut
+ * request as a good one. */
+UCS_TEST_P(test_cxi_tag, sw_rndv_request_into_a_small_receive)
+{
+    static const uct_tag_t TAG = 0xC1A5000000000004ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> rts     = sw_rts(60, 0x24);
+    std::vector<uint8_t> rx_buf(32, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), rx_buf.size());
+    uct_cxi_tag_recv_ctx rctx;
+    init_recv_ctx(rctx);
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = rx_buf.size();
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &rctx.super));
+
+    ASSERT_UCS_OK(uct_ep_tag_rndv_request(ep, TAG, rts.data(), rts.size(), 0));
+    poll_until(rctx.rndv_matched);
+
+    EXPECT_EQ(UCS_ERR_MESSAGE_TRUNCATED, rctx.rndv_status);
+    EXPECT_LE(rctx.rndv_hdr_len, rx_buf.size());
+
+    flush_ep(sender(), ep);
+    dereg(receiver(), rx_memh);
+}
+
+/** The mark of a request is not available to eager messages. */
+UCS_TEST_P(test_cxi_tag, sw_rndv_mark_is_refused_for_eager)
+{
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> buf(64, 0x5A);
+    uct_mem_h            memh = reg(sender(), buf.data(), buf.size());
+    uct_iov_t            iov;
+    iov.buffer = buf.data();
+    iov.length = buf.size();
+    iov.memh   = memh;
+    iov.stride = 0;
+    iov.count  = 1;
+
+    auto pack = [](void *dst, void *arg) -> size_t {
+        memset(dst, 0x5A, 64);
+        return 64;
+    };
+    EXPECT_EQ(static_cast<ssize_t>(UCS_ERR_INVALID_PARAM),
+              uct_ep_tag_eager_bcopy(ep, 0x1, UCT_CXI_TAG_SW_RNDV_IMM, +pack,
+                                     NULL, 0));
+    EXPECT_EQ(UCS_ERR_INVALID_PARAM,
+              uct_ep_tag_eager_zcopy(ep, 0x1, UCT_CXI_TAG_SW_RNDV_IMM, &iov, 1,
+                                     0, NULL));
+
+    dereg(sender(), memh);
+    flush_ep(sender(), ep);
+}
+
+
 /*
  * The ring of posted receives and its fences: a fence follows every
  * TAG_FENCE_INTERVAL posts and moves the ring's tail when it returns; slots and

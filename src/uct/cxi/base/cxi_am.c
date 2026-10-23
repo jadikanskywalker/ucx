@@ -122,7 +122,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
               (unsigned long)iface->tx.cmdq->hw_wp32);
 
     status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_am, ep->dfa_am_idx_ext,
-                                 (uint64_t)id | fcbits, buf,
+                                 (uint64_t)id | fcbits, 0, buf,
                                  sizeof(uint64_t) + length, UCT_CXI_FC_AM,
                                  units, credited, "am_short");
     if (ucs_unlikely(status != UCS_OK)) {
@@ -183,7 +183,7 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
                          (uint64_t)(uintptr_t)iface->rdzv.addr_table;
 
     status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_am, ep->dfa_am_idx_ext,
-                                 UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG | fcbits,
+                                 UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG | fcbits, 0,
                                  &payload, sizeof(payload), UCT_CXI_FC_AM,
                                  units, credited, "rndv_hdr_announce");
     if (ucs_unlikely(status != UCS_OK)) {

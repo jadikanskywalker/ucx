@@ -680,12 +680,6 @@ static uct_iface_ops_t uct_cxi_iface_ops = {
     .ep_tag_eager_short       = uct_cxi_ep_tag_eager_short,
     .ep_tag_eager_bcopy       = uct_cxi_ep_tag_eager_bcopy,
     .ep_tag_eager_zcopy       = uct_cxi_ep_tag_eager_zcopy,
-    /* Phase B (direct-match only) -- see the design plan's "Current
-     * increment". ep_tag_rndv_request stays unsupported: making it
-     * correct needs receive-side rndv_cb dispatch, out of scope here;
-     * confirmed safe to defer (ucp_rndv_send_handle_status_from_pending()
-     * turns UCS_ERR_UNSUPPORTED into a clean error completion, not a
-     * hang). */
     .ep_tag_rndv_zcopy        = uct_cxi_ep_tag_rndv_zcopy,
     .ep_tag_rndv_cancel       = uct_cxi_ep_tag_rndv_cancel,
     .ep_tag_rndv_request      = uct_cxi_ep_tag_rndv_request,

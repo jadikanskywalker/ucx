@@ -1227,12 +1227,23 @@ uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
      *
      * Nothing after the call may read \a event: a re-entrant progress call
      * from eager_cb can recycle its slot in the event queue. */
-    (void)iface->tag.eager_cb(iface->tag.eager_arg,
-                              (len > 0) ? uct_cxi_iface_tag_ovf_data(
-                                      iface, buf_idx, event->tgt_long.start) :
-                                          NULL,
-                              len, UCT_CB_PARAM_FLAG_FIRST, tag, imm,
-                              &context);
+    if (ucs_unlikely(imm == UCT_CXI_TAG_SW_RNDV_IMM)) {
+        /* A software rendezvous request: UCP's RTS is the payload, and there
+         * is no remote address (UCP tells it from a rendezvous the NIC
+         * pulls). UCP copies it, as it does an eager message (no DESC flag). */
+        (void)iface->tag.rndv_cb(iface->tag.rndv_arg, 0, tag,
+                                 uct_cxi_iface_tag_ovf_data(
+                                         iface, buf_idx,
+                                         event->tgt_long.start),
+                                 len, 0, 0, NULL);
+    } else {
+        (void)iface->tag.eager_cb(iface->tag.eager_arg,
+                                  (len > 0) ? uct_cxi_iface_tag_ovf_data(
+                                          iface, buf_idx,
+                                          event->tgt_long.start) : NULL,
+                                  len, UCT_CB_PARAM_FLAG_FIRST, tag, imm,
+                                  &context);
+    }
 
     /* Copied out by eager_cb: the sender's credits are free to go back. */
     uct_cxi_tag_ovf_done(iface, buf_idx, initiator, sent_len);
@@ -2640,6 +2651,17 @@ static void uct_cxi_tag_eager_match_complete(uct_cxi_iface_t *iface,
     if (!(priv->rndv_flags & UCT_CXI_TAG_FLAG_CONSUMED)) {
         ctx->tag_consumed_cb(ctx);
     }
+
+    if (ucs_unlikely(imm == UCT_CXI_TAG_SW_RNDV_IMM)) {
+        /* A software rendezvous request: its payload, UCP's RTS, is in the
+         * receive's buffer (the NIC put it there, or the copy above), and
+         * UCP carries on with the rendezvous from it. Truncated if the
+         * buffer was too small to hold it all. */
+        ctx->rndv_cb(ctx, stag, (const void *)(uintptr_t)priv->recv_addr,
+                     mlength, status, 0);
+        return;
+    }
+
     ctx->completed_cb(ctx, stag, imm, mlength, NULL, status);
 }
 
@@ -3070,21 +3092,22 @@ static void uct_cxi_tag_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 }
 
 /*
- * uct_cxi_ep_tag_eager_short -- unrestricted IDC tag send (<= 192 B
- * payload). No 8-byte header reservation needed (unlike AM) -- imm always
- * travels out-of-band via header_data, and eager_short has no imm
- * parameter at all (implicitly 0 per the API; use bcopy for nonzero imm).
+ * uct_cxi_tag_short_send -- the unrestricted IDC tag send (<= 192 B payload) of
+ * an eager message with nothing but \a imm out of band, and of a software
+ * rendezvous request (imm UCT_CXI_TAG_SW_RNDV_IMM), which is the same message
+ * with a different meaning to its receiver: charged the same, as eager tag
+ * traffic, and given back the same.
  */
-ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
-                                        const void *data, size_t length)
+static ucs_status_t
+uct_cxi_tag_short_send(uct_cxi_ep_t *ep, uct_tag_t tag, uint64_t imm,
+                       const void *data, size_t length, const char *what)
 {
-    uct_cxi_ep_t    *ep    = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t *iface = uct_cxi_tag_ep_iface(ep);
     unsigned         units = UCT_CXI_FC_UNITS(length);
     ucs_status_t     status;
     int              credited;
 
-    UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, "tag_eager_short");
+    UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, what);
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
@@ -3097,8 +3120,8 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
     }
 
     status = uct_cxi_ep_idc_send(ep, iface, ep->dfa_tag, ep->dfa_tag_idx_ext,
-                                 tag, data, length, UCT_CXI_FC_TAG, units,
-                                 credited, "tag_eager_short");
+                                 tag, imm, data, length, UCT_CXI_FC_TAG, units,
+                                 credited, what);
     if (ucs_unlikely(status != UCS_OK)) {
         return status;
     }
@@ -3106,9 +3129,22 @@ ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
     uct_cxi_fc_debit(ep, credited, UCT_CXI_FC_TAG, UCT_CXI_FC_SLOTS_TAG_EAGER,
                      units);
 
-    ucs_debug("cxi TAG [SEND-SHORT] ep=%p tag=0x%lx len=%zu", ep,
-             (unsigned long)tag, length);
+    ucs_debug("cxi TAG [SEND-SHORT] ep=%p tag=0x%lx len=%zu imm=0x%lx", ep,
+              (unsigned long)tag, length, (unsigned long)imm);
     return UCS_OK;
+}
+
+/*
+ * uct_cxi_ep_tag_eager_short -- unrestricted IDC tag send (<= 192 B
+ * payload). No 8-byte header reservation needed (unlike AM) -- imm always
+ * travels out-of-band via header_data, and eager_short has no imm
+ * parameter at all (implicitly 0 per the API; use bcopy for nonzero imm).
+ */
+ucs_status_t uct_cxi_ep_tag_eager_short(uct_ep_h tl_ep, uct_tag_t tag,
+                                        const void *data, size_t length)
+{
+    return uct_cxi_tag_short_send(ucs_derived_of(tl_ep, uct_cxi_ep_t), tag, 0,
+                                  data, length, "tag_eager_short");
 }
 
 /*
@@ -3127,6 +3163,10 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
     ucs_status_t          status;
     int                   credited;
     int                   ret;
+
+    if (ucs_unlikely(imm == UCT_CXI_TAG_SW_RNDV_IMM)) {
+        return UCS_ERR_INVALID_PARAM; /* the mark of a rendezvous request */
+    }
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
@@ -3214,6 +3254,10 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     int                   ret;
 
     UCT_CHECK_IOV_SIZE(iovcnt, 1ul, "tag_eager_zcopy");
+
+    if (ucs_unlikely(imm == UCT_CXI_TAG_SW_RNDV_IMM)) {
+        return UCS_ERR_INVALID_PARAM; /* the mark of a rendezvous request */
+    }
     UCT_CHECK_LENGTH(length, 0, iface->tag.max_msg, "tag_eager_zcopy");
 
     if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
@@ -3549,22 +3593,27 @@ void uct_cxi_iface_tag_handle_rdzv_get(uct_cxi_iface_t *iface,
 }
 
 /*
- * uct_cxi_ep_tag_rndv_request -- stubbed for this increment, deliberately.
- * See the design plan's "Current increment" section: making this correct
- * requires receive-side rndv_cb dispatch (distinguishing a software-only
- * rendezvous request from a plain eager Put or a real zcopy-backed one),
- * which is out of scope here (direct-match/zcopy only). Confirmed safe to
- * defer: ucp_rndv_send_handle_status_from_pending() (rndv.c:1799-1818)
- * turns any non-OK/non-NO_RESOURCE status, including UCS_ERR_UNSUPPORTED,
- * into a clean error completion delivered to the app via
- * ucp_ep_req_purge() -- not a hang or corruption.
+ * uct_cxi_ep_tag_rndv_request -- a software rendezvous request: UCP's RTS (a
+ * full ucp_rndv_rts_hdr_t and the packed key, of the sender's buffer) as the
+ * payload of a tagged message, so that it is matched against the receiver's
+ * tag list like any other tagged message and so stays in order with them, and
+ * is then handled by the receiver's UCP (no data is moved by the NIC). It is
+ * an eager message in every respect but one, its header_data
+ * (UCT_CXI_TAG_SW_RNDV_IMM): it is sent as the same IDC message, charged as
+ * eager tag traffic, and what the receiver does with it is told by that value:
+ * rndv_cb, with no remote address, in place of eager_cb or completed_cb (see
+ * uct_cxi_tag_eager_match_complete() and uct_cxi_iface_tag_report_unexp_eager()).
+ * As on InfiniBand, nothing completes it: UCS_OK when sent. UCP checks the
+ * size of the request against the largest short message.
  */
 ucs_status_t uct_cxi_ep_tag_rndv_request(uct_ep_h tl_ep, uct_tag_t tag,
                                          const void *header,
                                          unsigned header_length,
                                          unsigned flags)
 {
-    return UCS_ERR_UNSUPPORTED;
+    return uct_cxi_tag_short_send(ucs_derived_of(tl_ep, uct_cxi_ep_t), tag,
+                                  UCT_CXI_TAG_SW_RNDV_IMM, header,
+                                  header_length, "tag_rndv_request");
 }
 
 

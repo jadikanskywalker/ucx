@@ -455,24 +455,6 @@ UCS_TEST_P(test_cxi_tag_rndv, multiple_outstanding)
 
 
 /* -------------------------------------------------------------------------
- * rndv_request: deliberately stubbed for this increment (see the design
- * plan's "Current increment" section) -- confirm it fails cleanly rather
- * than corrupting or hanging, per ucp_rndv_send_handle_status_from_pending's
- * own handling of UCS_ERR_UNSUPPORTED.
- * -------------------------------------------------------------------------
- */
-
-UCS_TEST_P(test_cxi_tag_rndv, rndv_request_unsupported)
-{
-    cxi_connect(sender(), 0, receiver());
-    uct_ep_h ep = sender().ep(0);
-
-    ucs_status_t status = uct_ep_tag_rndv_request(ep, 0x1234, NULL, 0, 0);
-    EXPECT_EQ(UCS_ERR_UNSUPPORTED, status);
-}
-
-
-/* -------------------------------------------------------------------------
  * Diagnostic: delayed-matched rendezvous -- the rendezvous Put physically
  * lands (in the overflow ring, mlength=0) before the matching receive is
  * ever posted, then the priority-LE APPEND races hardware's own delayed
