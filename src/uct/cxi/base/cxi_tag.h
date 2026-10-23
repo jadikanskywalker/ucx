@@ -98,13 +98,14 @@
  * message, C_EVENT_SEARCH if it found nothing): it tells those apart from
  * the events of priority LEs (a delayed match is also a C_EVENT_PUT_OVERFLOW).
  *
- * It says nothing about WHICH message. A SEARCH_AND_DELETE deletes the oldest
- * entry with its tag, which need not be the arrival it was issued for (that
- * one may have been taken by a receive posted meanwhile, leaving a later one
- * of the same tag), so a found message is identified by its own event: its
- * start address (eager: which ring buffer, and the data), its rendezvous flag
- * and its initiator and rendezvous_id. The "not found" event carries none of
- * that (its start is always 0), and needs none: it is not acted on. */
+ * The command only takes the message, that has been given to UCP already, out
+ * of the NIC's unexpected list, so that no receive posted from then on can
+ * take it: it deletes the oldest entry with its tag, which is that message
+ * because every older one was taken by a receive appended before it, or by an
+ * earlier command. So the "found" event needs no handling, and one that finds
+ * nothing means a posted receive took the message too (an error). The
+ * "not found" event says nothing of which message it is about (its start is
+ * always 0). */
 #define UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID  UCT_CXI_TAG_MAX_OUTSTANDING_MAX
 
 /* The buffer_id of the fences (see uct_cxi_tag_pend_t): a SEARCH that matches
@@ -499,43 +500,43 @@ typedef struct uct_cxi_rndv_hdr_wire {
 } UCS_S_PACKED uct_cxi_rndv_hdr_wire_t;
 
 /*
- * uct_cxi_unexp_report_t -- an unexpected message that has to wait before it
- * can be reported to UCP in order (a chain of its stream, see below).
+ * uct_cxi_unexp_report_t -- an entry of a stream (see below): an unexpected
+ * message that is UCP's and has to wait before it can be reported in order, or
+ * a tombstone.
  *
- * A rendezvous cannot be reported at once: UCP needs the sender's source
+ * Whose an unexpected message is is decided when its arrival is handled (see
+ * uct_cxi_iface_tag_handle_ovf_arrival()): a posted receive's, which is
+ * claimed for it, or UCP's, which is told of it at once -- unless it is a
+ * rendezvous, which cannot be reported at once: UCP needs the sender's source
  * address, which the hardware does not give us (the events' remote_offset is
- * 0 for an unexpected message), so it is read from the sender's address
- * table (iface->rdzv.addr_table) with an 8-byte RMA Get. That read is posted
- * speculatively, as soon as the message is seen, in parallel with the
- * SEARCH_AND_DELETE that decides whether we own it. Three events can follow
- * for one rendezvous (identified by its initiator and rendezvous_id, which
- * all of them carry):
- *   - ARRIVED: the Put into the overflow list, the first event for it.
- *   - OWNED:   our SEARCH_AND_DELETE found and deleted it: it is ours to
- *              report.
- *   - LOST:    a receive posted in the meantime matched it first (its
- *              delayed-match event). The message is that receive's, and the
- *              read, if posted, was for nothing: it cannot be cancelled, so
- *              the entry is kept until its REPLY returns, only to be the
- *              landing buffer of it.
- * (A SEARCH_AND_DELETE that finds nothing is not an event of ours to act on.)
- * Hardware may deliver these out of order, so any of them can create the
- * entry; a LOST that comes before ARRIVED leaves a tombstone, which the
- * ARRIVED removes. Reported once ARRIVED, OWNED and the address is read.
+ * 0 for an unexpected message), so it is read from the sender's address table
+ * (iface->rdzv.addr_table) with an 8-byte RMA Get. The read is posted once the
+ * message is UCP's and the entry is reported when it completes (state
+ * NEW -> READING -> READY, or FAILED).
  *
  * UCP matches unexpected messages in the order they are reported, so a later
  * message with the same tag from the same sender must not be reported ahead
- * of one whose address is still on its way: it is held behind it. Each
- * (sender, tag) has a stream (uct_cxi_unexp_stream_t, found through
- * iface->tag.unexp_streams) that chains its held messages in the order they
- * arrived (numbered as their arrival events are handled), an eager one among
- * them, and only the entry at the head of a chain
- * is ever reported: when it is, the next is looked at. An event touches only
- * the stream it is for. Messages with other tags, or from other senders, are
- * never held: ordering them is not something UCP or the network promises, and
- * a receive with a wildcard tag is UCP's to order. Finding the entry an event
- * is about is a scan of its stream's chain, which is short unless a sender
- * has many messages with one tag unreported at once.
+ * of one whose address is still on its way: it is held behind it, as an entry
+ * of its own (state READY). Each (sender, tag) has a stream
+ * (uct_cxi_unexp_stream_t, found through iface->tag.unexp_streams) that chains
+ * its held messages in the order they arrived (numbered as their arrival
+ * events are handled), and only the entry at the head of a chain is ever
+ * reported: when it is, the next is looked at. An event touches only the stream
+ * it is for. Messages with other tags, or from other senders, are never held:
+ * ordering them is not something UCP or the network promises, and a receive
+ * with a wildcard tag is UCP's to order. Finding the entry an event is about
+ * is a scan of its stream's chain, which is short unless a sender has many
+ * messages with one tag unreported at once.
+ *
+ * A tombstone (UCT_CXI_UNEXP_LOST) is the other kind of entry, and is not
+ * reported: it stands for a message that a receive took (its delayed match)
+ * before the arrival of the message was seen. The two events come from
+ * different pipelines of the NIC and either can be seen first. A message with
+ * data waits for its arrival to be copied (see uct_cxi_eager_pair_t); a
+ * rendezvous, or a message without data, has nothing to wait for, and leaves
+ * the tombstone for the arrival to find: it is then that receive's, and nothing
+ * more is done for it, unless the receive was cancelled and the message is to
+ * go to UCP after all (UCT_CXI_UNEXP_REDELIVER). A tombstone is never read.
  *
  * Also needed: the sender's one-time announce (ep_id, md_index, and where its
  * table is) may not have been processed yet. The announce and the Put are
@@ -553,10 +554,8 @@ typedef struct uct_cxi_rndv_hdr_wire {
 #define UCT_CXI_UNEXP_READY    2  /* eager, or rendezvous with its address */
 #define UCT_CXI_UNEXP_FAILED   3  /* rendezvous: the address read failed */
 
-#define UCT_CXI_UNEXP_ARRIVED  1  /* flags: see above (eager: all but LOST) */
-#define UCT_CXI_UNEXP_OWNED    2
-#define UCT_CXI_UNEXP_LOST     4
-#define UCT_CXI_UNEXP_REDELIVER 8 /* a tombstone of an eager message that
+#define UCT_CXI_UNEXP_LOST     1  /* flags: a tombstone, see above */
+#define UCT_CXI_UNEXP_REDELIVER 2 /* a tombstone of an eager message that
                                      is to be reported to UCP when it
                                      arrives: its receive was cancelled */
 

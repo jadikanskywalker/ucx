@@ -72,8 +72,7 @@ uct_cxi_tag_ep_iface(uct_cxi_ep_t *ep)
 }
 
 /* Plain host-memory pools -- the NIC never DMAs into or out of these
- * (software-Get tracking and parked rendezvous confirmations), so no
- * registration is needed. */
+ * (software-Get tracking), so no registration is needed. */
 static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
@@ -1004,9 +1003,9 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self)
  * uct_cxi_iface_tag_ovf_buf_idx / uct_cxi_iface_tag_ovf_data -- shared
  * address-range math for locating which overflow ring buffer an event's
  * event->tgt_long.start falls within, and the actual data pointer inside
- * it. Used both for a fresh arrival (buf_idx already known directly from
- * buffer_id there) and, more importantly, for a *later* confirmation event
- * (SEARCH_AND_DELETE completion, or a real delayed match) that only
+ * it. Used for a fresh arrival (buf_idx already known directly from
+ * buffer_id there) and for a *later* event (a real delayed match, or an
+ * arrival held for UCP and reported later from a copy of its event) that only
  * carries the address, not which ring slot it originated from.
  */
 static inline int
@@ -1061,15 +1060,14 @@ uct_cxi_iface_tag_ovf_maybe_repost(uct_cxi_iface_t *iface, int buf_idx)
  * mlength>0 (mirroring tag_handle_ovf_arrival()'s increment condition --
  * an mlength==0 arrival never took a reference to begin with), from
  * whichever handler is the actual, sole reader of that arrival's own
- * overflow-buffer memory: tag_handle_search_delete_confirm_eager()/_rndv()
- * when our own SEARCH_AND_DELETE finds and deletes it (it does the copy,
- * so it releases); tag_handle_eager_match()/tag_handle_rdzv_match() when a
- * real priority-LE delayed match wins instead (same reasoning, they do the
- * copy) -- including their force-cancel branches, which release directly
- * since the normal copy-then-release path never runs once cancelled.
- * Never tag_handle_search_delete_not_found() -- that event carries no
- * data-read obligation of its own (nothing there ever touches
- * overflow-buffer memory), so it must never gate reposting.
+ * overflow-buffer memory: uct_cxi_iface_tag_report_unexp_eager() when the
+ * message is given to UCP (it hands eager_cb the data in place, then
+ * releases); tag_handle_eager_match() when a real priority-LE delayed match
+ * wins instead (it does the copy) -- including its force-cancel branch, which
+ * reports the message to UCP as an unexpected one and so ends in the first.
+ * Never the outcome of a SEARCH_AND_DELETE: it only takes the entry out of the
+ * NIC's list, nothing there ever touches overflow-buffer memory, so it must
+ * never gate reposting.
  *
  * No assert on ovf_refcnt here (there used to be one, requiring it be >0
  * before decrementing): a decrement landing before its matching increment
@@ -1131,47 +1129,17 @@ static void uct_cxi_tag_ovf_done(uct_cxi_iface_t *iface, int buf_idx,
 
 /*
  * uct_cxi_iface_tag_report_unexp_eager -- report an unexpected eager message
- * to UCP: the work of uct_cxi_iface_tag_handle_search_delete_confirm_eager()
- * (below), done at once or, if the message has to wait behind an unexpected
- * rendezvous of the same sender, later from a copy of the same event.
+ * (or a software rendezvous request) to UCP, from the event of its arrival or a
+ * copy of it: at once when the arrival is handled or, if the message has to wait
+ * behind an unexpected rendezvous of the same sender, later (see
+ * uct_cxi_tag_found_eager()).
  *
- * The "found and
- * deleted" confirmation for our own SEARCH_AND_DELETE: a
- * C_EVENT_PUT_OVERFLOW on the tag PTE whose buffer_id falls in the
- * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID (see its doc comment in cxi_tag.h).
- * Dispatched directly from
- * cxi_iface.c's progress loop -- checked once, before ever choosing
- * between eager and rendezvous match handling, rather than duplicated
- * inside both (or relying on uct_cxi_iface_tag_match_lookup()'s ordinary
- * bounds check to coincidentally also catch it, which said nothing about
- * *why* it's safe to drop and left tag_handle_rdzv_match() with no
- * explicit handling of this case at all -- SEARCH_AND_DELETE is only ever
- * issued for eager unexpected arrivals, so this event is never
- * rendezvous-flagged and tag_handle_rdzv_match() should never need to
- * know it exists).
- *
- * With sd.use_once=1 (see tag_handle_ovf_arrival()'s own comment on that
- * flag), this event type only ever fires for the "found and deleted"
- * outcome -- confirmed on real hardware (cxi_event_rc()==C_RC_OK on every
- * observed run, test_cxi_tag_ovf.raw_event_order_and_manual_search_
- * delete). The "not found" outcome is a structurally different event
- * type entirely (C_EVENT_SEARCH, handled by tag_handle_search_delete_
- * not_found() below), not a different rc on this same event -- so unlike
- * the pre-use_once design, there is no second outcome to branch on here;
- * a non-OK rc on this event type would be a genuine surprise, logged
- * defensively but not otherwise expected to occur.
- *
- * buf_idx comes from event->tgt_long.start, the address of the message
- * itself: the command's buffer_id says which arrival the SEARCH_AND_DELETE
- * was posted for, but it deletes the oldest entry with that tag, which can
- * be another message. start also locates the actual bytes to copy within
- * the overflow buffer (SEARCH_AND_DELETE only removes the list *entry*, it
- * has no destination-address field of its own to move data with --
- * confirmed against every libfabric SEARCH/SEARCH_AND_DELETE call site). This is the only event that will ever fire for this specific
- * arrival (real hardware search-on-append can never also independently
- * claim an entry our own use_once=1 SEARCH_AND_DELETE already found and
- * deleted), so this is also where the arrival's own overflow-buffer
- * reference is released and its sender's credits are given back.
+ * The message is handed to eager_cb (rndv_cb for a request) where it sits in
+ * the overflow buffer: this arrival's reference on the buffer is still held
+ * during the call, and released after it, together with the sender's credits.
+ * The event carries the message's own address, which is how the buffer and the
+ * bytes are found (event->tgt_long.start); the SEARCH_AND_DELETE that takes
+ * the message out of the NIC's list has no part in this, it is issued before.
  */
 static void
 uct_cxi_iface_tag_report_unexp_eager(uct_cxi_iface_t *iface,
@@ -1439,7 +1407,7 @@ uct_cxi_unexp_stream_get(uct_cxi_iface_t *iface, uint32_t initiator,
     ucs_list_head_init(&stream->entries);
     stream->tag       = tag;
     stream->initiator = initiator;
-    stream->num_early = 0;
+    stream->num_lost  = 0;
     stream->busy      = 0;
     return stream;
 }
@@ -1514,7 +1482,7 @@ uct_cxi_unexp_alloc(uct_cxi_iface_t *iface, const union c_event *event,
         pos = pos->prev;
     }
     ucs_list_insert_after(pos, &e->link);
-    stream->num_early += !(flags & UCT_CXI_UNEXP_ARRIVED);
+    stream->num_lost += !!(flags & UCT_CXI_UNEXP_LOST);
     iface->tag.unexp_held += is_rndv;
     return e;
 }
@@ -1525,7 +1493,7 @@ static void uct_cxi_unexp_unlink(uct_cxi_iface_t *iface,
                                  uct_cxi_unexp_report_t *e)
 {
     ucs_list_del(&e->link);
-    e->stream->num_early -= !(e->flags & UCT_CXI_UNEXP_ARRIVED);
+    e->stream->num_lost -= !!(e->flags & UCT_CXI_UNEXP_LOST);
     iface->tag.unexp_held -= e->is_rndv;
     if (!ucs_list_is_empty(&e->wait)) {
         ucs_list_del(&e->wait);
@@ -1534,18 +1502,18 @@ static void uct_cxi_unexp_unlink(uct_cxi_iface_t *iface,
 }
 
 /*
- * Give back an entry that is off its chain. For a rendezvous that has arrived
- * this is where the sender's credits go back: every event the message leaves
- * in the receive event queue has been handled by now (its arrival, the outcome
- * of the search for it, the completion of the read of its source address, which
- * for a message a receive took is the last to come), and it holds no more of
- * the table. All the ways of leaving the table end here, so the credits go
- * back once.
+ * Give back an entry that is off its chain. For a rendezvous this is where the
+ * sender's credits go back: every event the message leaves in the receive event
+ * queue has been handled by now (its arrival, and the completion of the read of
+ * its source address, or for a message a receive took, the arrival is the last
+ * to come: see uct_cxi_unexp_arrival_lost()), and it holds no more of the
+ * table. All the ways of leaving the table end here, so the credits go back
+ * once.
  */
 static void uct_cxi_unexp_free(uct_cxi_iface_t *iface,
                                uct_cxi_unexp_report_t *e)
 {
-    if (e->is_rndv && (e->flags & UCT_CXI_UNEXP_ARRIVED)) {
+    if (e->is_rndv) {
         uct_cxi_tag_credit_return(iface, e->initiator,
                                   UCT_CXI_FC_SLOTS_TAG_RNDV, 0);
     }
@@ -1554,22 +1522,16 @@ static void uct_cxi_unexp_free(uct_cxi_iface_t *iface,
     iface->tag.unexp_free = e;
 }
 
-/* The arrival of an entry is seen. */
-static void uct_cxi_unexp_set_arrived(uct_cxi_unexp_report_t *e)
-{
-    e->stream->num_early -= !(e->flags & UCT_CXI_UNEXP_ARRIVED);
-    e->flags             |= UCT_CXI_UNEXP_ARRIVED;
-}
-
-/* A rendezvous that is not ours, now that it has arrived: nothing is left to
- * wait for, but its address read, if one is on its way. */
+/* An entry with nothing left to wait for and nothing to report: a tombstone
+ * whose message has arrived, or an entry that could not be handed on. Its
+ * address read, if there is one, has not been posted: only an entry that is
+ * reported is ever read. */
 static void uct_cxi_unexp_discard(uct_cxi_iface_t *iface,
                                   uct_cxi_unexp_report_t *e)
 {
+    ucs_assert(e->state != UCT_CXI_UNEXP_READING);
     uct_cxi_unexp_unlink(iface, e);
-    if (e->state != UCT_CXI_UNEXP_READING) {
-        uct_cxi_unexp_free(iface, e);
-    } /* else uct_cxi_unexp_read_comp() frees it: the read cannot be undone */
+    uct_cxi_unexp_free(iface, e);
 }
 
 /* The first entry of \a stream that is not a tombstone, NULL if none. */
@@ -1667,17 +1629,18 @@ static ucs_status_t uct_cxi_unexp_start_read(uct_cxi_iface_t *iface,
 }
 
 /*
- * Post the address read of the rendezvous \a e if it can be: not yet posted,
- * its sender known, and it is not known to be lost. If the sender is not
- * known (its announce is not seen), the entry waits for the announce handler.
+ * Post the address read of the rendezvous \a e if it can be: not yet posted
+ * and its sender known. If the sender is not known (its announce is not seen),
+ * the entry waits for the announce handler.
  */
 static void uct_cxi_unexp_start(uct_cxi_iface_t *iface,
                                 uct_cxi_unexp_report_t *e)
 {
     ucs_status_t status;
 
+    ucs_assert(!(e->flags & UCT_CXI_UNEXP_LOST));
     if (!e->is_rndv || (e->state != UCT_CXI_UNEXP_NEW) ||
-        (e->flags & UCT_CXI_UNEXP_LOST) || !ucs_list_is_empty(&e->wait)) {
+        !ucs_list_is_empty(&e->wait)) {
         return;
     }
 
@@ -1693,16 +1656,13 @@ static void uct_cxi_unexp_start(uct_cxi_iface_t *iface,
     }
 }
 
-/* Can \a e be reported to UCP, as far as it itself goes? A rendezvous must be
- * ours, and have its address (or know it can not get it). */
+/* Can \a e be reported to UCP, as far as it itself goes? A rendezvous must
+ * have its address (or know it can not get it). */
 static UCS_F_ALWAYS_INLINE int
 uct_cxi_unexp_is_ready(const uct_cxi_unexp_report_t *e)
 {
-    return !e->is_rndv ||
-           (((e->flags & (UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED)) ==
-             (UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED)) &&
-            ((e->state == UCT_CXI_UNEXP_READY) ||
-             (e->state == UCT_CXI_UNEXP_FAILED)));
+    return !e->is_rndv || (e->state == UCT_CXI_UNEXP_READY) ||
+           (e->state == UCT_CXI_UNEXP_FAILED);
 }
 
 /*
@@ -1802,12 +1762,7 @@ static void uct_cxi_unexp_read_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 
     e->state = (status == UCS_OK) ? UCT_CXI_UNEXP_READY :
                                     UCT_CXI_UNEXP_FAILED;
-    if (e->flags & UCT_CXI_UNEXP_LOST) {
-        /* Its message went to a receive; this read was for nothing. It is
-         * off its chain, which may be gone too. */
-        uct_cxi_unexp_free(e->iface, e);
-        return;
-    }
+    ucs_assert(!(e->flags & UCT_CXI_UNEXP_LOST));
     uct_cxi_unexp_advance(e->iface, e->stream);
 }
 
@@ -1883,13 +1838,12 @@ static int uct_cxi_unexp_arrival_lost(uct_cxi_iface_t *iface,
     int                     redeliver;
     union c_event           copy;
 
-    if ((stream == NULL) || (stream->num_early == 0)) {
-        return 0; /* every one of them has arrived already */
+    if ((stream == NULL) || (stream->num_lost == 0)) {
+        return 0; /* no tombstone */
     }
 
     ucs_list_for_each(e, &stream->entries, link) {
-        if ((e->is_rndv == is_rndv) && (e->flags & UCT_CXI_UNEXP_LOST) &&
-            !(e->flags & UCT_CXI_UNEXP_ARRIVED) &&
+        if ((e->flags & UCT_CXI_UNEXP_LOST) && (e->is_rndv == is_rndv) &&
             (!is_rndv || (e->rendezvous_id == id))) {
             break;
         }
@@ -1899,7 +1853,6 @@ static int uct_cxi_unexp_arrival_lost(uct_cxi_iface_t *iface,
     }
 
     redeliver = e->flags & UCT_CXI_UNEXP_REDELIVER;
-    uct_cxi_unexp_set_arrived(e);
     uct_cxi_unexp_discard(iface, e); /* the tombstone */
     if (redeliver) {
         copy = *event; /* the report may re-enter progress */
@@ -2038,9 +1991,7 @@ static void uct_cxi_tag_found_eager(uct_cxi_iface_t *iface,
                         event->tgt_long.match_bits);
 
         if ((stream != NULL) && uct_cxi_unexp_has_older(stream, seq)) {
-            if (uct_cxi_unexp_alloc(iface, event, 0,
-                                    UCT_CXI_UNEXP_ARRIVED |
-                                    UCT_CXI_UNEXP_OWNED, seq) != NULL) {
+            if (uct_cxi_unexp_alloc(iface, event, 0, 0, seq) != NULL) {
                 return;
             }
             ucs_warn("cxi TAG no free entry to hold an unexpected eager "
@@ -2256,9 +2207,7 @@ void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
      * an eager message reported on the spot. The entry is taken first: with
      * none, the message stays in the NIC's list, for a receive to take. */
     if (is_rndv) {
-        e = uct_cxi_unexp_alloc(iface, event, 1,
-                                UCT_CXI_UNEXP_ARRIVED | UCT_CXI_UNEXP_OWNED,
-                                seq);
+        e = uct_cxi_unexp_alloc(iface, event, 1, 0, seq);
         if (ucs_unlikely(e == NULL)) {
             ucs_error("cxi TAG no free entry to hold an unexpected "
                       "rendezvous, tag=0x%lx initiator=0x%x -- not reported "
@@ -2460,11 +2409,11 @@ uct_cxi_iface_issue_rdzv_get(uct_cxi_iface_t *iface,
  * rather than in each handler. Classifying eager-vs-rendezvous
  * (event->tgt_long.rendezvous) and dispatching to the right handler is the
  * caller's job -- iface_progress() in cxi_iface.c -- not this function's
- * or the handlers' own; see the handlers' doc comments. A
- * SEARCH_AND_DELETE confirmation (buffer_id==UCT_CXI_TAG_SEARCH_DELETE_
- * BUFFER_ID) never reaches here at all -- iface_progress() routes it to
- * uct_cxi_iface_tag_handle_search_delete_confirm_eager() before either match
- * handler, let alone this shared lookup, is ever called.
+ * or the handlers' own; see the handlers' doc comments. The outcome of a
+ * SEARCH_AND_DELETE (buffer_id==UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID) never
+ * reaches here at all -- iface_progress() routes it to
+ * uct_cxi_iface_tag_handle_search_delete_found() before either match handler,
+ * let alone this shared lookup, is ever called.
  *
  * Returns NULL (nothing further to do) for a stale/already-resolved slot;
  * otherwise returns the matched ctx with *slot_p set.

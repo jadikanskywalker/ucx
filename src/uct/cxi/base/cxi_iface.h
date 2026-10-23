@@ -348,8 +348,8 @@ typedef struct uct_cxi_unexp_stream {
     ucs_list_link_t              entries;   /**< uct_cxi_unexp_report_t.link */
     uint64_t                     tag;
     uint32_t                     initiator;
-    unsigned                     num_early; /**< entries still to have their
-                                                 ARRIVED event */
+    unsigned                     num_lost;  /**< entries in the chain that are
+                                                 tombstones (UCT_CXI_UNEXP_LOST) */
     int                          busy;      /**< being advanced */
     struct uct_cxi_unexp_stream *next_free;
 } uct_cxi_unexp_stream_t;
