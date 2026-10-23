@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <cstring>
+#include <functional>
 
 
 /**
@@ -24,6 +25,9 @@ struct uct_cxi_tag_unexp_msg {
     uct_tag_t             tag;
     uint64_t              imm;
     std::vector<uint8_t>  data;
+    /* The receive watched by uct_cxi_tag_unexp_ctx::watch had been told it
+     * was consumed when this message was delivered. */
+    bool                  watched_consumed;
 };
 
 struct uct_cxi_tag_unexp_ctx {
@@ -34,6 +38,11 @@ struct uct_cxi_tag_unexp_ctx {
     /* Every message delivered so far, in delivery order -- for tests that
      * send several before the receiver progresses. */
     std::vector<uct_cxi_tag_unexp_msg> all;
+    /* Optional: a receive's consumed flag, recorded with every message, and a
+     * hook called with every message delivered (the model of UCP matching it
+     * to its own receives). */
+    const volatile bool *watch;
+    std::function<void(const uct_cxi_tag_unexp_msg &)> on_msg;
 };
 
 static ucs_status_t
@@ -45,8 +54,12 @@ uct_cxi_tag_eager_cb(void *arg, void *data, size_t length, unsigned flags,
     ctx->imm = imm;
     ctx->data.assign(static_cast<uint8_t *>(data),
                      static_cast<uint8_t *>(data) + length);
-    ctx->all.push_back({stag, imm, ctx->data});
+    ctx->all.push_back({stag, imm, ctx->data,
+                        (ctx->watch != NULL) && *ctx->watch});
     ctx->fired = true;
+    if (ctx->on_msg) {
+        ctx->on_msg(ctx->all.back());
+    }
     return UCS_OK;
 }
 
@@ -85,6 +98,7 @@ static void uct_cxi_tag_consumed_cb(uct_tag_context_t *self)
 {
     uct_cxi_tag_recv_ctx *ctx = reinterpret_cast<uct_cxi_tag_recv_ctx *>(self);
     EXPECT_FALSE(ctx->completed) << "tag_consumed_cb fired after completed_cb";
+    EXPECT_FALSE(ctx->consumed) << "tag_consumed_cb fired twice";
     ctx->consumed = true;
 }
 
@@ -157,6 +171,7 @@ protected:
         m_unexp.fired = false;
         m_unexp.tag   = 0;
         m_unexp.imm   = 0;
+        m_unexp.watch = NULL;
 
         /* Deliberately not calling test_cxi_rma_base::init() -- it uses
          * the no-arg create_entity(), which substitutes a dummy eager_cb

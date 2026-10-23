@@ -219,6 +219,8 @@ typedef struct uct_cxi_iface_config {
     unsigned                  tag_max_outstanding; /**< Max simultaneously-posted
                                               priority LEs (hard ceiling 65535 --
                                               buffer_id is uint16_t)                */
+    unsigned                  tag_fence_interval; /**< Posted receives between
+                                              fences (see uct_cxi_tag_pend_t)       */
 #ifndef UCT_CXI_DISABLE_FC
     int                       fc_enable;       /**< Handshake with peers and
                                                     open the control PTE       */
@@ -314,15 +316,14 @@ typedef struct uct_cxi_rndv_peer_hdr {
 KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
 
 /**
- * One unexpected eager message with data, as far as its two events are
- * concerned: the Put into the overflow list (arrival), and the event that
- * takes it out of the list (a posted receive matched it, or our
- * SEARCH_AND_DELETE found it). They are produced by different pipelines of the
- * NIC and either can be seen first; the data is only known to be in the
- * overflow buffer once the arrival has been, so whichever comes first waits
- * for the other (iface->tag.eager_pairs, keyed by the message's address in
- * the overflow buffer, which both carry). Same as libfabric's
- * match_put_event().
+ * One unexpected eager message with data that a posted receive is to take, as
+ * far as its two events are concerned: the Put into the overflow list
+ * (arrival), and the receive's delayed match. They are produced by different
+ * pipelines of the NIC and either can be seen first; the data is only known to
+ * be in the overflow buffer once the arrival has been, so whichever comes
+ * first waits for the other (iface->tag.eager_pairs, keyed by the message's
+ * address in the overflow buffer, which both carry). Same as libfabric's
+ * match_put_event(). A message that goes to UCP instead is not kept here.
  */
 typedef struct uct_cxi_eager_pair {
     uint64_t      seq;       /**< when the arrival was handled, in the numbering
@@ -330,8 +331,6 @@ typedef struct uct_cxi_eager_pair {
     uint8_t       parked;    /**< 0: the arrival was seen and waits for its
                                   match; 1: a match was seen and waits for
                                   its arrival, and is kept in `event` */
-    uint8_t       is_found;  /**< parked: the SEARCH_AND_DELETE's find, not a
-                                  posted receive's match */
     union c_event event;
 } uct_cxi_eager_pair_t;
 KHASH_MAP_INIT_INT64(uct_cxi_eager_pair_hash, uct_cxi_eager_pair_t)
@@ -352,6 +351,35 @@ typedef struct uct_cxi_unexp_stream {
     int                          busy;      /**< being advanced */
     struct uct_cxi_unexp_stream *next_free;
 } uct_cxi_unexp_stream_t;
+
+/*
+ * A receive that has been posted, and may still take a message that is in the
+ * overflow list. Hardware gives an unexpected message to a receive appended
+ * after it landed, and tells us only afterwards (the delayed match, from its
+ * command pipeline); UCP must not be handed that message in the meantime, nor
+ * be left to think the receive is still free. So the receives are kept in the
+ * order they were posted, in a ring (iface->tag.pend): the first PENDING one
+ * whose tag matches is the one a message that arrives unexpected goes to (see
+ * uct_cxi_tag_claim()), and it is CLAIMED. A receive is SPENT once its outcome
+ * is known (a match, a cancel).
+ *
+ * The ring is bounded by fences (uct_cxi_tag_fence_post()): a search that
+ * matches nothing, posted every TAG_FENCE_INTERVAL receives. Commands are
+ * executed in order, so when its event is seen every receive before it has
+ * been appended and has had whatever messages it was going to take reported,
+ * and those receives leave the ring (pend_tail moves over them).
+ */
+typedef struct uct_cxi_tag_pend {
+    uint64_t tag;
+    uint64_t mask;
+    uint16_t slot;
+    uint8_t  state;
+} uct_cxi_tag_pend_t;
+
+#define UCT_CXI_TAG_PEND_FREE    0  /* not a receive (never in the window) */
+#define UCT_CXI_TAG_PEND_PENDING 1
+#define UCT_CXI_TAG_PEND_CLAIMED 2
+#define UCT_CXI_TAG_PEND_SPENT   3
 
 typedef struct uct_cxi_unexp_key {
     uint64_t tag;
@@ -685,6 +713,22 @@ typedef struct uct_cxi_iface {
         uint64_t              unexp_seq;        /**< numbers the unexpected arrivals
                                                      as they are handled: the
                                                      order of a stream's chain */
+
+        /* The posted receives that may take an unexpected message: see
+         * uct_cxi_tag_pend_t. pend_head is where the next is put and
+         * pend_tail the oldest not yet covered by a fence (both count up and
+         * wrap; an index is the count modulo UCT_CXI_TAG_PEND_SIZE).
+         * slot_pos[slot] is a receive's count. fences[] holds, for each fence
+         * in flight (fence_tail..fence_head), the pend_head it covers. */
+        uct_cxi_tag_pend_t   *pend;        /**< [UCT_CXI_TAG_PEND_SIZE] */
+        uint32_t             *slot_pos;    /**< [max_outstanding] */
+        uint32_t             *fences;      /**< [UCT_CXI_TAG_PEND_SIZE] */
+        uint32_t              pend_head;
+        uint32_t              pend_tail;
+        uint32_t              fence_head;
+        uint32_t              fence_tail;
+        unsigned              fence_interval; /**< receives between fences */
+        unsigned              fence_posts;    /**< posted since the last one */
 
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;

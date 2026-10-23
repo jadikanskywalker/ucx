@@ -22,7 +22,9 @@
 #include <uct/cxi/base/cxi_ep.h>
 #include <uct/cxi/base/cxi_iface.h>
 #include <uct/cxi/base/cxi_md.h>
+extern "C" {
 #include <uct/cxi/base/cxi_tag.h>
+}
 
 #include <cstring>
 #include <functional>
@@ -30,7 +32,13 @@
 #include <unistd.h>
 
 
-class test_cxi_tag : public test_cxi_tag_base {};
+class test_cxi_tag : public test_cxi_tag_base {
+protected:
+    static uct_cxi_iface_t *cxi_iface(entity &e)
+    {
+        return ucs_derived_of(e.iface(), uct_cxi_iface_t);
+    }
+};
 
 
 /* -------------------------------------------------------------------------
@@ -750,6 +758,391 @@ UCS_TEST_P(test_cxi_tag, forced_race_search_delete_vs_priority_append)
                      << " / " << ITERS << " iterations";
 
     flush_ep(sender(), ep);
+}
+
+
+/* -------------------------------------------------------------------------
+ * Unexpected messages and the receives posted for them: who takes which
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * Two messages with one tag arrive while the receiver is not looking, then a
+ * receive is posted: hardware gives it the first, and the second is UCP's.
+ * UCP must be told that the receive is taken before it is told of the second
+ * message, or it can match the second to the receive (and cancel it, losing
+ * the first), and told once.
+ */
+UCS_TEST_P(test_cxi_tag, claimed_receive_is_consumed_before_the_next_report)
+{
+    static const size_t    PAY_LEN = 32;
+    static const uct_tag_t TAG     = 0xC1A1000000000001ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> tx1(PAY_LEN, 0x11), tx2(PAY_LEN, 0x22);
+    std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx1.data(), PAY_LEN));
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx2.data(), PAY_LEN));
+    usleep(200000); /* both are in the overflow list before the receive */
+
+    uct_cxi_tag_recv_ctx rctx;
+    init_recv_ctx(rctx);
+    m_unexp.watch = &rctx.consumed;
+
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = PAY_LEN;
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &rctx.super));
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(10.0);
+    while ((!rctx.completed || (m_unexp.all.size() < 1)) &&
+           (ucs_get_time() < deadline)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    ASSERT_TRUE(rctx.completed);
+    ASSERT_EQ(1u, m_unexp.all.size());
+
+    EXPECT_EQ(UCS_OK, rctx.status);
+    EXPECT_EQ(tx1, rx_buf) << "the receive must get the first message";
+    EXPECT_EQ(tx2, m_unexp.all[0].data) << "UCP must get the second";
+    EXPECT_TRUE(m_unexp.all[0].watched_consumed)
+            << "the second message was reported before UCP was told that the "
+               "receive is taken";
+
+    /* Nothing else shows up. */
+    ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.2);
+    while (ucs_get_time() < settle) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+    EXPECT_EQ(1u, m_unexp.all.size());
+
+    m_unexp.watch = NULL;
+    flush_ep(sender(), ep);
+    dereg(receiver(), rx_memh);
+}
+
+
+/*
+ * More messages arrive than there are receives, as in tag_bw: all with one
+ * tag, with UCP modelled by what it does with a message it is handed -- match
+ * it to its oldest receive that is not consumed, and force-cancel that
+ * receive -- and by what it does with a receive that is consumed (nothing,
+ * but its message is the receive's). Every message must get to one place only:
+ * a receive that hardware completed, or UCP.
+ */
+UCS_TEST_P(test_cxi_tag, more_messages_than_receives)
+{
+    static const unsigned  NUM_MSGS = 40;
+    static const unsigned  NUM_RECV = 16;
+    static const size_t    PAY_LEN  = 8;
+    static const uct_tag_t TAG      = 0xC1A2000000000001ULL;
+
+    struct model_recv {
+        uct_cxi_tag_recv_ctx rctx;
+        std::vector<uint8_t> buf;
+        uct_mem_h            memh;
+        bool                 sw_matched;
+    };
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<model_recv> recvs(NUM_RECV);
+    std::vector<unsigned>   seen(NUM_MSGS, 0);
+    unsigned                to_ucp = 0;
+
+    m_unexp.on_msg = [&](const uct_cxi_tag_unexp_msg &msg) {
+        ASSERT_EQ(PAY_LEN, msg.data.size());
+        unsigned id = msg.data[0];
+        ASSERT_LT(id, NUM_MSGS);
+
+        for (model_recv &r : recvs) {
+            if (!r.rctx.consumed && !r.sw_matched && !r.rctx.completed) {
+                /* What UCP does: complete the oldest expected receive with
+                 * it, and give up its own hardware receive. */
+                r.sw_matched = true;
+                seen[id]++;
+                ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
+                                                        &r.rctx.super, 1));
+                return;
+            }
+        }
+        seen[id]++;
+        to_ucp++;
+    };
+
+    for (unsigned i = 0; i < NUM_MSGS; i++) {
+        std::vector<uint8_t> tx(PAY_LEN, 0);
+        tx[0] = i;
+        ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx.data(), PAY_LEN));
+    }
+    usleep(500000); /* all of them are in the overflow list */
+
+    for (model_recv &r : recvs) {
+        r.buf.assign(PAY_LEN, 0xFF);
+        r.memh       = reg(receiver(), r.buf.data(), PAY_LEN);
+        r.sw_matched = false;
+        init_recv_ctx(r.rctx);
+
+        uct_iov_t iov;
+        iov.buffer = r.buf.data();
+        iov.length = PAY_LEN;
+        iov.memh   = r.memh;
+        iov.stride = 0;
+        iov.count  = 1;
+        ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                               UCS_MASK(64), &iov, 1,
+                                               &r.rctx.super));
+    }
+
+    /* The messages the receives complete are theirs: counted by them. */
+    auto hw_done = [&]() {
+        unsigned n = 0;
+        for (model_recv &r : recvs) {
+            n += r.rctx.completed;
+        }
+        return n;
+    };
+
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(10.0);
+    while (((hw_done() + to_ucp) < NUM_MSGS) &&
+           (ucs_get_time() < deadline)) {
+        uct_iface_progress(sender().iface());
+        uct_iface_progress(receiver().iface());
+    }
+
+    for (model_recv &r : recvs) {
+        if (r.rctx.completed) {
+            ASSERT_EQ(PAY_LEN, r.rctx.length);
+            ASSERT_LT(r.buf[0], NUM_MSGS);
+            seen[r.buf[0]]++;
+        }
+    }
+
+    unsigned cancelled = 0;
+    for (model_recv &r : recvs) {
+        cancelled += r.sw_matched;
+    }
+    EXPECT_EQ(0u, cancelled)
+            << "UCP was handed a message while an unconsumed receive could "
+               "still have taken another";
+    EXPECT_EQ(NUM_RECV, hw_done());
+    EXPECT_EQ(NUM_MSGS - NUM_RECV, to_ucp);
+    for (unsigned i = 0; i < NUM_MSGS; i++) {
+        EXPECT_EQ(1u, seen[i]) << "message " << i
+                               << " was delivered " << seen[i] << " times";
+    }
+
+    m_unexp.on_msg = nullptr;
+    flush_ep(sender(), ep);
+    for (model_recv &r : recvs) {
+        dereg(receiver(), r.memh);
+    }
+}
+
+
+/*
+ * A receive whose outcome is known (it matched directly, or was cancelled) stays
+ * in the ring until a fence covers it, but is not for a later unexpected
+ * message to take: the message goes to UCP.
+ */
+UCS_TEST_P(test_cxi_tag, spent_receive_does_not_claim)
+{
+    static const size_t    PAY_LEN = 16;
+    static const uct_tag_t TAG     = 0xC1A4000000000001ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h ep = sender().ep(0);
+
+    std::vector<uint8_t> tx1(PAY_LEN, 0x31), tx2(PAY_LEN, 0x32);
+    std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = PAY_LEN;
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+
+    /* 1. Matched directly. */
+    uct_cxi_tag_recv_ctx r1;
+    init_recv_ctx(r1);
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &r1.super));
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx1.data(), PAY_LEN));
+    poll_until(r1.completed);
+    EXPECT_EQ(tx1, rx_buf);
+
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx2.data(), PAY_LEN));
+    poll_until(m_unexp.fired);
+    ASSERT_EQ(1u, m_unexp.all.size());
+    EXPECT_EQ(tx2, m_unexp.all[0].data)
+            << "the message was taken by a receive that had completed";
+
+    /* 2. Cancelled. */
+    m_unexp.fired = false;
+    m_unexp.all.clear();
+    uct_cxi_tag_recv_ctx r2;
+    init_recv_ctx(r2);
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &r2.super));
+    ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(), &r2.super, 0));
+    poll_until(r2.completed);
+    EXPECT_EQ(UCS_ERR_CANCELED, r2.status);
+
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx2.data(), PAY_LEN));
+    poll_until(m_unexp.fired);
+    ASSERT_EQ(1u, m_unexp.all.size());
+    EXPECT_EQ(tx2, m_unexp.all[0].data)
+            << "the message was taken by a receive that was cancelled";
+
+    flush_ep(sender(), ep);
+    dereg(receiver(), rx_memh);
+}
+
+
+/*
+ * The ring of posted receives and its fences: a fence follows every
+ * TAG_FENCE_INTERVAL posts and moves the ring's tail when it returns; slots and
+ * ring positions are recycled over many times the ring's size.
+ */
+UCS_TEST_P(test_cxi_tag, fences_advance_the_ring)
+{
+    static const size_t    PAY_LEN = 8;
+    static const unsigned  ROUNDS  = 4 * UCT_CXI_TAG_PEND_SIZE;
+
+    uct_cxi_iface_t     *riface = cxi_iface(receiver());
+    std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+    unsigned             interval = riface->tag.fence_interval;
+
+    ASSERT_GE(interval, 1u);
+    ASSERT_LT(interval, UCT_CXI_TAG_PEND_SIZE / 2);
+
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = PAY_LEN;
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+
+    EXPECT_EQ(0u, riface->tag.pend_head);
+    for (unsigned i = 0; i < ROUNDS; i++) {
+        uct_cxi_tag_recv_ctx rctx;
+        init_recv_ctx(rctx);
+        ASSERT_EQ(UCS_OK, uct_iface_tag_recv_zcopy(receiver().iface(),
+                                                   0xFE0000 + i, UCS_MASK(64),
+                                                   &iov, 1, &rctx.super))
+                << "round " << i;
+        ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
+                                                &rctx.super, 1));
+        if ((i % interval) == (interval - 1)) {
+            /* The fence of these returns once the receiver is looked at. */
+            ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
+            while (((riface->tag.pend_head - riface->tag.pend_tail) >=
+                    interval) && (ucs_get_time() < deadline)) {
+                uct_iface_progress(receiver().iface());
+            }
+            EXPECT_LT(riface->tag.pend_head - riface->tag.pend_tail, interval)
+                    << "round " << i << ": no fence returned";
+        }
+    }
+
+    EXPECT_EQ(ROUNDS, riface->tag.pend_head);
+    EXPECT_EQ(riface->tag.fence_head, riface->tag.fence_tail)
+            << "a fence is still in flight";
+    EXPECT_EQ(ROUNDS / interval, riface->tag.fence_head);
+
+    dereg(receiver(), rx_memh);
+}
+
+
+/*
+ * The delayed match of a receive that UCP gave up reaches us before the arrival
+ * of the message it took (the order the NIC has been seen to produce): the
+ * message is not lost, UCP is told of it. The events are drained by hand and
+ * handed to the handlers in that order, since which one the NIC writes first
+ * is not for a test to decide.
+ */
+UCS_TEST_P(test_cxi_tag, match_of_a_cancelled_receive_is_reported)
+{
+    static const size_t    PAY_LEN = 32;
+    static const uct_tag_t TAG     = 0xC1A3000000000001ULL;
+
+    cxi_connect(sender(), 0, receiver());
+    uct_ep_h         ep     = sender().ep(0);
+    uct_cxi_iface_t *riface = cxi_iface(receiver());
+
+    std::vector<uint8_t> tx(PAY_LEN, 0x5A);
+    std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+
+    ASSERT_UCS_OK(uct_ep_tag_eager_short(ep, TAG, tx.data(), PAY_LEN));
+    usleep(200000);
+
+    uct_cxi_tag_recv_ctx rctx;
+    init_recv_ctx(rctx);
+    uct_iov_t iov;
+    iov.buffer = rx_buf.data();
+    iov.length = PAY_LEN;
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+    ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), TAG,
+                                           UCS_MASK(64), &iov, 1, &rctx.super));
+    usleep(200000); /* the receive has taken the message in hardware */
+    ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(), &rctx.super,
+                                            1));
+
+    std::vector<union c_event> events;
+    const union c_event       *arrival = NULL, *match = NULL;
+    ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(2.0);
+    while (((arrival == NULL) || (match == NULL)) &&
+           (ucs_get_time() < deadline)) {
+        const union c_event *ev;
+        while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
+            if (ev->tgt_long.ptlte_index == riface->tag.pte->ptn) {
+                events.push_back(*ev);
+            }
+        }
+        cxi_eq_ack_events(riface->rx_eq.evtq);
+
+        arrival = match = NULL;
+        for (const union c_event &e : events) {
+            if ((e.hdr.event_type == C_EVENT_PUT) &&
+                (e.tgt_long.ptl_list == C_PTL_LIST_OVERFLOW)) {
+                arrival = &e;
+            } else if (e.hdr.event_type == C_EVENT_PUT_OVERFLOW) {
+                match = &e;
+            }
+        }
+    }
+    ASSERT_NE(static_cast<const union c_event *>(NULL), arrival);
+    ASSERT_NE(static_cast<const union c_event *>(NULL), match);
+
+    /* The match first, then the arrival. */
+    uct_cxi_iface_tag_handle_eager_match(riface, match);
+    EXPECT_TRUE(m_unexp.all.empty()) << "reported before it arrived";
+    uct_cxi_iface_tag_handle_ovf_arrival(riface, arrival);
+
+    ASSERT_EQ(1u, m_unexp.all.size()) << "the message was lost";
+    EXPECT_EQ(TAG, m_unexp.all[0].tag);
+    EXPECT_EQ(tx, m_unexp.all[0].data);
+    EXPECT_FALSE(rctx.completed) << "a force-cancelled receive completed";
+    EXPECT_EQ(0, riface->tag.ovf_refcnt[0]) << "the buffer is still held";
+
+    dereg(receiver(), rx_memh);
 }
 
 

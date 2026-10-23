@@ -235,9 +235,20 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"TAG_MAX_OUTSTANDING", "512",
      "Maximum number of simultaneously-posted priority-list receive LEs.\n"
      "Hard ceiling UCT_CXI_TAG_MAX_OUTSTANDING_MAX (the hardware buffer_id\n"
-     "correlation field is 16 bits, and the id above the receives' is\n"
-     "reserved for SEARCH_AND_DELETE, see cxi_tag.h).",
+     "correlation field is 16 bits, and the two ids above the receives' are\n"
+     "reserved for SEARCH_AND_DELETE and fences, see cxi_tag.h).",
      ucs_offsetof(uct_cxi_iface_config_t, tag_max_outstanding),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"TAG_FENCE_INTERVAL", "32",
+     "Number of posted tag receives between fences. A fence is a search that\n"
+     "matches nothing, whose event tells that every receive before it has\n"
+     "been appended, so that the unexpected messages they can still take\n"
+     "have been told of: the receives not covered by one are what an\n"
+     "unexpected message is matched against (at most 512, then receives are\n"
+     "refused and matched in software). A smaller interval keeps that list\n"
+     "short, at the cost of an event per fence.",
+     ucs_offsetof(uct_cxi_iface_config_t, tag_fence_interval),
      UCS_CONFIG_TYPE_UINT},
 
 #ifndef UCT_CXI_DISABLE_FC
@@ -2432,23 +2443,14 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
                   (int)event->tgt_long.buffer_id);
     } else if ((event->hdr.event_type == C_EVENT_PUT_OVERFLOW) &&
                (event->tgt_long.ptlte_index == iface->tag.ptn)) {
-        /* Either our own SEARCH_AND_DELETE's "found" confirmation (buffer_id
-         * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID, see cxi_tag.h),
-         * or delayed correlation for a real match (same disposition as a
-         * direct match). Either way routed by the event's own rendezvous
-         * flag, not by the command's buffer_id: the SEARCH_AND_DELETE
-         * deletes the oldest entry with its tag, which can be an eager
-         * message when it was posted for a rendezvous arrival, or the
-         * reverse. */
+        /* Either our own SEARCH_AND_DELETE's "found" outcome (buffer_id
+         * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID, see cxi_tag.h), or the delayed
+         * correlation of a real match (same disposition as a direct match),
+         * routed by the event's own rendezvous flag, not by the command's
+         * buffer_id. */
         if (event->tgt_long.buffer_id ==
             UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID) {
-            if (event->tgt_long.rendezvous) {
-                uct_cxi_iface_tag_handle_search_delete_confirm_rndv(iface,
-                                                                    event);
-            } else {
-                uct_cxi_iface_tag_handle_search_delete_confirm_eager(iface,
-                                                                     event);
-            }
+            uct_cxi_iface_tag_handle_search_delete_found(iface, event);
         } else if (event->tgt_long.rendezvous) {
             uct_cxi_iface_tag_handle_rdzv_match(iface, event);
         } else {
@@ -2458,11 +2460,11 @@ uct_cxi_iface_handle_event(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
                (event->tgt_long.ptlte_index == iface->tag.ptn) &&
                (event->tgt_long.buffer_id ==
                 UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID)) {
-        /* Our SEARCH_AND_DELETE found nothing: the message it was issued
-         * for was taken by a receive posted meanwhile, whose own event
-         * accounts for it. Nothing to do. */
-        ucs_info("cxi TAG [SEARCH-DELETE-NOT-FOUND] rc=%d",
-                 cxi_event_rc(event));
+        uct_cxi_iface_tag_handle_search_delete_missed(iface, event);
+    } else if ((event->hdr.event_type == C_EVENT_SEARCH) &&
+               (event->tgt_long.ptlte_index == iface->tag.ptn) &&
+               (event->tgt_long.buffer_id == UCT_CXI_TAG_FENCE_BUFFER_ID)) {
+        uct_cxi_iface_tag_fence_done(iface, event);
     } else if (event->hdr.event_type == C_EVENT_PUT_OVERFLOW) {
         ucs_info("cxi C_EVENT_PUT_OVERFLOW: ptl_list=%d am_id=%u "
                  "mlength=%u start=0x%lx remote_offset=0x%lx rc=%d",

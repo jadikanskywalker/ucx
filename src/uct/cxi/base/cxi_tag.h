@@ -62,9 +62,18 @@
 #define UCT_CXI_TAG_UNEXP_MAX_LIMIT       (1u << 20)
 
 /* buffer_id (uint16_t) is ours to choose on a command and comes back on its
- * events: real priority-LE slot ids are [0, max_outstanding), and the one id
- * above them is reserved for our own SEARCH_AND_DELETE commands. */
-#define UCT_CXI_TAG_MAX_OUTSTANDING_MAX   65534u
+ * events: real priority-LE slot ids are [0, max_outstanding), and the two ids
+ * above them are reserved for our own SEARCH_AND_DELETE and fence commands. */
+#define UCT_CXI_TAG_MAX_OUTSTANDING_MAX   65533u
+
+/* Receives that may still take a message that is already in the overflow list
+ * (see uct_cxi_tag_pend_t): a power of two. A full ring refuses further
+ * receives (UCP then matches them in software). */
+#define UCT_CXI_TAG_PEND_SIZE             512u
+
+/* The most fences in flight at once: each leaves one event in the receive
+ * event queue, which is covered by the reserved slots (EQ_RESERVED_SLOTS). */
+#define UCT_CXI_TAG_FENCE_MAX_INFLIGHT    32u
 
 /* Advertised rndv.max_hdr -- must be >= sizeof(ucp_tag_offload_unexp_
  * rndv_hdr_t) (17 bytes), which UCP sends with every offloaded rendezvous
@@ -87,6 +96,11 @@
  * and its initiator and rendezvous_id. The "not found" event carries none of
  * that (its start is always 0), and needs none: it is not acted on. */
 #define UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID  UCT_CXI_TAG_MAX_OUTSTANDING_MAX
+
+/* The buffer_id of the fences (see uct_cxi_tag_pend_t): a SEARCH that matches
+ * nothing, whose C_EVENT_SEARCH tells that every receive posted before it has
+ * been appended. */
+#define UCT_CXI_TAG_FENCE_BUFFER_ID  (UCT_CXI_TAG_MAX_OUTSTANDING_MAX + 1u)
 
 /* uct_cxi_tag_ctx_priv_t::rndv_flags bits 1-3 -- per-event bookkeeping for
  * a rendezvous receive (pre-shifted to land directly in rndv_flags).
@@ -145,6 +159,7 @@ typedef struct uct_cxi_tag_ctx_priv {
                              *             event arrives (Put/Put_Overflow/
                              *             Rendezvous all carry the same
                              *             rlength/mlength for one message).
+                             * bit 6     = UCT_CXI_TAG_FLAG_CONSUMED.
                              * imm (header_data) needs no persistence: for
                              * eager it's read from the event and used
                              * immediately (single-event completion); for
@@ -194,9 +209,12 @@ typedef struct uct_cxi_tag_ctx_priv {
 } uct_cxi_tag_ctx_priv_t;
 
 /* uct_cxi_tag_ctx_priv_t::rndv_flags bit layout (bits 1-4 are
- * UCT_CXI_RNDV_SEEN_* above). */
+ * UCT_CXI_RNDV_SEEN_* above). CONSUMED: UCP has been told through
+ * tag_consumed_cb that this receive is taken, which must happen once (see
+ * uct_cxi_tag_claim()), and for eager receives too. */
 #define UCT_CXI_RNDV_FLAG_IS_RNDV     UCS_BIT(0)
 #define UCT_CXI_RNDV_FLAG_TRUNCATED   UCS_BIT(5)
+#define UCT_CXI_TAG_FLAG_CONSUMED     UCS_BIT(6)
 
 /* Hard ceiling on iface->rdzv.max_outstanding: the id has to survive a hop
  * through the original Put's own cmd.rendezvous_id field (struct
@@ -388,21 +406,19 @@ void uct_cxi_iface_close_rdzv_pte(uct_cxi_iface_t *self);
  */
 void uct_cxi_iface_tag_handle_ovf_arrival(uct_cxi_iface_t *iface,
                                           const union c_event *event);
-/* Dispatched from cxi_iface.c for a C_EVENT_PUT_OVERFLOW whose buffer_id is
- * UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID and whose message is eager (the
- * event's own rendezvous flag, not which arrival the command was issued
- * for), before choosing between eager and rendezvous match handling.
- * With sd.use_once=1, this event only ever fires "found and
- * deleted" (C_RC_OK) -- "not found" is C_EVENT_SEARCH, see
- * uct_cxi_iface_tag_handle_search_delete_not_found() below. */
-void uct_cxi_iface_tag_handle_search_delete_confirm_eager(uct_cxi_iface_t *iface,
-                                                    const union c_event *event);
-/* Rendezvous counterpart of the above, for a message whose event has the
- * rendezvous flag: calls rndv_cb instead of eager_cb, and reconstructs/caches the
- * unexpected-rndv header (uct_cxi_rndv_peer_hdr_t) instead of just copying
- * raw eager bytes. */
-void uct_cxi_iface_tag_handle_search_delete_confirm_rndv(
-        uct_cxi_iface_t *iface, const union c_event *event);
+/* Dispatched from cxi_iface.c for the outcome of one of our
+ * SEARCH_AND_DELETE commands (buffer_id UCT_CXI_TAG_SEARCH_DELETE_BUFFER_ID).
+ * With sd.use_once=1 it is one event: C_EVENT_PUT_OVERFLOW (C_RC_OK) if it
+ * found and deleted the message (nothing is left to do, it was reported when
+ * its arrival was handled), C_EVENT_SEARCH if it found nothing (which for a
+ * message we handed to UCP means a posted receive took it too: an error). */
+void uct_cxi_iface_tag_handle_search_delete_found(uct_cxi_iface_t *iface,
+                                                  const union c_event *event);
+void uct_cxi_iface_tag_handle_search_delete_missed(uct_cxi_iface_t *iface,
+                                                   const union c_event *event);
+/* The C_EVENT_SEARCH of a fence (UCT_CXI_TAG_FENCE_BUFFER_ID). */
+void uct_cxi_iface_tag_fence_done(uct_cxi_iface_t *iface,
+                                  const union c_event *event);
 
 void uct_cxi_iface_tag_handle_eager_match(uct_cxi_iface_t *iface,
                                           const union c_event *event);
@@ -530,6 +546,9 @@ typedef struct uct_cxi_rndv_hdr_wire {
 #define UCT_CXI_UNEXP_ARRIVED  1  /* flags: see above (eager: all but LOST) */
 #define UCT_CXI_UNEXP_OWNED    2
 #define UCT_CXI_UNEXP_LOST     4
+#define UCT_CXI_UNEXP_REDELIVER 8 /* a tombstone of an eager message that
+                                     is to be reported to UCP when it
+                                     arrives: its receive was cancelled */
 
 typedef struct uct_cxi_unexp_report {
     /* What is looked at along a stream's chain: all in the first cache line */
