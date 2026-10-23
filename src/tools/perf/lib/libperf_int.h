@@ -301,6 +301,16 @@ ucx_perf_do_warmup(ucx_perf_context_t *perf, const ucx_perf_params_t *params);
  */
 size_t ucx_perf_get_message_size(const ucx_perf_params_t *params);
 
+/**
+ * Number of messages the UCP receive buffer of each thread holds: one for each
+ * receive that a tag bandwidth test can have outstanding. Receives of one
+ * buffer overlap, and a transport that offloads tag matching writes a
+ * rendezvous request into the buffer of the receive it matches, which the next
+ * request, or the data of an earlier rendezvous, would overwrite before it is
+ * read. 1 for any other test, and when the buffers would be too large.
+ */
+unsigned ucp_perf_recv_slices(const ucx_perf_params_t *params);
+
 void ucx_perf_report(ucx_perf_context_t *perf);
 
 ucs_status_t ucx_perf_allocators_init_thread(ucx_perf_context_t *perf);

@@ -14,6 +14,7 @@
 #include "libperf_int.h"
 #include "ucp_tests.h"
 
+#include <ucs/datastruct/mpool.h>
 #include <ucs/sys/preprocessor.h>
 #include <ucs/sys/string.h>
 #include <ucs/type/status.h>
@@ -38,6 +39,9 @@ public:
         m_recvs_outstanding(0),
         m_sends_outstanding(0),
         m_max_outstanding(m_perf.params.max_outstanding),
+        m_recv_slices(ucp_perf_recv_slices(&m_perf.params)),
+        m_recv_slice_size(ucx_perf_get_message_size(&m_perf.params)),
+        m_recv_init(0),
         m_length(0ul),
         m_send_sn_buffer(NULL),
         m_send_sn_length(0ul),
@@ -52,6 +56,21 @@ public:
         memset(&m_recv_params, 0, sizeof(m_recv_params));
 
         ucs_assert_always(m_max_outstanding > 0);
+
+        if (m_recv_slices > 1) {
+            static const ucs_mpool_ops_t ops = {ucs_mpool_chunk_malloc,
+                                                ucs_mpool_chunk_free,
+                                                recv_slice_init, NULL, NULL};
+            ucs_mpool_params_t mp_params;
+
+            ucs_mpool_params_reset(&mp_params);
+            mp_params.elem_size       = sizeof(recv_slice_t);
+            mp_params.elems_per_chunk = m_recv_slices;
+            mp_params.max_elems       = m_recv_slices;
+            mp_params.ops             = &ops;
+            mp_params.name            = "perftest_recv_slices";
+            ucs_mpool_init(&mp_params, &m_recv_mp);
+        }
 
         if (m_perf.params.flags & UCX_PERF_TEST_FLAG_AM_RECV_COPY) {
             am_flags |= UCP_AM_FLAG_PERSISTENT_DATA;
@@ -81,6 +100,10 @@ public:
         set_am_handler(UCP_PERF_DAEMON_AM_ID_RECV_CMPL, NULL, NULL, 0);
         set_am_handler(UCP_PERF_DAEMON_AM_ID_SEND_CMPL, NULL, NULL, 0);
         set_am_handler(AM_ID, NULL, NULL, 0);
+
+        if (m_recv_slices > 1) {
+            ucs_mpool_cleanup(&m_recv_mp, 1);
+        }
     }
 
     void set_am_handler(unsigned id, ucp_am_recv_callback_t cb, void *arg,
@@ -527,6 +550,26 @@ public:
                 while (ucp_tag_probe_nb(worker, TAG, TAG_MASK, 0, &tag_info) == NULL) {
                     progress_responder();
                 }
+            }
+            if (m_recv_slices > 1) {
+                ucp_request_param_t param = m_recv_params;
+                recv_slice_t *slice;
+
+                while ((slice = (recv_slice_t*)ucs_mpool_get(&m_recv_mp)) ==
+                       NULL) {
+                    progress_responder();
+                }
+
+                param.cb.recv   = tag_recv_slice_cb;
+                param.user_data = slice;
+                request = ucp_tag_recv_nbx(worker, slice->buffer, length, TAG,
+                                           TAG_MASK, &param);
+                if (ucs_likely(!UCS_PTR_IS_PTR(request))) {
+                    ucs_mpool_put(slice); /* done at once */
+                    return UCS_PTR_STATUS(request);
+                }
+                recv_started();
+                return UCS_OK;
             }
             request = ucp_tag_recv_nbx(worker, buffer, length, TAG, TAG_MASK,
                                        &m_recv_params);
@@ -1090,9 +1133,47 @@ private:
         return alloc_validate_common(buffer_length);
     }
 
+    /* A receive of a stream of tag receives gets a slice of the receive
+     * buffer of its own for as long as it is outstanding (see
+     * ucp_perf_recv_slices()), whatever the order they complete in: the slices
+     * are the elements of a pool, and the element is the user_data of the
+     * receive. */
+    struct recv_slice_t {
+        ucp_perf_test_runner *test;
+        void                 *buffer;
+    };
+
+    static void recv_slice_init(ucs_mpool_t *mp, void *obj, void *chunk)
+    {
+        ucp_perf_test_runner *test = ucs_container_of(mp, ucp_perf_test_runner,
+                                                      m_recv_mp);
+        recv_slice_t *slice        = (recv_slice_t*)obj;
+
+        slice->test   = test;
+        slice->buffer = UCS_PTR_BYTE_OFFSET(test->m_perf.recv_buffer,
+                                            test->m_recv_init++ *
+                                            test->m_recv_slice_size);
+    }
+
+    static void tag_recv_slice_cb(void *request, ucs_status_t status,
+                                  const ucp_tag_recv_info_t *info,
+                                  void *user_data)
+    {
+        recv_slice_t *slice = (recv_slice_t*)user_data;
+        ucp_perf_test_runner *test = slice->test;
+
+        ucs_mpool_put(slice);
+        test->recv_completed();
+        ucp_request_free(request);
+    }
+
     int                m_recvs_outstanding;
     int                m_sends_outstanding;
     const int          m_max_outstanding;
+    const unsigned     m_recv_slices;
+    const size_t       m_recv_slice_size;
+    unsigned           m_recv_init;
+    ucs_mpool_t        m_recv_mp;
     size_t             m_length;
     void               *m_send_sn_buffer;
     size_t             m_send_sn_length;

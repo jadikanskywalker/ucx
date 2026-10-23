@@ -163,7 +163,8 @@ ucs_status_t ucp_perf_test_alloc_mem(ucx_perf_context_t *perf)
     perf->ucp.recv_exported_mem.address = NULL;
 
     /* Allocate receive buffer memory */
-    status = ucp_perf_mem_alloc(perf, buffer_size * params->thread_count +
+    status = ucp_perf_mem_alloc(perf, buffer_size * params->thread_count *
+                                ucp_perf_recv_slices(params) +
                                 ONESIDED_SIGNAL_SIZE,
                                 perf->recv_allocator, &perf->recv_buffer,
                                 &perf->ucp.recv_memh);

@@ -2113,7 +2113,9 @@ static ucs_status_t ucp_perf_setup(ucx_perf_context_t *perf)
         perf->ucp.tctx[i].perf.send_buffer =
                         UCS_PTR_BYTE_OFFSET(perf->send_buffer, i * message_size);
         perf->ucp.tctx[i].perf.recv_buffer =
-                        UCS_PTR_BYTE_OFFSET(perf->recv_buffer, i * message_size);
+                        UCS_PTR_BYTE_OFFSET(perf->recv_buffer,
+                                            i * message_size *
+                                            ucp_perf_recv_slices(&perf->params));
 
         status = ucp_worker_create(perf->ucp.context, &worker_params,
                                    &perf->ucp.tctx[i].perf.ucp.worker);
@@ -2319,6 +2321,27 @@ size_t ucx_perf_get_message_size(const ucx_perf_params_t *params)
     }
 
     return length;
+}
+
+/* The most memory the slices of all the threads may take (see
+ * ucp_perf_recv_slices): beyond it, fewer slices than receives are used. */
+#define UCP_PERF_RECV_SLICES_MAX_BYTES (256ul * UCS_MBYTE)
+
+unsigned ucp_perf_recv_slices(const ucx_perf_params_t *params)
+{
+    size_t slice;
+
+    if (((params->command != UCX_PERF_CMD_TAG) &&
+         (params->command != UCX_PERF_CMD_TAG_SYNC)) ||
+        (params->test_type != UCX_PERF_TEST_TYPE_STREAM_UNI) ||
+        (params->ucp.recv_datatype != UCP_PERF_DATATYPE_CONTIG) ||
+        (params->iov_stride != 0)) {
+        return 1;
+    }
+
+    slice = ucx_perf_get_message_size(params) * params->thread_count;
+    return ucs_max(1ul, ucs_min((size_t)params->max_outstanding,
+                                UCP_PERF_RECV_SLICES_MAX_BYTES / slice));
 }
 
 unsigned rte_peer_index(unsigned group_size, unsigned group_index)
