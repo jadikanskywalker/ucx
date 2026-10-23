@@ -32,7 +32,9 @@
 
 #include <uct/cxi/base/cxi_iface.h>
 #include <uct/cxi/base/cxi_md.h>
+extern "C" {
 #include <uct/cxi/base/cxi_tag.h>
+}
 
 #include <cstring>
 #include <vector>
@@ -1081,6 +1083,110 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
 }
 
 /*
+ * A receive that would match a rendezvous UCP has yet to be told of is refused,
+ * so that UCP keeps it in software and matches it to that rendezvous when it is
+ * reported (the rendezvous is out of the NIC's list already: a receive posted
+ * there would take a later message, and UCP would then match the report to it).
+ *
+ * The rendezvous is held by handing its arrival event to the handler by hand,
+ * without the sender's announce, which the interface then waits for. The
+ * receiver's other events are dropped, nothing here goes on to report it.
+ */
+UCS_TEST_P(test_cxi_tag_rndv_unexp, receive_matching_a_held_rendezvous_is_refused)
+{
+    static const uct_tag_t TAG     = 0xBEEF1234000000A5ULL;
+    static const size_t    PAY_LEN = 4096;
+
+    cxi_connect(sender(), 0, receiver());
+    cxi_connect(receiver(), 0, sender());
+    uct_ep_h         sep    = sender().ep(0);
+    uct_cxi_iface_t *riface = ucs_derived_of(receiver().iface(), uct_cxi_iface_t);
+
+    unexp_rndv_send rs;
+    rs.buf.assign(PAY_LEN, 0x3C);
+    rs.memh = reg(sender(), rs.buf.data(), PAY_LEN);
+    init_rndv_send_ctx(rs.ctx);
+
+    uct_iov_t siov;
+    siov.buffer = rs.buf.data();
+    siov.length = PAY_LEN;
+    siov.memh   = rs.memh;
+    siov.stride = 0;
+    siov.count  = 1;
+    std::vector<uint8_t> hdr = pack_rndv_hdr(0x77, 0x1000, 3);
+    void *rop = uct_ep_tag_rndv_zcopy(sep, TAG, hdr.data(), hdr.size(), &siov, 1,
+                                      0, &rs.ctx.super);
+    ASSERT_FALSE(UCS_PTR_IS_ERR(rop));
+
+    usleep(200000); /* it has landed, the receiver has not looked */
+
+    union c_event arrival;
+    bool          found    = false;
+    ucs_time_t    deadline = ucs_get_time() + ucs_time_from_sec(2.0);
+    while (!found && (ucs_get_time() < deadline)) {
+        const union c_event *ev;
+        while ((ev = cxi_eq_get_event(riface->rx_eq.evtq)) != NULL) {
+            if ((ev->hdr.event_type == C_EVENT_PUT) &&
+                (ev->tgt_long.ptlte_index == riface->tag.pte->ptn) &&
+                (ev->tgt_long.ptl_list == C_PTL_LIST_OVERFLOW) &&
+                ev->tgt_long.rendezvous) {
+                arrival = *ev;
+                found   = true;
+            }
+        }
+        cxi_eq_ack_events(riface->rx_eq.evtq);
+    }
+    ASSERT_TRUE(found) << "the rendezvous never arrived";
+
+    /* Without its announce, the rendezvous is held. */
+    uct_cxi_iface_tag_handle_ovf_arrival(riface, &arrival);
+    ASSERT_EQ(1u, riface->tag.unexp_held);
+    EXPECT_TRUE(m_ctx.records.empty());
+
+    std::vector<uint8_t> rx_buf(PAY_LEN, 0);
+    uct_mem_h            rx_memh = reg(receiver(), rx_buf.data(), PAY_LEN);
+    uct_iov_t            iov;
+    iov.buffer = rx_buf.data();
+    iov.length = PAY_LEN;
+    iov.memh   = rx_memh;
+    iov.stride = 0;
+    iov.count  = 1;
+
+    struct recv_t {
+        uct_cxi_tag_recv_ctx ctx;
+        uct_tag_t            tag, mask;
+        ucs_status_t         expect;
+    } recvs[] = {
+        {{}, TAG,               UCS_MASK(64),     UCS_ERR_NO_RESOURCE}, /* exact */
+        {{}, TAG ^ 0xFF00,      0xFFFFFFFF000000FFULL,
+                                                  UCS_ERR_NO_RESOURCE}, /* masked */
+        {{}, 0,                 0,                UCS_ERR_NO_RESOURCE}, /* any */
+        {{}, TAG ^ 0x10,        UCS_MASK(64),     UCS_OK},              /* other tag */
+        {{}, TAG ^ 0x1000000000, 0xFFFFFFFF000000FFULL,
+                                                  UCS_OK}               /* other tag, masked */
+    };
+
+    for (recv_t &r : recvs) {
+        memset(&r.ctx, 0, sizeof(r.ctx));
+        r.ctx.super.tag_consumed_cb = uct_cxi_tag_consumed_cb;
+        r.ctx.super.completed_cb    = uct_cxi_tag_completed_cb;
+        EXPECT_EQ(r.expect,
+                  uct_iface_tag_recv_zcopy(receiver().iface(), r.tag, r.mask,
+                                           &iov, 1, &r.ctx.super))
+                << "tag 0x" << std::hex << r.tag << " mask 0x" << r.mask;
+        if (r.expect == UCS_OK) {
+            ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
+                                                    &r.ctx.super, 1));
+        }
+    }
+
+    ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(sep, rop));
+    dereg(receiver(), rx_memh);
+    dereg(sender(), rs.memh);
+}
+
+
+/*
  * Many unexpected rendezvous at once, all with the same tag. Each is reported
  * only after its own address read, and the reads need not finish in the order
  * they were posted: they must still be reported in the order sent, and each
@@ -1215,10 +1321,15 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, rendezvous_vs_posted_receive)
             riov.memh   = rx_memh;
             riov.stride = 0;
             riov.count  = 1;
-            ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
-                                                   UCS_MASK(64), &riov, 1,
-                                                   &rctx.super));
-            posted = true;
+            /* Refused while the rendezvous is held for its address read: UCP
+             * would match the receive to it in software when reported. */
+            ucs_status_t status = uct_iface_tag_recv_zcopy(receiver().iface(),
+                                                           tag, UCS_MASK(64),
+                                                           &riov, 1,
+                                                           &rctx.super);
+            ASSERT_TRUE((status == UCS_OK) || (status == UCS_ERR_NO_RESOURCE))
+                    << ucs_status_string(status);
+            posted = (status == UCS_OK);
         }
 
         ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
@@ -1336,9 +1447,16 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_behind_rendezvous_taken_by_receive)
         riov.memh   = rx_memh;
         riov.stride = 0;
         riov.count  = 1;
-        ASSERT_UCS_OK(uct_iface_tag_recv_zcopy(receiver().iface(), tag,
-                                               UCS_MASK(64), &riov, 1,
-                                               &rctx.super));
+        /* Refused while the rendezvous is held (UCP would match it in
+         * software): then both messages are reported. */
+        ucs_status_t post_status = uct_iface_tag_recv_zcopy(receiver().iface(),
+                                                            tag, UCS_MASK(64),
+                                                            &riov, 1,
+                                                            &rctx.super);
+        ASSERT_TRUE((post_status == UCS_OK) ||
+                    (post_status == UCS_ERR_NO_RESOURCE))
+                << ucs_status_string(post_status);
+        const bool posted = (post_status == UCS_OK);
 
         /* Two messages: the receive takes one or none, the rest is reported. */
         ucs_time_t deadline = ucs_get_time() + ucs_time_from_sec(5.0);
@@ -1357,7 +1475,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_behind_rendezvous_taken_by_receive)
                 << "iteration " << i << ": " << reports << " reported, "
                 << "receive " << (rctx.completed ? "completed" : "pending");
 
-        if (!rctx.completed) {
+        if (posted && !rctx.completed) {
             ASSERT_UCS_OK(uct_iface_tag_recv_cancel(receiver().iface(),
                                                     &rctx.super, 1));
         }

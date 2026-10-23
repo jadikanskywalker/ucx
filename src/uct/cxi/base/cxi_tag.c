@@ -122,6 +122,7 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
 
     kh_init_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
     ucs_list_head_init(&self->tag.unexp_wait);
+    ucs_list_head_init(&self->tag.unexp_live);
     self->tag.unexp_held        = 0;
     self->tag.unexp_seq         = 0;
     self->tag.unexp_ents        = NULL;
@@ -1423,6 +1424,7 @@ uct_cxi_unexp_stream_get(uct_cxi_iface_t *iface, uint32_t initiator,
 
     iface->tag.unexp_stream_free = stream->next_free;
     kh_value(&iface->tag.unexp_streams, k) = stream;
+    ucs_list_add_tail(&iface->tag.unexp_live, &stream->live);
     ucs_list_head_init(&stream->entries);
     stream->tag       = tag;
     stream->initiator = initiator;
@@ -1448,6 +1450,7 @@ static void uct_cxi_unexp_stream_put(uct_cxi_iface_t *iface,
     k = kh_get(uct_cxi_unexp_stream_hash, &iface->tag.unexp_streams, key);
     ucs_assert(k != kh_end(&iface->tag.unexp_streams));
     kh_del(uct_cxi_unexp_stream_hash, &iface->tag.unexp_streams, k);
+    ucs_list_del(&stream->live);
 
     stream->next_free            = iface->tag.unexp_stream_free;
     iface->tag.unexp_stream_free = stream;
@@ -3570,6 +3573,34 @@ ucs_status_t uct_cxi_ep_tag_rndv_request(uct_ep_h tl_ep, uct_tag_t tag,
  * -------------------------------------------------------------------------
  */
 
+/*
+ * Would a receive for \a tag and \a mask match a message UCP has yet to be told
+ * of, one of those held in a stream (a rendezvous waiting for its address, and
+ * what is behind it)? The message is no longer in the NIC's list, so such a
+ * receive posted there would take a later message instead, while UCP, told of
+ * the held one afterwards, matches it to the oldest receive it has: this one.
+ * The receive is refused, so that UCP keeps it in software and matches it to the
+ * held message when it is reported. (Receives that UCP posts to hardware only
+ * after earlier ones for the tag that were refused are offloaded in order by
+ * UCP, through this function again.) A stream with nothing left to report (a
+ * tombstone) does not count. Walks the streams in use: they are few, and one
+ * load of unexp_held is all the cost while no rendezvous is held.
+ */
+static int uct_cxi_tag_held_matches(uct_cxi_iface_t *iface, uct_tag_t tag,
+                                    uct_tag_t mask)
+{
+    uct_cxi_unexp_stream_t *stream;
+
+    ucs_list_for_each(stream, &iface->tag.unexp_live, live) {
+        if ((((tag ^ stream->tag) & mask) == 0) &&
+            (uct_cxi_unexp_head(stream) != NULL)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
                                           uct_tag_t tag_mask,
                                           const uct_iov_t *iov, size_t iovcnt,
@@ -3598,6 +3629,14 @@ ucs_status_t uct_cxi_iface_tag_recv_zcopy(uct_iface_h tl_iface, uct_tag_t tag,
      * a fence returns, UCP is to match this one in software. */
     if (ucs_unlikely((iface->tag.pend_head - iface->tag.pend_tail) >=
                      UCT_CXI_TAG_PEND_SIZE)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    if (ucs_unlikely(iface->tag.unexp_held != 0) &&
+        uct_cxi_tag_held_matches(iface, tag, tag_mask)) {
+        ucs_debug("cxi TAG [PRI-LE-REFUSED] tag=0x%lx tag_mask=0x%lx: matches "
+                  "an unexpected message held for UCP", (unsigned long)tag,
+                  (unsigned long)tag_mask);
         return UCS_ERR_NO_RESOURCE;
     }
 

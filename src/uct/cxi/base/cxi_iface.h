@@ -343,6 +343,8 @@ KHASH_MAP_INIT_INT64(uct_cxi_eager_pair_hash, uct_cxi_eager_pair_t)
  * entry, and is found by (sender, tag) in iface->tag.unexp_streams.
  */
 typedef struct uct_cxi_unexp_stream {
+    ucs_list_link_t              live;      /**< iface->tag.unexp_live, while in
+                                                 use (has an entry) */
     ucs_list_link_t              entries;   /**< uct_cxi_unexp_report_t.link */
     uint64_t                     tag;
     uint32_t                     initiator;
@@ -705,6 +707,9 @@ typedef struct uct_cxi_iface {
         uct_cxi_unexp_stream_t *unexp_stream_pool;
         uct_cxi_unexp_stream_t *unexp_stream_free;
         ucs_list_link_t       unexp_wait;
+        ucs_list_link_t       unexp_live;       /**< the streams in use, to tell
+                                                     whether a receive would
+                                                     match one (recv_zcopy) */
         struct uct_cxi_unexp_report *unexp_ents;
         struct uct_cxi_unexp_report *unexp_free;
         uct_cxi_mem_handle_t  unexp_ents_mh;
