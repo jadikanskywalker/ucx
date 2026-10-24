@@ -256,7 +256,12 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      "Connected-endpoint flow control: open the control PTE and handshake\n"
      "with each peer when an endpoint to it is created. When off, this\n"
      "interface neither opens the control PTE nor handshakes, and peers\n"
-     "treat it as a plain connectionless peer.",
+     "treat it as a plain connectionless peer. Without flow control nothing\n"
+     "limits what a sender puts in the receiver's queues: a target that falls\n"
+     "behind (for example under a stream of small tagged messages) has its\n"
+     "portal table entry disabled by the hardware, and the messages sent\n"
+     "meanwhile are lost. For bring-up and debugging only; the same holds\n"
+     "for a build configured with --disable-cxi-fc.",
      ucs_offsetof(uct_cxi_iface_config_t, fc_enable),
      UCS_CONFIG_TYPE_BOOL},
 

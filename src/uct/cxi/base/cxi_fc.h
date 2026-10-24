@@ -35,6 +35,18 @@
  * --disable-cxi-fc, or UCX_CXI_FC_ENABLE=n) is marked LEGACY and treated as a
  * plain connectionless peer.
  *
+ * Without credits nothing ties a sender to its target's processing rate, and
+ * the transport cannot make up for it. A target that falls behind (a stream of
+ * small tagged messages, whose each costs it an arrival, a search, a callback
+ * and a receive to post) fills its receive event queue or its unexpected
+ * list; the hardware then disables its portal table entry (flow control, with
+ * the reason EQ full or unexpected-list failure), recovery enables it again,
+ * and the messages sent in between are lost without the sender being told:
+ * UCP tag_bw at 8 B, with flow control off, stops after about a thousand
+ * messages in some runs (a larger UCX_CXI_EQ_SIZE only moves where). A
+ * build or run without flow control is for bring-up and debugging, with
+ * traffic the target keeps up with.
+ *
  * This header is included only by cxi_iface.h, after uct_cxi_pte_fc_t.
  */
 
