@@ -92,9 +92,9 @@ static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
  * until they are reported (see uct_cxi_unexp_report_t in cxi_tag.h): one
  * registered array of tag.unexp_max, as every message in it is an unexpected
  * arrival we are yet to report, and that is as many as the credits let senders
- * have outstanding (each holds at least the slots of an eager message), or
- * tag.max_outstanding, the bound of the pools beside it, without flow
- * control.
+ * have outstanding (each holds at least the slots of an eager message; with
+ * flow control off, as many as the windows would), or tag.max_outstanding,
+ * the bound of the pools beside it, if that is more.
  * Registered because each entry is also the landing buffer of its own address
  * read. Only LAC 0 can be reached by the senders' RMA PTEs.
  *
@@ -310,7 +310,7 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
  * uct_cxi_iface_size_tag_ring -- resolve the number and size of the overflow
  * buffers. \a outstanding is the most bytes that the peers allowed to send at
  * once may have sent and not yet had processed (active senders x tag byte
- * window), or 0 when flow control is off and nothing bounds it.
+ * window; with flow control off, the load the ring is sized for all the same).
  *
  * Messages are placed back to back, and the NIC retires a buffer once less
  * than max_msg is left in it, so every buffer takes at least
@@ -333,15 +333,13 @@ static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
     size_t        min_size = 2 * max_msg;
     size_t        buf_size;
     unsigned long num_bufs;
-    unsigned long needed   = 0;
+    unsigned long needed;
 
     if (config->tag_ovf_buf_size != UCS_MEMUNITS_AUTO) {
         buf_size = config->tag_ovf_buf_size;
-    } else if (outstanding != 0) {
+    } else {
         buf_size = ucs_max((size_t)UCT_CXI_TAG_OVF_BUF_SIZE_MIN,
                            UCT_CXI_TAG_OVF_BUF_PER_MSG * max_msg);
-    } else {
-        buf_size = UCT_CXI_TAG_OVF_BUF_SIZE_DEFAULT;
     }
 
     if (buf_size < min_size) {
@@ -352,12 +350,10 @@ static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
         buf_size = min_size;
     }
 
-    if (outstanding != 0) {
-        needed = outstanding / (buf_size - max_msg) + 2;
-    }
+    needed = outstanding / (buf_size - max_msg) + 2;
 
     if (config->tag_ovf_num_bufs == UCS_ULUNITS_AUTO) {
-        num_bufs = (outstanding != 0) ? needed : UCT_CXI_TAG_OVF_NUM_BUFS_DEFAULT;
+        num_bufs = needed;
     } else {
         num_bufs = config->tag_ovf_num_bufs;
         if (needed > num_bufs) {
@@ -446,12 +442,9 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     /* What can be unexpected at once: every message the peers' windows allow
      * that goes to the overflow list holds at least an eager message's slots
      * until it is reported; a receive posted for each is the most there are
-     * without flow control. */
-    self->tag.unexp_max = self->tag.max_outstanding;
-    if (slot_credits != 0) {
-        self->tag.unexp_max = ucs_max(self->tag.unexp_max,
-                                      slot_credits / UCT_CXI_FC_SLOTS_TAG_EAGER);
-    }
+     * when the windows allow fewer. */
+    self->tag.unexp_max = ucs_max(self->tag.max_outstanding,
+                                  slot_credits / UCT_CXI_FC_SLOTS_TAG_EAGER);
     if (self->tag.unexp_max > UCT_CXI_TAG_UNEXP_MAX_LIMIT) {
         ucs_warn("cxi TAG wants room for %zu unexpected messages, limited to "
                  "%u", self->tag.unexp_max, UCT_CXI_TAG_UNEXP_MAX_LIMIT);
@@ -503,9 +496,8 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
      * in cxi_iface.h. Growable, starts empty; never fails to init. */
     kh_init_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     kh_init_inplace(uct_cxi_eager_pair_hash, &self->tag.eager_pairs);
-    if ((slot_credits != 0) &&
-        (kh_resize(uct_cxi_eager_pair_hash, &self->tag.eager_pairs,
-                   self->tag.unexp_max) < 0)) {
+    if (kh_resize(uct_cxi_eager_pair_hash, &self->tag.eager_pairs,
+                  self->tag.unexp_max) < 0) {
         /* Never more messages wait for their other event than are unexpected;
          * sized for all of them, a put does not have to allocate. */
         status = UCS_ERR_NO_MEMORY;

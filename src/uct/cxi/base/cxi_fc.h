@@ -64,14 +64,6 @@
 #include <cxi_prov_hw.h>
 
 
-/* Largest windows the CREP can express: 24 bits of event slots, and 20 bits of
- * buffer space per class in multiples of UCT_CXI_FC_WINDOW_GRAIN units (4 KiB,
- * so up to 4 GiB). Nothing else limits a window: the piggyback and GRANT
- * counters do not need to hold one (see uct_cxi_fc_pb_shift). */
-#define UCT_CXI_FC_WINDOW_GRAIN     64u
-#define UCT_CXI_FC_MAX_SLOT_WINDOW  ((1u << 24) - 1)
-#define UCT_CXI_FC_MAX_UNIT_WINDOW  (((1u << 20) - 1) * UCT_CXI_FC_WINDOW_GRAIN)
-
 /* Control channel protocol version; a message with another version is
  * ignored (the sender then times out and treats the peer as FAILED). */
 #define UCT_CXI_CTRL_VERSION  2u

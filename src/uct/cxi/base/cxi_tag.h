@@ -39,12 +39,7 @@
 /* Cap on the number of overflow ring buffers (TAG_OVERFLOW_NUM_BUFS). */
 #define UCT_CXI_TAG_OVF_NUM_BUFS_MAX      1024u
 
-/* Overflow ring geometry when flow control does not size it: the previous
- * fixed one. */
-#define UCT_CXI_TAG_OVF_BUF_SIZE_DEFAULT  (512u * 1024u)
-#define UCT_CXI_TAG_OVF_NUM_BUFS_DEFAULT  4u
-
-/* With flow control, the buffers are at least this, and four times the largest
+/* The buffers are at least this, and four times the largest
  * message if that is more, as for the AM ring. */
 #define UCT_CXI_TAG_OVF_BUF_SIZE_MIN      (1024u * 1024u)
 #define UCT_CXI_TAG_OVF_BUF_PER_MSG       4u

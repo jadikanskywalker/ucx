@@ -96,10 +96,9 @@ protected:
         modify_config("CXI_TAG_EAGER_MAX", "512");
 
         /* The ring set above is deliberately tiny, far below what the credit
-         * windows need, which each interface says in a warning. */
-#ifndef UCT_CXI_DISABLE_FC
+         * windows need (with flow control on or off: the ring is sized from
+         * them either way), which each interface says in a warning. */
         scoped_log_handler wrap_warn(wrap_warns_logger);
-#endif
 
         /* Deliberately not calling test_cxi_rma_base::init() -- it uses the
          * no-arg create_entity(), which substitutes a dummy eager_cb we

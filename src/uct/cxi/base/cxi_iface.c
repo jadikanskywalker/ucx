@@ -84,11 +84,10 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      "RX event queue depth (number of hardware events): everything the NIC\n"
      "reports for this iface's own portal table entries, i.e. incoming\n"
      "traffic and PTE state changes. -1 (default) sizes it for\n"
-     "FC_ACTIVE_SENDERS peers each using their full FC_MSG_WINDOW when flow\n"
-     "control is on (a warning is logged if an explicit value is smaller),\n"
-     "and resolves to 1024 when it is off. Rounded up to a whole number of\n"
-     "pages (64 events). Initiator-side completions use a separate queue,\n"
-     "see TX_EQ_SIZE.",
+     "FC_ACTIVE_SENDERS peers each using their full FC_MSG_WINDOW, with flow\n"
+     "control on or off (a warning is logged if an explicit value is\n"
+     "smaller). Rounded up to a whole number of pages (64 events).\n"
+     "Initiator-side completions use a separate queue, see TX_EQ_SIZE.",
      ucs_offsetof(uct_cxi_iface_config_t, eq_size),
      UCS_CONFIG_TYPE_INT},
 
@@ -173,16 +172,16 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"AM_RX_NUM_BUFS", "auto",
      "Number of AM receive buffers rotated on the PRIORITY list. Auto sizes\n"
      "the ring for FC_ACTIVE_SENDERS peers each using their full\n"
-     "FC_BYTE_WINDOW when flow control is on (a warning is logged if an\n"
-     "explicit value is smaller), and is 4 when it is off. Hard ceiling\n"
-     "UCT_CXI_AM_RX_NUM_BUFS_MAX (cxi_iface.h).",
+     "FC_BYTE_WINDOW, with flow control on or off (a warning is logged if an\n"
+     "explicit value is smaller). Hard ceiling UCT_CXI_AM_RX_NUM_BUFS_MAX\n"
+     "(cxi_iface.h).",
      ucs_offsetof(uct_cxi_iface_config_t, am_rx_num_bufs),
      UCS_CONFIG_TYPE_ULUNITS},
 
     {"AM_RX_BUF_SIZE", "auto",
      "Size of each AM receive buffer in bytes. Auto is the greater of 1 MiB\n"
-     "and four times the largest message when flow control is on, and\n"
-     "512 KiB when it is off. Raised to twice the largest message if smaller:\n"
+     "and four times the largest message. Raised to twice the largest message\n"
+     "if smaller:\n"
      "the NIC retires a buffer once less than a maximum-size message is left\n"
      "in it, so a smaller one would be retired after every message.",
      ucs_offsetof(uct_cxi_iface_config_t, am_rx_buf_size),
@@ -206,17 +205,16 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
     {"TAG_OVERFLOW_NUM_BUFS", "auto",
      "Number of overflow-list buffers rotated for unexpected tagged\n"
      "messages (no priority LE posted for them yet). Auto sizes the ring for\n"
-     "FC_ACTIVE_SENDERS peers each using their full FC_TAG_BYTE_WINDOW when\n"
-     "flow control is on (a warning is logged if an explicit value is\n"
-     "smaller), and is 4 when it is off. Hard ceiling\n"
-     "UCT_CXI_TAG_OVF_NUM_BUFS_MAX (cxi_tag.h).",
+     "FC_ACTIVE_SENDERS peers each using their full FC_TAG_BYTE_WINDOW, with\n"
+     "flow control on or off (a warning is logged if an explicit value is\n"
+     "smaller). Hard ceiling UCT_CXI_TAG_OVF_NUM_BUFS_MAX (cxi_tag.h).",
      ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_num_bufs),
      UCS_CONFIG_TYPE_ULUNITS},
 
     {"TAG_OVERFLOW_BUF_SIZE", "auto",
      "Size of each overflow-list buffer in bytes. Auto is the greater of\n"
-     "1 MiB and four times TAG_EAGER_MAX when flow control is on, and\n"
-     "512 KiB when it is off. Raised to twice TAG_EAGER_MAX if smaller: the\n"
+     "1 MiB and four times TAG_EAGER_MAX. Raised to twice TAG_EAGER_MAX if\n"
+     "smaller: the\n"
      "NIC retires a buffer once less than a maximum-size message is left in\n"
      "it, so a smaller one would be retired after every message.",
      ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_buf_size),
@@ -251,6 +249,51 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, tag_fence_interval),
      UCS_CONFIG_TYPE_UINT},
 
+    {"FC_MSG_WINDOW", "512",
+     "Receive event queue slots granted to each peer: how many events one\n"
+     "peer may have outstanding in this interface's queue at a time. Shared\n"
+     "by Active Messages and tag matching. An Active Message takes one slot;\n"
+     "so does an eager tag message that matches no posted receive, and a\n"
+     "rendezvous one takes two (the receive's own events are accounted\n"
+     "separately). Must be at least 2. Without flow control it is the load\n"
+     "the receive queue is sized for, no credits being granted.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_msg_window),
+     UCS_CONFIG_TYPE_UINT},
+
+    {"FC_BYTE_WINDOW", "1m",
+     "Active Message buffer credits granted to each peer: how many bytes\n"
+     "one peer may have outstanding in this interface's AM receive buffers\n"
+     "at a time (counted in 64-byte units). Must be at least the largest\n"
+     "Active Message a peer may send. Without flow control it is the load\n"
+     "the AM receive ring is sized for.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_byte_window),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"FC_TAG_BYTE_WINDOW", "512k",
+     "Tag matching buffer credits granted to each peer: how many bytes one\n"
+     "peer may have outstanding in this interface's tag overflow buffers at\n"
+     "a time (counted in 64-byte units). Must be at least TAG_EAGER_MAX. The\n"
+     "default is two maximum-size messages: a message that matches a posted\n"
+     "receive is charged only until its ACK, so this is ample for bandwidth,\n"
+     "and it keeps the overflow ring no larger than the AM ring. Without flow\n"
+     "control it is the load the overflow ring is sized for.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_tag_byte_window),
+     UCS_CONFIG_TYPE_MEMUNITS},
+
+    {"FC_ACTIVE_SENDERS", "8",
+     "Number of peers that may each send up to their full FC_MSG_WINDOW,\n"
+     "FC_BYTE_WINDOW and FC_TAG_BYTE_WINDOW at the same time. Sizes the AM\n"
+     "receive ring, the tag overflow ring, the table of unexpected tag\n"
+     "messages and the RX EQ (unless AM_RX_NUM_BUFS, AM_RX_BUF_SIZE,\n"
+     "TAG_OVERFLOW_NUM_BUFS, TAG_OVERFLOW_BUF_SIZE or EQ_SIZE are set), so\n"
+     "pinned memory grows with it. The sizing is the same with flow control\n"
+     "on and off (without it, nothing paces the senders to this load: see\n"
+     "FC_ENABLE). Credits pace senders but do not stop more peers than this\n"
+     "from overrunning the ring; the PTE flow control and recovery path is\n"
+     "the backstop for that.",
+     ucs_offsetof(uct_cxi_iface_config_t, fc_active_senders),
+     UCS_CONFIG_TYPE_UINT},
+
 #ifndef UCT_CXI_DISABLE_FC
     {"FC_ENABLE", "y",
      "Connected-endpoint flow control: open the control PTE and handshake\n"
@@ -264,46 +307,6 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      "for a build configured with --disable-cxi-fc.",
      ucs_offsetof(uct_cxi_iface_config_t, fc_enable),
      UCS_CONFIG_TYPE_BOOL},
-
-    {"FC_MSG_WINDOW", "512",
-     "Receive event queue slots granted to each peer: how many events one\n"
-     "peer may have outstanding in this interface's queue at a time. Shared\n"
-     "by Active Messages and tag matching. An Active Message takes one slot;\n"
-     "so does an eager tag message that matches no posted receive, and a\n"
-     "rendezvous one takes two (the receive's own events are accounted\n"
-     "separately). Must be at least 2.",
-     ucs_offsetof(uct_cxi_iface_config_t, fc_msg_window),
-     UCS_CONFIG_TYPE_UINT},
-
-    {"FC_BYTE_WINDOW", "1m",
-     "Active Message buffer credits granted to each peer: how many bytes\n"
-     "one peer may have outstanding in this interface's AM receive buffers\n"
-     "at a time (counted in 64-byte units). Must be at least the largest\n"
-     "Active Message a peer may send.",
-     ucs_offsetof(uct_cxi_iface_config_t, fc_byte_window),
-     UCS_CONFIG_TYPE_MEMUNITS},
-
-    {"FC_TAG_BYTE_WINDOW", "512k",
-     "Tag matching buffer credits granted to each peer: how many bytes one\n"
-     "peer may have outstanding in this interface's tag overflow buffers at\n"
-     "a time (counted in 64-byte units). Must be at least TAG_EAGER_MAX. The\n"
-     "default is two maximum-size messages: a message that matches a posted\n"
-     "receive is charged only until its ACK, so this is ample for bandwidth,\n"
-     "and it keeps the overflow ring no larger than the AM ring.",
-     ucs_offsetof(uct_cxi_iface_config_t, fc_tag_byte_window),
-     UCS_CONFIG_TYPE_MEMUNITS},
-
-    {"FC_ACTIVE_SENDERS", "8",
-     "Number of peers that may each send up to their full FC_MSG_WINDOW,\n"
-     "FC_BYTE_WINDOW and FC_TAG_BYTE_WINDOW at the same time. Sizes the AM\n"
-     "receive ring, the tag overflow ring, the table of unexpected tag\n"
-     "messages and the RX EQ (unless AM_RX_NUM_BUFS, AM_RX_BUF_SIZE,\n"
-     "TAG_OVERFLOW_NUM_BUFS, TAG_OVERFLOW_BUF_SIZE or EQ_SIZE are set), so\n"
-     "pinned memory grows with it. Credits pace senders but do not stop more\n"
-     "peers than this from overrunning the ring; the PTE flow control and\n"
-     "recovery path is the backstop for that.",
-     ucs_offsetof(uct_cxi_iface_config_t, fc_active_senders),
-     UCS_CONFIG_TYPE_UINT},
 
     {"FC_CONNECT_TIMEOUT", "30s",
      "Give up on a peer's handshake after this long without a reply.",
@@ -808,8 +811,8 @@ static void uct_cxi_iface_set_am_limits(uct_cxi_iface_t *self,
 /*
  * uct_cxi_iface_size_am_ring -- resolve the number and size of the AM receive
  * buffers. \a outstanding is the most bytes that the peers allowed to send at
- * once may have sent and not yet had processed (active senders x byte window),
- * or 0 when flow control is off and nothing bounds it.
+ * once may have sent and not yet had processed (active senders x byte window;
+ * with flow control off, the load the ring is sized for all the same).
  *
  * Messages are placed back to back, and the NIC retires a buffer once less
  * than max_msg is left in it, so every buffer takes at least
@@ -830,15 +833,13 @@ static void uct_cxi_iface_size_am_ring(uct_cxi_iface_t *self,
     size_t        min_size = 2 * max_msg + sizeof(uint64_t);
     size_t        buf_size;
     unsigned long num_bufs;
-    unsigned long needed   = 0;
+    unsigned long needed;
 
     if (config->am_rx_buf_size != UCS_MEMUNITS_AUTO) {
         buf_size = config->am_rx_buf_size;
-    } else if (outstanding != 0) {
+    } else {
         buf_size = ucs_max((size_t)UCT_CXI_AM_RX_BUF_SIZE_MIN,
                            UCT_CXI_AM_RX_BUF_PER_MSG * max_msg);
-    } else {
-        buf_size = UCT_CXI_AM_RX_BUF_SIZE_DEFAULT;
     }
 
     if (buf_size < min_size) {
@@ -847,12 +848,10 @@ static void uct_cxi_iface_size_am_ring(uct_cxi_iface_t *self,
         buf_size = min_size;
     }
 
-    if (outstanding != 0) {
-        needed = outstanding / (buf_size - sizeof(uint64_t) - max_msg) + 2;
-    }
+    needed = outstanding / (buf_size - sizeof(uint64_t) - max_msg) + 2;
 
     if (config->am_rx_num_bufs == UCS_ULUNITS_AUTO) {
-        num_bufs = (outstanding != 0) ? needed : UCT_CXI_AM_RX_NUM_BUFS_DEFAULT;
+        num_bufs = needed;
     } else {
         num_bufs = config->am_rx_num_bufs;
         if (needed > num_bufs) {
@@ -873,11 +872,76 @@ static void uct_cxi_iface_size_am_ring(uct_cxi_iface_t *self,
     self->am.buf_size = buf_size;
 }
 
+/* -------------------------------------------------------------------------
+ * The credit windows: what flow control grants each peer, and, whether or not
+ * it is on, what the receive rings and the RX EQ are sized for -- so that a run
+ * without flow control has the buffers of one with it, and the two compare the
+ * credit scheme alone.
+ * -------------------------------------------------------------------------
+ */
+
+/* The window of one class of buffer space, in units, from \a byte_window: in
+ * whole multiples of UCT_CXI_FC_WINDOW_GRAIN, which is how the CREP carries it,
+ * at least the largest message \a max_msg of the class (which could never be
+ * sent otherwise), and at most what the CREP can carry. */
+static uint32_t uct_cxi_fc_unit_window(size_t byte_window, size_t max_msg,
+                                       const char *knob, const char *what)
+{
+    const uint64_t grain     = UCT_CXI_FC_WINDOW_GRAIN;
+    uint64_t       max_units = (UCT_CXI_FC_UNITS(max_msg) + grain - 1) / grain *
+                               grain;
+    uint64_t       unit_window = ((uint64_t)byte_window / UCT_CXI_FC_UNIT +
+                                  grain - 1) / grain * grain;
+
+    if (unit_window > UCT_CXI_FC_MAX_UNIT_WINDOW) {
+        ucs_warn("cxi %s=%zu is more than a window can be: limiting it to "
+                 "%zu", knob, byte_window,
+                 (size_t)UCT_CXI_FC_MAX_UNIT_WINDOW * UCT_CXI_FC_UNIT);
+        unit_window = UCT_CXI_FC_MAX_UNIT_WINDOW;
+    }
+    if (unit_window < max_units) {
+        ucs_warn("cxi %s=%zu is smaller than the largest %s (%zu bytes): "
+                 "raising it to %zu", knob, byte_window, what, max_msg,
+                 (size_t)max_units * UCT_CXI_FC_UNIT);
+        unit_window = max_units;
+    }
+    return (uint32_t)unit_window;
+}
+
+/*
+ * uct_cxi_fc_windows -- the credit windows to grant each peer, from the
+ * configuration. They are needed before the interface is opened (the receive
+ * rings and the RX EQ are sized from them), hence not part of
+ * uct_cxi_fc_init().
+ *
+ * Each byte window must hold the largest message of its class that a peer may
+ * send or that message could never be sent. \a tag_max_msg is 0 when tag
+ * matching is not offloaded.
+ */
+void uct_cxi_fc_windows(const uct_cxi_iface_config_t *config, size_t am_max_msg,
+                        size_t tag_max_msg, uint32_t *slot_window_p,
+                        uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES])
+{
+    /* At least what the costliest message charges, or it could never be
+     * sent. */
+    *slot_window_p = ucs_max(UCT_CXI_FC_MAX_SLOTS,
+                             ucs_min(config->fc_msg_window,
+                                     UCT_CXI_FC_MAX_SLOT_WINDOW));
+    unit_window[UCT_CXI_FC_AM] =
+            uct_cxi_fc_unit_window(config->fc_byte_window, am_max_msg,
+                                   "FC_BYTE_WINDOW", "Active Message");
+    /* No tag matching, no pool for it. */
+    unit_window[UCT_CXI_FC_TAG] = (tag_max_msg == 0) ? 0 :
+            uct_cxi_fc_unit_window(config->fc_tag_byte_window, tag_max_msg,
+                                   "FC_TAG_BYTE_WINDOW", "tag message");
+}
+
 /*
  * uct_cxi_iface_rx_eq_events -- resolve the RX EQ depth. \a slot_credits is
  * the most event slots the peers allowed to send at once may have outstanding
- * (active senders x slot window), or 0 when flow control is off. \a
- * tag_receives is the most receives that can be posted for tag matching.
+ * (active senders x slot window; with flow control off, the load it is sized
+ * for all the same). \a tag_receives is the most receives that can be posted
+ * for tag matching.
  *
  * A message is charged the slots of the events it can leave in the queue
  * until it is processed, so those events always fit. The exception is a
@@ -894,20 +958,16 @@ static unsigned
 uct_cxi_iface_rx_eq_events(const uct_cxi_iface_config_t *config,
                            size_t slot_credits, size_t tag_receives)
 {
-    unsigned needed = UCT_CXI_EQ_NUM_EVENTS;
-
-    if (slot_credits != 0) {
-        needed = ucs_max((size_t)UCT_CXI_EQ_NUM_EVENTS,
-                         slot_credits +
-                         tag_receives * UCT_CXI_TAG_RECV_EVENTS +
-                         config->eq_reserved_slots + UCT_CXI_EQ_SLACK);
-    }
+    unsigned needed = ucs_max((size_t)UCT_CXI_EQ_NUM_EVENTS,
+                              slot_credits +
+                              tag_receives * UCT_CXI_TAG_RECV_EVENTS +
+                              config->eq_reserved_slots + UCT_CXI_EQ_SLACK);
 
     if (config->eq_size == UINT_MAX) {
         return needed;
     }
 
-    if ((slot_credits != 0) && (config->eq_size < needed)) {
+    if (config->eq_size < needed) {
         ucs_warn("cxi EQ_SIZE=%u is below the %u events that "
                  "FC_ACTIVE_SENDERS peers at their full window need: the "
                  "RX queue can fill under load", config->eq_size, needed);
@@ -1039,10 +1099,9 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     size_t                     byte_credits = 0;
     size_t                     tag_byte_credits = 0;
     size_t                     tag_receives = 0;
-#ifndef UCT_CXI_DISABLE_FC
     uint32_t                   slot_window  = 0;
     uint32_t                   unit_window[UCT_CXI_FC_NUM_CLASSES] = {};
-#endif
+    unsigned                   active_senders;
 
     UCT_CHECK_PARAM(params->field_mask & UCT_IFACE_PARAM_FIELD_OPEN_MODE,
                     "UCT_IFACE_PARAM_FIELD_OPEN_MODE is not defined");
@@ -1079,21 +1138,20 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * instead of growing the event queue.
      */
     uct_cxi_iface_set_am_limits(self, config);
-#ifndef UCT_CXI_DISABLE_FC
-    if (config->fc_enable) {
-        unsigned active_senders = ucs_max(config->fc_active_senders, 1u);
-
-        uct_cxi_fc_windows(config, self->am.max_msg,
-                           uct_cxi_iface_tag_requested(config, params) ?
-                                   uct_cxi_tag_max_msg(config) : 0,
-                           &slot_window, unit_window);
-        msg_credits  = (size_t)active_senders * slot_window;
-        byte_credits = (size_t)active_senders * unit_window[UCT_CXI_FC_AM] *
+    /* The receive rings and the RX EQ are sized for what the peers' windows
+     * allow them to have outstanding, with flow control on or off: without it
+     * the same buffers are there, and the two compare the credit scheme alone
+     * (nothing paces the senders to that load, see FC_ENABLE). */
+    active_senders = ucs_max(config->fc_active_senders, 1u);
+    uct_cxi_fc_windows(config, self->am.max_msg,
+                       uct_cxi_iface_tag_requested(config, params) ?
+                               uct_cxi_tag_max_msg(config) : 0,
+                       &slot_window, unit_window);
+    msg_credits      = (size_t)active_senders * slot_window;
+    byte_credits     = (size_t)active_senders * unit_window[UCT_CXI_FC_AM] *
                        UCT_CXI_FC_UNIT;
-        tag_byte_credits = (size_t)active_senders *
-                           unit_window[UCT_CXI_FC_TAG] * UCT_CXI_FC_UNIT;
-    }
-#endif
+    tag_byte_credits = (size_t)active_senders * unit_window[UCT_CXI_FC_TAG] *
+                       UCT_CXI_FC_UNIT;
     if (uct_cxi_iface_tag_requested(config, params)) {
         tag_receives = ucs_min(config->tag_max_outstanding,
                                (unsigned)UCT_CXI_TAG_MAX_OUTSTANDING_MAX);
@@ -1362,9 +1420,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * NULL) unless UCP requested it (supplied both HW_TM callbacks) and
      * UCX_CXI_TAG_ENABLE != no. See cxi_tag.c.
      */
-    status = uct_cxi_iface_open_tag_pte(self, lni, config, params,
-                                        uct_cxi_iface_tag_requested(config, params) ?
-                                                msg_credits : 0,
+    status = uct_cxi_iface_open_tag_pte(self, lni, config, params, msg_credits,
                                         tag_byte_credits);
     if (status != UCS_OK) {
         goto err_am_pte;

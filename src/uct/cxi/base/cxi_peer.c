@@ -82,62 +82,6 @@ static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
  * -------------------------------------------------------------------------
  */
 
-/* The window of one class of buffer space, in units, from \a byte_window: in
- * whole multiples of UCT_CXI_FC_WINDOW_GRAIN, which is how the CREP carries it,
- * at least the largest message \a max_msg of the class (which could never be
- * sent otherwise), and at most what the CREP can carry. */
-static uint32_t uct_cxi_fc_unit_window(size_t byte_window, size_t max_msg,
-                                       const char *knob, const char *what)
-{
-    const uint64_t grain     = UCT_CXI_FC_WINDOW_GRAIN;
-    uint64_t       max_units = (UCT_CXI_FC_UNITS(max_msg) + grain - 1) / grain *
-                               grain;
-    uint64_t       unit_window = ((uint64_t)byte_window / UCT_CXI_FC_UNIT +
-                                  grain - 1) / grain * grain;
-
-    if (unit_window > UCT_CXI_FC_MAX_UNIT_WINDOW) {
-        ucs_warn("cxi %s=%zu is more than a window can be: limiting it to "
-                 "%zu", knob, byte_window,
-                 (size_t)UCT_CXI_FC_MAX_UNIT_WINDOW * UCT_CXI_FC_UNIT);
-        unit_window = UCT_CXI_FC_MAX_UNIT_WINDOW;
-    }
-    if (unit_window < max_units) {
-        ucs_warn("cxi %s=%zu is smaller than the largest %s (%zu bytes): "
-                 "raising it to %zu", knob, byte_window, what, max_msg,
-                 (size_t)max_units * UCT_CXI_FC_UNIT);
-        unit_window = max_units;
-    }
-    return (uint32_t)unit_window;
-}
-
-/*
- * uct_cxi_fc_windows -- the credit windows to grant each peer, from the
- * configuration. They are needed before the interface is opened (the receive
- * rings and the RX EQ are sized from them), hence not part of
- * uct_cxi_fc_init().
- *
- * Each byte window must hold the largest message of its class that a peer may
- * send or that message could never be sent. \a tag_max_msg is 0 when tag
- * matching is not offloaded.
- */
-void uct_cxi_fc_windows(const uct_cxi_iface_config_t *config, size_t am_max_msg,
-                        size_t tag_max_msg, uint32_t *slot_window_p,
-                        uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES])
-{
-    /* At least what the costliest message charges, or it could never be
-     * sent. */
-    *slot_window_p = ucs_max(UCT_CXI_FC_MAX_SLOTS,
-                             ucs_min(config->fc_msg_window,
-                                     UCT_CXI_FC_MAX_SLOT_WINDOW));
-    unit_window[UCT_CXI_FC_AM] =
-            uct_cxi_fc_unit_window(config->fc_byte_window, am_max_msg,
-                                   "FC_BYTE_WINDOW", "Active Message");
-    /* No tag matching, no pool for it. */
-    unit_window[UCT_CXI_FC_TAG] = (tag_max_msg == 0) ? 0 :
-            uct_cxi_fc_unit_window(config->fc_tag_byte_window, tag_max_msg,
-                                   "FC_TAG_BYTE_WINDOW", "tag message");
-}
-
 ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
                              const uct_cxi_iface_config_t *config,
                              uint32_t slot_window,

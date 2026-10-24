@@ -707,12 +707,11 @@ protected:
     {
         modify_config("CXI_AM_RX_BUF_SIZE", "64k");
         modify_config("CXI_AM_RX_NUM_BUFS", "4");
-#ifndef UCT_CXI_DISABLE_FC
         /* One sender at a time, and no more bytes outstanding than the ring
-         * is meant to hold. */
+         * is meant to hold (the ring is sized from these with flow control
+         * on or off). */
         modify_config("CXI_FC_ACTIVE_SENDERS", "1");
         modify_config("CXI_FC_BYTE_WINDOW", "64k");
-#endif
         test_cxi_am::init();
     }
 };

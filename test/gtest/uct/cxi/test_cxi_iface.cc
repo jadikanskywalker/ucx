@@ -269,15 +269,14 @@ protected:
     {
         return ucs_derived_of(get_entity().iface(), uct_cxi_iface_t);
     }
-};
-
-#ifndef UCT_CXI_DISABLE_FC
 
 /**
  * By default the ring and the RX EQ are sized for 8 peers at their full
- * window (512 messages, 1 MiB), and the advertised AM size is the IB RC one.
+ * window (512 messages, 1 MiB), and the advertised AM size is the IB RC one --
+ * whether flow control is on or not, so that the two are compared with the
+ * same buffers (see test_cxi_iface_no_fc).
  */
-UCS_TEST_P(test_cxi_iface_sized, sized_for_flow_control)
+void check_default_sizes()
 {
     uct_cxi_iface_t *iface = cxi_iface();
 
@@ -308,8 +307,15 @@ UCS_TEST_P(test_cxi_iface_sized, sized_for_flow_control)
 
     /* 8 x 512 slots, 512 receives of 3 events each, 64 reserved, 128 slack. */
     EXPECT_EQ(8u * 512 + 512 * 3 + 64 + 128, iface->rx_eq.num_events);
-    EXPECT_EQ(64u, iface->rx_eq.reserved_slots);
+    EXPECT_EQ(64u, iface->rx_eq.reserved_slots);}
+};
+
+UCS_TEST_P(test_cxi_iface_sized, sized_by_default)
+{
+    check_default_sizes();
 }
+
+#ifndef UCT_CXI_DISABLE_FC
 
 class test_cxi_iface_16_senders : public test_cxi_iface_sized {
 protected:
@@ -410,7 +416,9 @@ UCS_TEST_P(test_cxi_iface_big_buffers, buffer_size_is_not_message_size)
 
 #endif /* UCT_CXI_DISABLE_FC */
 
-/** Without flow control nothing bounds what arrives, so the legacy sizes stay. */
+/** Without flow control the buffers are the same as with it: the windows still
+ * say what they are sized for, so a comparison of the two is of the credit
+ * scheme alone. (With flow control compiled out the default is this already.) */
 class test_cxi_iface_no_fc : public test_cxi_iface_sized {
 protected:
     void configure() override
@@ -421,17 +429,9 @@ protected:
     }
 };
 
-UCS_TEST_P(test_cxi_iface_no_fc, legacy_sizes)
+UCS_TEST_P(test_cxi_iface_no_fc, same_sizes_as_with_flow_control)
 {
-    uct_cxi_iface_t *iface = cxi_iface();
-
-    EXPECT_EQ(4u, iface->am.num_bufs);
-    EXPECT_EQ(512u * 1024, iface->am.buf_size);
-    EXPECT_EQ(4u, iface->tag.num_bufs);
-    EXPECT_EQ(512u * 1024, iface->tag.buf_size);
-    EXPECT_EQ(512u, iface->tag.unexp_max);
-    EXPECT_EQ(1024u, iface->rx_eq.num_events);
-    EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
+    check_default_sizes();
 }
 
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_iface, cxi)

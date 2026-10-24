@@ -43,6 +43,15 @@
  * costs event slots plus UCT_CXI_FC_UNITS(len) byte credits of its class.
  * Defined here, outside the UCT_CXI_DISABLE_FC guard, because the send paths
  * compute the cost whether or not it is charged. */
+/* Largest windows the CREP can express (and so the largest the receive
+ * buffers and the RX EQ are ever sized for: see uct_cxi_fc_windows()): 24 bits of event slots, and 20 bits of
+ * buffer space per class in multiples of UCT_CXI_FC_WINDOW_GRAIN units (4 KiB,
+ * so up to 4 GiB). Nothing else limits a window: the piggyback and GRANT
+ * counters do not need to hold one (see uct_cxi_fc_pb_shift). */
+#define UCT_CXI_FC_WINDOW_GRAIN     64u
+#define UCT_CXI_FC_MAX_SLOT_WINDOW  ((1u << 24) - 1)
+#define UCT_CXI_FC_MAX_UNIT_WINDOW  (((1u << 20) - 1) * UCT_CXI_FC_WINDOW_GRAIN)
+
 #define UCT_CXI_FC_UNIT       64u
 #define UCT_CXI_FC_UNITS(_len) \
     ((unsigned)(((_len) + UCT_CXI_FC_UNIT - 1) / UCT_CXI_FC_UNIT))
@@ -86,11 +95,9 @@ typedef enum {
 #define UCT_CXI_CMDQ_DEPTH     512U
 
 /* AM receive ring.  UCX_CXI_AM_RX_BUF_SIZE and UCX_CXI_AM_RX_NUM_BUFS are
- * "auto" by default: with flow control the ring is sized from the credit
- * windows (see uct_cxi_iface_size_am_ring()); without it, from the legacy
- * defaults below. */
-#define UCT_CXI_AM_RX_BUF_SIZE_DEFAULT  (512u * 1024u)  /* legacy, no FC */
-#define UCT_CXI_AM_RX_NUM_BUFS_DEFAULT  4               /* legacy, no FC */
+ * "auto" by default: the ring is sized from the credit windows (see
+ * uct_cxi_iface_size_am_ring()), whether or not flow control is on, so that
+ * the two can be compared with the same buffers. */
 #define UCT_CXI_AM_RX_NUM_BUFS_MAX      64
 
 /* Automatic buffer size with flow control: a multiple of the largest message,
@@ -221,28 +228,30 @@ typedef struct uct_cxi_iface_config {
                                               buffer_id is uint16_t)                */
     unsigned                  tag_fence_interval; /**< Posted receives between
                                               fences (see uct_cxi_tag_pend_t)       */
-#ifndef UCT_CXI_DISABLE_FC
-    int                       fc_enable;       /**< Handshake with peers and
-                                                    open the control PTE       */
     unsigned                  fc_msg_window;   /**< Event slot credits granted
                                                     to each peer, shared by
-                                                    all message classes        */
+                                                    all message classes (also
+                                                    what the RX EQ is sized
+                                                    for without flow control)  */
     size_t                    fc_byte_window;  /**< Active Message buffer
                                                     credits granted to each
                                                     peer                       */
     size_t                    fc_tag_byte_window; /**< Tag matching buffer
                                                     credits granted to each
                                                     peer                       */
+    unsigned                  fc_active_senders; /**< Peers sending at their
+                                                    full window at once, which
+                                                    the ring and RX EQ are
+                                                    sized for                  */
+#ifndef UCT_CXI_DISABLE_FC
+    int                       fc_enable;       /**< Handshake with peers and
+                                                    open the control PTE       */
     double                    fc_connect_timeout; /**< Give up on a peer's
                                                     handshake after this long
                                                     (seconds)                  */
     double                    fc_grant_thresh; /**< Send a pure credit grant once
                                                     this fraction of a window is
                                                     owed to a peer             */
-    unsigned                  fc_active_senders; /**< Peers sending at their
-                                                    full window at once, which
-                                                    the ring and RX EQ are
-                                                    sized for                  */
 #endif
 } uct_cxi_iface_config_t;
 
@@ -936,15 +945,21 @@ int uct_cxi_iface_is_reachable_v2(const uct_iface_h tl_iface,
                                    const uct_iface_is_reachable_params_t *params);
 ucs_status_t uct_cxi_iface_event_fd_get(uct_iface_h tl_iface, int *fd_p);
 
+BEGIN_C_DECLS
+
+/* cxi_iface.c */
+void         uct_cxi_fc_windows(const uct_cxi_iface_config_t *config,
+                                size_t am_max_msg, size_t tag_max_msg,
+                                uint32_t *slot_window_p,
+                                uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES]);
+
+END_C_DECLS
+
 #ifndef UCT_CXI_DISABLE_FC
 
 BEGIN_C_DECLS
 
 /* cxi_peer.c */
-void         uct_cxi_fc_windows(const uct_cxi_iface_config_t *config,
-                                size_t am_max_msg, size_t tag_max_msg,
-                                uint32_t *slot_window_p,
-                                uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES]);
 ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
                              const uct_cxi_iface_config_t *config,
                              uint32_t slot_window,
