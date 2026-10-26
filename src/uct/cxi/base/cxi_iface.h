@@ -988,7 +988,7 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                                 const union c_event *event);
 
 /** Send the GRANTs that are waiting, as far as there is room. */
-void uct_cxi_fc_retry_grants(uct_cxi_iface_t *iface);
+void uct_cxi_fc_flush_grants(uct_cxi_iface_t *iface);
 
 /** The peer record for event initiator \a process, or NULL if there is none
  *  (a sender without flow control). Refills the one-entry cache. */

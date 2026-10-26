@@ -999,7 +999,7 @@ void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
  * completions have made room, before the sends waiting in pending queues get
  * it, and from the timer in case no completion comes.
  */
-void uct_cxi_fc_retry_grants(uct_cxi_iface_t *iface)
+void uct_cxi_fc_flush_grants(uct_cxi_iface_t *iface)
 {
     uct_cxi_peer_t *peer;
 
@@ -1022,7 +1022,7 @@ static void uct_cxi_fc_grant_timer(ucs_wtimer_t *timer)
     uct_cxi_iface_t *iface = ucs_container_of(timer, uct_cxi_iface_t,
                                               fc.grant_timer);
 
-    uct_cxi_fc_retry_grants(iface);
+    uct_cxi_fc_flush_grants(iface);
     if (!ucs_list_is_empty(&iface->fc.grants)) {
         /* Still waiting: again, a little later. */
         uct_cxi_fc_queue_grant(iface, ucs_list_head(&iface->fc.grants,
