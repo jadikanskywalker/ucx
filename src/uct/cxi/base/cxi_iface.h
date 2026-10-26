@@ -270,16 +270,17 @@ typedef struct uct_cxi_iface_config {
 /**
  * Per-PTE flow-control recovery state — tracks disable/re-enable flapping
  * so sustained overload escalates (log + stop retrying) instead of spinning
- * SETSTATE commands forever.  One instance per locally-owned PTE (AM, and
- * one per open RMA LAC).
+ * SETSTATE commands forever.  One instance per locally-owned PTE that arms
+ * flow control (AM, tag, rendezvous); the RMA/AMO PTEs do not (see
+ * uct_cxi_iface_open_rma_pte).
  *
  * `exhausted` tracks matching-resource exhaustion (LE/overflow-list, not
  * EQ capacity) independently of EQ-fill `DRAINING`
  * (uct_cxi_eq_t::need_to_drain) — draining EQ events doesn't free
  * buffer/LE capacity, so the two need separate state.  Only ever set for
- * `iface->am.fc` — never for `iface->rma.fc[]`, since RMA/AMO's catch-all
- * LE is a single persistent non-consuming LE with no matching resource to
- * exhaust (see the design notes in cxi_iface.c's STATE_CHANGE handling).
+ * `iface->am.fc` — never for the RMA/AMO PTEs, whose catch-all LE is a single
+ * persistent non-consuming LE with no matching resource to exhaust (see the
+ * design notes in cxi_iface.c's STATE_CHANGE handling).
  * `onload_cb` is a reserved, currently-unused extension point for TAG,
  * which will need an onload step (TGT_SEARCH_AND_DELETE) before repost —
  * reserved now so TAG doesn't need to reshape this struct later.
@@ -586,8 +587,6 @@ typedef struct uct_cxi_iface {
     struct {
         struct cxil_pte     *pte[UCT_CXI_MAX_LACS];     /**< One PTE per LAC, all opened eagerly at iface_open */
         struct cxil_pte_map *pte_map[UCT_CXI_MAX_LACS];
-        uint8_t              lac_count;                   /**< # of open RMA PTEs (== UCT_CXI_MAX_LACS once iface_open succeeds) */
-        uct_cxi_pte_fc_t      fc[UCT_CXI_MAX_LACS];       /**< Per-LAC recovery state */
     } rma;
 
     /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) ────

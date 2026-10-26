@@ -351,16 +351,17 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     int                       ret;
 
     {
-        /* en_flowctrl: on EQ-full pressure, transition DISABLED (graceful,
-         * accountable via drop_count) instead of silently dropping the
-         * event. This LE has event_success_disable=1 below, so it can
-         * never itself generate a target-side event needing a slot — the
-         * bit is armed here for consistency / in case that ever changes,
-         * not because RMA/AMO can hit this path today. */
-        struct cxi_pt_alloc_opts pt_opts = {
-            .en_flowctrl = 1
-        };
-        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->rma.pte[lac]);
+        /* No en_flowctrl: the PTE is never disabled by a full event queue.
+         * The list entry below raises no event on success, link or
+         * communication, so an operation that works needs no slot of the
+         * queue and has nothing to lose to it being full. (A failed one
+         * does raise an event, which a full queue drops and progress
+         * reports.) The PTE is thus never part of the PTE recovery, and the
+         * disable of another PTE on the queue does not turn remote memory
+         * access away with PT_DISABLED. */
+        struct cxi_pt_alloc_opts pt_opts = {};
+        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts,
+                             &self->rma.pte[lac]);
     }
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte lac %u: %s", lac, strerror(-ret));
@@ -1208,7 +1209,6 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     self->eq_flap_limit        = config->eq_flap_limit;
     self->eq_flap_window       = ucs_time_from_sec(config->eq_flap_window);
     memset(&self->am.fc, 0, sizeof(self->am.fc));
-    memset(self->rma.fc, 0, sizeof(self->rma.fc));
 
     /* Step 2: wait object (epoll fd for event-driven progress). */
     ret = cxil_alloc_wait_obj(lni, &self->wait_obj);
@@ -1287,7 +1287,6 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
             if (status != UCS_OK) {
                 goto err_rma_ptes;
             }
-            self->rma.lac_count++;
         }
     }
 
@@ -1832,28 +1831,21 @@ uct_cxi_iface_pte_recover(uct_cxi_iface_t *iface, struct cxil_pte *pte,
 }
 
 /*
- * uct_cxi_iface_recover_ptes — check every locally-owned PTE (AM + each open
- * RMA LAC — bounded by UCT_CXI_MAX_LACS+1, not connection count) and recover
- * any found DISABLED.  Called once the EQ has been drained enough
- * (eq.need_to_drain reaching 0), not per-drop.
+ * uct_cxi_iface_recover_ptes — check every PTE that flow control can disable
+ * (AM, tag, rendezvous) and recover any found DISABLED.  Called once the EQ
+ * has been drained enough (eq.need_to_drain reaching 0), not per-drop.
  */
 static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
 {
-    unsigned lac;
-
     uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
     uct_cxi_iface_pte_recover(iface, iface->tag.pte, &iface->tag.fc);
     uct_cxi_iface_pte_recover(iface, iface->rdzv.pte, &iface->rdzv.fc);
-    for (lac = 0; lac < iface->rma.lac_count; lac++) {
-        uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
-                                  &iface->rma.fc[lac]);
-    }
 }
 
 /*
  * uct_cxi_iface_pte_by_index — find the locally-owned PTE (and its
  * recovery/exhaustion state) matching a STATE_CHANGE event's ptlte_index.
- * Checks AM first, then each open RMA LAC. Returns NULL (via *pte_p) if
+ * Returns NULL (via *pte_p) if
  * the index doesn't match anything we track — shouldn't happen, but a
  * STATE_CHANGE for a PTE we don't recognize isn't actionable either way.
  */
@@ -1861,8 +1853,6 @@ static uct_cxi_pte_fc_t *
 uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
                            struct cxil_pte **pte_p)
 {
-    unsigned lac;
-
     if ((iface->am.pte != NULL) && (ptlte_index == iface->am.pte->ptn)) {
         *pte_p = iface->am.pte;
         return &iface->am.fc;
@@ -1874,13 +1864,6 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
     if ((iface->rdzv.pte != NULL) && (ptlte_index == iface->rdzv.pte->ptn)) {
         *pte_p = iface->rdzv.pte;
         return &iface->rdzv.fc;
-    }
-    for (lac = 0; lac < iface->rma.lac_count; lac++) {
-        if ((iface->rma.pte[lac] != NULL) &&
-            (ptlte_index == iface->rma.pte[lac]->ptn)) {
-            *pte_p = iface->rma.pte[lac];
-            return &iface->rma.fc[lac];
-        }
     }
     *pte_p = NULL;
     return NULL;
@@ -2085,8 +2068,9 @@ uct_cxi_iface_handle_state_change(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
     } else if (ptlte_state == C_PTLTE_DISABLED) {
         if (sc_reason == C_SC_FC_EQ_FULL) {
             /* Fresh disable caused by EQ capacity — affects every
-             * PTE bound to this queue (all of them, today: they
-             * share the RX EQ). Defer recovery until the EQ has
+             * PTE bound to this queue that arms flow control (AM, tag
+             * and rendezvous: they share the RX EQ). Defer recovery
+             * until the EQ has
              * actually drained (see the eq->need_to_drain
              * countdown in uct_cxi_iface_poll_rx()) rather than
              * retrying inline. */
