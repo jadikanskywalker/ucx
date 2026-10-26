@@ -20,11 +20,8 @@
 #include <sys/mman.h>
 
 
-/*
- * uct_cxi_eq_configure -- reset \a eq and fill in the resolved config that
- * uct_cxi_eq_init() and the poll loop consume. \a num_events is rounded up to
- * whole pages: the driver requires a page-aligned queue length.
- */
+/* Reset \a eq and fill in the resolved config. \a num_events is rounded up to
+ * whole pages (the driver needs a page-aligned length). */
 void
 uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
                      unsigned reserved_slots, int grow_enabled,
@@ -45,12 +42,9 @@ uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
     eq->grow.max_len_events = ucs_max(config->eq_max_len, eq->num_events);
 }
 
-/*
- * uct_cxi_eq_init -- allocate one event queue: mmap its ring buffer, pin it
- * for the NIC and create the hardware queue on top of it. The caller must
- * have filled in eq->num_events, eq->reserved_slots_cfg and eq->grow.* (the
- * resolved config) beforehand.
- */
+/* Allocate one event queue: mmap and pin its ring buffer and create the
+ * hardware queue on it. The caller fills eq->num_events, reserved_slots_cfg and
+ * grow.* first. */
 ucs_status_t
 uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
                 struct cxil_wait_obj *wait_obj)
@@ -76,18 +70,15 @@ uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
         goto err_munmap;
     }
 
-    /* Allocate the event queue backed by the pinned buffer.
-     * reserved_slots is one-sided (blocks LPE/RX from the reservation,
-     * does not cap TX) — see EQ_RESERVED_SLOTS_PCT doc and the design
-     * notes in iface_progress(). */
+    /* reserved_slots is one-sided: it blocks incoming messages from the
+     * reservation but does not cap TX. */
     memset(&eq_attr, 0, sizeof(eq_attr));
     eq_attr.queue           = eq->buf;
     eq_attr.queue_len       = buf_len;
     eq_attr.reserved_slots  = eq->reserved_slots_cfg;
     eq->reserved_slots      = eq_attr.reserved_slots;
-    /* status_thresh_*: a single hardware-native fill-percentage threshold
-     * (see EQ_DYNAMIC_GROWTH doc) — status_thresh_count=0 when disabled
-     * costs nothing (no status write-backs ever generated). */
+    /* One hardware fill-percentage threshold (EQ_DYNAMIC_GROWTH); count 0
+     * when disabled costs nothing. */
     if (eq->grow.enabled) {
         eq_attr.status_thresh_base  = eq->grow.thresh_pct;
         eq_attr.status_thresh_delta = 0;
@@ -108,12 +99,8 @@ err_munmap:
     return UCS_ERR_IO_ERROR;
 }
 
-/*
- * uct_cxi_eq_abort_resize -- release the pending buffer of a resize left in
- * flight (iface torn down before C_EVENT_EQ_SWITCH arrived). It leaks unless
- * freed explicitly: it's not reachable via uct_cxi_eq_cleanup(), which only
- * knows about the currently-active buffer.
- */
+/* Release the pending buffer of a resize still in flight at close, which
+ * uct_cxi_eq_cleanup() does not know about. */
 void uct_cxi_eq_abort_resize(uct_cxi_eq_t *eq)
 {
     int ret;
@@ -130,10 +117,8 @@ void uct_cxi_eq_abort_resize(uct_cxi_eq_t *eq)
     munmap(eq->grow.pending_buf, eq->grow.pending_len);
 }
 
-/*
- * uct_cxi_eq_cleanup -- destroy the hardware queue and release its buffer.
- * Everything bound to the queue (PTEs, command queues) must already be gone.
- */
+/* Destroy the hardware queue and release its buffer; everything bound to it
+ * (PTEs, command queues) must be gone. */
 void uct_cxi_eq_cleanup(uct_cxi_eq_t *eq)
 {
     int ret;
@@ -152,17 +137,11 @@ void uct_cxi_eq_cleanup(uct_cxi_eq_t *eq)
 }
 
 /*
- * uct_cxi_iface_eq_grow_start — begin a preemptive EQ resize.
- *
- * Called from iface_progress() once a hardware fill-threshold status
- * update reports the EQ at or above eq.grow.thresh_pct. Submits a new,
- * double-sized buffer via cxil_evtq_resize() — hardware keeps writing to
- * the old buffer for a few more events, then emits C_EVENT_EQ_SWITCH
- * (handled in the main event loop) once it has switched to the new one.
- *
- * Only one resize may be in flight at a time (enforced by the driver,
- * mirrored here via eq.grow.resizing) — the caller must not call this
- * again until eq_grow_complete() has run.
+ * Begin a preemptive resize, called once a fill-threshold status update puts
+ * the EQ at or above eq.grow.thresh_pct. Submits a double-sized buffer via
+ * cxil_evtq_resize(); hardware switches to it after a few more events and
+ * raises C_EVENT_EQ_SWITCH. One resize at a time (eq.grow.resizing): not to be
+ * called again until uct_cxi_iface_eq_grow_complete() has run.
  */
 UCS_F_NOINLINE void
 uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
@@ -193,9 +172,8 @@ uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
         return;
     }
 
-    /* Same flags as the original eq_md (Step 4 in iface_open) — must land
-     * on the same LAC as the EQ's current MD, or cxil_evtq_resize() below
-     * rejects it. */
+    /* Same flags as the original eq_md: it must land on the same LAC, or
+     * cxil_evtq_resize() rejects it. */
     ret = cxil_map(md->cxi_lni, new_buf, new_len,
                    CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE, NULL,
                    &new_md);
@@ -223,13 +201,9 @@ uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
 }
 
 /*
- * uct_cxi_iface_eq_grow_complete — finish a preemptive EQ resize.
- *
- * Called from the main event loop on C_EVENT_EQ_SWITCH. Completes the
- * driver-side handshake, frees the old buffer, and re-applies the
- * reserved-slots percentage against the new (larger) size — otherwise
- * the reserved floor silently shrinks as a fraction of the queue on
- * every doubling.
+ * Finish a resize on C_EVENT_EQ_SWITCH: complete the driver handshake, free the
+ * old buffer, and re-apply the reserved slots against the new size (or the
+ * reserved floor would shrink with each doubling).
  */
 UCS_F_NOINLINE void
 uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)

@@ -2,20 +2,13 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI UCT Atomic Memory Operations.
+ * CXI atomic memory operations: restricted-mode IDC commands (c_cstate_cmd,
+ * then c_idc_amo_cmd) to the target's catch-all RMA LE.
  *
- * All AMOs use restricted-mode IDC commands: c_cstate_cmd (carries user_ptr,
- * eq, write_lac) followed by c_idc_amo_cmd (carries dfa, remote_offset,
- * operands).  Single cxi_cq_ring after both commands.
- *
- * Post (non-fetching): send_op from op_pool, C_EVENT_ACK.  Returns UCS_OK.
- * Fetch:               send_desc from desc_pool (registered result buffer),
- *                      C_EVENT_REPLY writes result to desc data area.
- *                      Completion handler copies to *result.  Returns UCS_INPROGRESS.
- * CSWAP:               same as fetch, op1=swap, op2=compare, CSWAP_EQ.
- *
- * Target side: existing RMA catch-all LEs (restricted, op_put=1, op_get=1)
- * handle atomics.  No additional target setup needed.
+ * Post (non-fetching): tracked by the ep alone, ACK. Returns UCS_OK.
+ * Fetch / CSWAP:       a desc from desc_pool receives the result in its data
+ *                      area (REPLY); the completion handler copies it out.
+ *                      Returns UCS_INPROGRESS.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -49,11 +42,7 @@ static const uint8_t uct_cxi_amo_op_table[] = {
     [UCT_ATOMIC_OP_SWAP] = C_AMO_OP_CSWAP,
 };
 
-/*
- * On failure (status != UCS_OK), desc's buffer was never actually written
- * by the remote — skip the copy rather than deliver a stale/uninitialized
- * "result" to the caller as if the fetch/cswap had actually happened.
- */
+/* Copy the result out only on success: otherwise the buffer was not written. */
 static void uct_cxi_amo_fetch_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     uct_cxi_send_desc_t *desc = (uct_cxi_send_desc_t *)op;

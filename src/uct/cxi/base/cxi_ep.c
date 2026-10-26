@@ -2,13 +2,7 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI endpoint implementation — ep_create, ep_destroy, ep_flush, ep_fence.
- *
- * RMA operations (ep_put_zcopy, ep_get_zcopy) live in cxi_rma.c.
- *
- * ep_create builds all UCT_CXI_MAX_LACS dfa_rma[] entries eagerly (one per
- * LAC, pid_offset = lac) so the hot path in cxi_rma.c/cxi_amo.c never needs
- * a check -- it just indexes dfa_rma[rkey->lac].
+ * CXI endpoint: create, destroy, pending queue, flush and fence.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -45,12 +39,7 @@ uct_cxi_ep_md(uct_cxi_ep_t *ep)
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ep_create — allocate and connect an EP to a remote iface.
- *
- * Reads device_addr (nid) and iface_addr (pid) from params, stores them in
- * the EP, and precomputes every dfa_rma[lac] (0..UCT_CXI_MAX_LACS-1).
- */
+/* Allocate an EP to the remote iface in \a params and precompute its DFAs. */
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
 {
     uct_cxi_iface_t             *iface;
@@ -96,9 +85,7 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     }
 #endif
 
-    /* Build all DFAs at creation time so the hot path needs no check.
-     * RMA DFAs: pid_offset = lac index (one per LAC).
-     * AM DFA:   pid_offset = UCT_CXI_PTE_AM (fixed protocol constant). */
+    /* All DFAs are built here so the hot path needs no check. */
     {
         uint8_t lac;
         for (lac = 0; lac < UCT_CXI_MAX_LACS; lac++) {
@@ -109,9 +96,7 @@ ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p)
     }
     cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
                   (uint32_t)UCT_CXI_PTE_AM, &ep->dfa_am, &ep->dfa_am_idx_ext);
-    /* Built unconditionally, same as dfa_am -- pure address arithmetic,
-     * no local resource needed even if this iface's own tag.pte is
-     * disabled (the peer's tag PTE may still be open). */
+    /* Pure address arithmetic: needs no local tag PTE. */
     cxi_build_dfa(ep->rem_nid, ep->rem_pid, (uint32_t)md->pid_bits,
                   (uint32_t)UCT_CXI_PTE_TAG, &ep->dfa_tag, &ep->dfa_tag_idx_ext);
 
@@ -141,10 +126,8 @@ void uct_cxi_ep_destroy(uct_ep_h tl_ep)
     }
 #endif
 
-    /* Completions of sends still in flight find their ep through a pointer
-     * stored in the command (op->ep, or the tagged user_ptr of a short), so
-     * freeing it now would leave them a dangling one. Leave the free to the
-     * last completion instead (see uct_cxi_iface_ep_tx_done). */
+    /* Completions find their ep through a pointer in the command, so the last
+     * completion frees it (uct_cxi_iface_ep_release). */
     if (ep->outstanding > 0) {
         uct_cxi_iface_t *iface = ucs_derived_of(ep->super.super.iface,
                                                 uct_cxi_iface_t);
@@ -174,18 +157,12 @@ void uct_cxi_ep_destroy(uct_ep_h tl_ep)
  */
 
 /*
- * uct_cxi_ep_process_pending — arbiter dispatch callback, invoked from
- * iface_progress() once TX completions have freed cmdq/pool resources or a
- * grant has returned credits.
- *
- * A NO_RESOURCE from req->func is one of two things:
- *   - this ep's peer has no credits for it, or the handshake with the peer
- *     is still in flight (iface->tx.credit_block was set by
- *     uct_cxi_fc_reserve()): nothing shared is short, so only this ep is
- *     parked (DESCHED_GROUP) on its peer until a grant, the CREP or a refund
- *     resumes it, and every other ep's queue carries on;
- *   - cmdq, op_pool, desc_pool or the TX queue are iface-global: if one ep
- *     cannot send, none can this round, so STOP halts the whole dispatch.
+ * Arbiter dispatch callback, run from progress. A NO_RESOURCE from req->func
+ * is:
+ *   - a lack of this peer's credits or a handshake in flight
+ *     (iface->tx.credit_block): only this ep is parked until a grant, the CREP
+ *     or a refund;
+ *   - an interface-wide shortage (cmdq, pools, TX queue): STOP the dispatch.
  */
 ucs_arbiter_cb_result_t
 uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
@@ -209,9 +186,7 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
     } else if (status == UCS_ERR_NO_RESOURCE) {
 #ifndef UCT_CXI_DISABLE_FC
         if (iface->tx.credit_block) {
-            /* Short of this peer's credits (or still handshaking), not of
-             * anything shared: park just this ep until a grant, the CREP or
-             * a refund resumes it, and let every other ep carry on. */
+            /* Park just this ep; other eps carry on. */
             uct_cxi_fc_block_ep(ep);
             return UCS_ARBITER_CB_RESULT_DESCHED_GROUP;
         }
@@ -221,15 +196,7 @@ uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
     return UCS_ARBITER_CB_RESULT_NEXT_GROUP;
 }
 
-/*
- * uct_cxi_ep_pending_add — queue a callback to retry once resources free up.
- *
- * Unconditionally queues (no UCS_ERR_BUSY fast path): CXI has three distinct
- * resource pools (cmdq, op_pool, desc_pool) and no cheap way to probe "do I
- * have resources right now" across all of them, so we always defer to the
- * arbiter dispatch in iface_progress() rather than trying to special-case
- * the immediately-retryable case.
- */
+/* Always queues: there is no cheap way to probe cmdq, op_pool and desc_pool. */
 ucs_status_t uct_cxi_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
                                      unsigned flags)
 {
@@ -278,12 +245,7 @@ void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ep_flush — poll-based flush.
- *
- * Returns UCS_OK when all sends posted on this EP have been acknowledged.
- * Returns UCS_INPROGRESS while ACKs are pending.
- */
+/* UCS_OK once every send on this EP is acknowledged, else UCS_INPROGRESS. */
 ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
                                uct_completion_t *comp)
 {
@@ -303,13 +265,7 @@ ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
     return UCS_INPROGRESS;
 }
 
-/*
- * uct_cxi_ep_fence — emit C_CMD_CQ_FENCE to stall NIC pipeline.
- *
- * The CXI CMDQ is submission-ordered, but the NIC pipelines execution:
- * a later command can begin before an earlier one finishes, allowing
- * reordering in the fabric.  C_CMD_CQ_FENCE stalls subsequent commands
- * until all prior commands have completed execution.
+/* The NIC pipelines commands; CQ_FENCE holds later ones until earlier finish.
  */
 ucs_status_t uct_cxi_ep_fence(uct_ep_h tl_ep, unsigned flags)
 {

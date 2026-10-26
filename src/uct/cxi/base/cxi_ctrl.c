@@ -2,23 +2,14 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI control channel: a portal table entry, an event queue and a command
- * queue of their own, over which the transport talks to the same transport on
- * other nodes (today the flow-control handshake and credit grants, see
- * cxi_fc.h). Nothing here depends on the clients: a control message is a
- * zero-payload send to the control PTE of a peer, and everything it says
- * travels in its match bits and header data.
+ * CXI control channel: a PTE, event queue and command queue of their own for
+ * messages between transports (today the flow-control handshake and credit
+ * grants, see cxi_fc.h). A control message is a zero-payload send whose
+ * content travels in its match bits and header data.
  *
- * The channel shares nothing with the data path. Its PTE lists one
- * zero-length entry that accepts every message, so a message needs no
- * buffer, and is bound to the control event queue, so control traffic can
- * neither fill the receive queue of the data path nor be refused because it
- * is full. Its sends use their own command queue and report to the same
- * event queue, so they neither wait for nor take a place of the sends of the
- * data path. The event queue holds the messages that arrive and the
- * completions of the messages sent, and the slots of the completions are
- * reserved: a message that arrives can only be refused (the sender is told),
- * never cost a completion.
+ * The control EQ holds arrivals and send completions. Slots for the
+ * completions are reserved, so an arrival can be refused but never costs a
+ * completion.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -46,10 +37,7 @@ static ucs_mpool_ops_t uct_cxi_ctrl_mpool_ops = {
 };
 
 
-/*
- * Enable the control PTE: SETSTATE, then wait for the state change event that
- * confirms it.
- */
+/* Enable the control PTE and wait for its STATE_CHANGE event. */
 static ucs_status_t uct_cxi_ctrl_enable_pte(uct_cxi_iface_t *iface)
 {
     uct_cxi_ctrl_t         *ctrl     = &iface->ctrl;
@@ -102,11 +90,8 @@ static ucs_status_t uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface,
     int                  ret;
 
     {
-        /* No flow control: the only thing that can refuse a message here is
-         * a full event queue, and then the sender is told and sends it
-         * again. The PTE is never disabled, so recovery has nothing to do
-         * for it, and the messages that recovery itself needs can always
-         * travel. */
+        /* No flow control: a full EQ refuses the message and the sender
+         * resends, so the PTE is never disabled. */
         struct cxi_pt_alloc_opts pt_opts = {
             .is_matching    = 1,
             .use_long_event = 1,
@@ -176,16 +161,15 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
 
     memset(ctrl, 0, sizeof(*ctrl));
 
-    /* Without flow control on this run there is no control PTE: a peer's CREQ
-     * finds none and marks this interface as a plain connectionless peer. */
+    /* FC_ENABLE=n: no control PTE, so a peer's CREQ finds none and marks this
+     * interface LEGACY. */
     if (!iface->fc.enabled) {
         return UCS_OK;
     }
 
     ctrl->max_inflight = UCT_CXI_CTRL_MAX_INFLIGHT;
 
-    /* The completions of the messages sent have slots of their own, which
-     * the messages that arrive may not use. */
+    /* One reserved slot per message in flight, for its completion. */
     uct_cxi_eq_configure(&ctrl->eq, "ctrl",
                          (config->ctrl_eq_size == UINT_MAX) ?
                                  UCT_CXI_CTRL_EQ_NUM_EVENTS :
@@ -267,20 +251,15 @@ void uct_cxi_ctrl_close(uct_cxi_iface_t *iface)
         ucs_warn("cxi cxil_destroy_cmdq ctrl failed: %s", strerror(-ret));
     }
 
-    /* A request still in flight when the interface closes is normal (its
-     * completion is simply never processed): don't report it as a leak. */
+    /* Requests still in flight at close are expected, not leaks. */
     ucs_mpool_cleanup(&ctrl->req_pool, 0);
     uct_cxi_eq_cleanup(&ctrl->eq);
     ctrl->eq.evtq = NULL;
 }
 
 /*
- * uct_cxi_ctrl_send -- send one zero-payload control message to \a peer's
- * control PTE. It takes one of the ctrl->max_inflight places until its
- * completion, so UCS_ERR_NO_RESOURCE if there is none free or the command
- * queue is full, and the caller just tries again later (a GRANT from the list
- * of waiting ones, a CREQ from its timer, a CREP when the requester sends its
- * CREQ again).
+ * Send a zero-payload control message to \a peer's control PTE.
+ * UCS_ERR_NO_RESOURCE if the channel is full; the caller retries later.
  */
 ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                unsigned type, uint64_t match_bits,

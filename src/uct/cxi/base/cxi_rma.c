@@ -2,37 +2,15 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI RMA operations — ep_put_short, ep_put_zcopy, ep_get_zcopy.
+ * CXI RMA operations: put/get short, bcopy and zcopy.
  *
- * Restricted-mode DMA model
- * ─────────────────────────
- * Both PUT and GET use c_full_dma_cmd with restricted=1.  The NIC routes the
- * command to the remote peer's RMA portal at pid_offset = rkey->lac (the
- * *target* buffer's LAC) via ep->dfa_rma[rkey->lac], precomputed for every
- * LAC at ep_create.  Routing has to be per-LAC rather than one shared PTE:
- * a restricted-mode wire packet carries no LAC field at all (verified —
- * cassini_user_defs.h's struct c_port_restricted_hdr has only opcode,
- * index_ext, remote_offset, request_len), so index_ext/PTE selection is the
- * only per-packet signal available to tell the target which LAC's address
- * context (and therefore which of its per-LAC PTEs' catch-all LE) should
- * resolve remote_offset. Each RMA PTE (opened eagerly at iface_open, one
- * per LAC — see cxi_iface.c) carries exactly one catch-all LE with an
- * unambiguous .lac, so there's nothing for the target to disambiguate.
+ * All use restricted mode: the NIC routes a command to the target's RMA PTE
+ * of the target buffer's LAC (ep->dfa_rma[rkey->lac]). A restricted packet
+ * carries no LAC, so the PTE is the only signal of which LAC's address
+ * context resolves remote_offset. UCT_CXI_MAX_LACS is 1 for now.
  *
- * UCT_CXI_MAX_LACS is currently 1 (LAC 0 only — see cxi_iface.h), so in
- * practice there's exactly one RMA PTE and rkey->lac is always 0;
- * uct_cxi_md_mem_reg() rejects any registration that lands elsewhere. The
- * per-LAC structure above still describes the actual mechanism, just
- * degenerate at N=1 for now.
- *
- * PUT short: data is inline in the IDC command — no local mem_reg needed, no DMA.
- *   c_idc_hdr carries no user_ptr, so a c_cstate_cmd is emitted first.
- *   The cstate carries user_ptr, eq, index_ext, and restricted; the NIC pairs
- *   it with the following IDC put and fires C_EVENT_ACK with that user_ptr.
- *   Both cstate and IDC are emitted before cxi_cq_ring (single doorbell).
- *
- * PUT zcopy: NIC DMA from app's registered IOVA.  Completion: C_EVENT_ACK.
- * GET zcopy: NIC reads remote memory → local registered buffer.  Completion: C_EVENT_REPLY.
+ * Completions: ACK for puts, REPLY for gets. An IDC put_short has no
+ * user_ptr in its header, so a c_cstate_cmd carrying it precedes the IDC put.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -72,18 +50,9 @@ uct_cxi_rma_ep_iface(uct_cxi_ep_t *ep)
  */
 
 /*
- * uct_cxi_ep_get_short — synchronous inline GET from remote memory.
- *
- * Posts a restricted-mode DMA GET into iface->tx.get_short_buf (a small
- * separately-allocated, pre-registered scratch buffer), spins on
- * iface_progress until C_EVENT_REPLY arrives, then copies the data into
- * the caller's buffer.  Returns UCS_OK with data ready on return.
- *
- * The scratch buffer is separate from the iface struct to keep the NIC's
- * DMA writes out of the CPU-hot struct pages.
- *
- * Thread safety: single-threaded poll model; at most one get_short in
- * flight at a time is guaranteed by the UCT single-worker contract.
+ * Synchronous GET: read into the scratch buffer iface->tx.get_short_buf, spin
+ * on progress until the REPLY, then copy to the caller. At most one is in
+ * flight (single-threaded worker).
  */
 ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
                                    unsigned length, uint64_t remote_addr,
@@ -158,23 +127,9 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
  */
 
 /*
- * uct_cxi_ep_put_short — post an inline restricted-mode PUT.
- *
- * Data (≤ C_MAX_IDC_PAYLOAD_RES = 224 B, cassini_user_defs.h hardware
- * constant) is embedded directly in the IDC command; the source buffer may
- * be reused as soon as this function returns.
- *
- * Completion tracking: c_idc_hdr carries no user_ptr.  The correct CXI
- * pattern (mirroring libfabric's cxip_rma_emit_idc) is to emit a
- * c_cstate_cmd first: it carries user_ptr, eq, index_ext, and restricted,
- * and the NIC pairs it with the following IDC put to fire C_EVENT_ACK with
- * that user_ptr.  Both cstate and IDC are emitted before the single
- * cxi_cq_ring, so the NIC sees them as one operation.  The user_ptr is the
- * ep alone (see uct_cxi_ep_restricted_user_ptr): the completion has nothing
- * to run, so no send op is taken.
- *
- * Returns UCS_OK (not UCS_INPROGRESS): source buffer is reusable on return,
- * but remote visibility is not guaranteed until ep_flush returns UCS_OK.
+ * Inline PUT of up to C_MAX_IDC_PAYLOAD_RES bytes, copied into the command.
+ * The completion is tracked by the ep alone (uct_cxi_ep_restricted_user_ptr);
+ * remote visibility is only guaranteed once ep_flush returns UCS_OK.
  */
 ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
                                    unsigned length, uint64_t remote_addr,
@@ -241,24 +196,13 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
  * -------------------------------------------------------------------------
  */
 
-/*
- * put_bcopy completion: no user callback — the source data is already in the
- * bounce buffer which belongs to the transport.  Just return the desc.
- */
+/* put_bcopy completion: just return the desc. */
 static void uct_cxi_put_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     ucs_mpool_put((uct_cxi_send_desc_t *)op);
 }
 
-/*
- * get_bcopy completion: NIC has delivered remote data into desc's buffer.
- * Call the unpack callback to deliver to the caller, invoke any user
- * completion, then return the descriptor.
- *
- * On failure (status != UCS_OK), desc's buffer was never actually written
- * by the remote — skip unpack_cb rather than deliver stale/uninitialized
- * data to the caller as if it were a real result.
- */
+/* get_bcopy completion: unpack the data (only on success), complete, free. */
 static void uct_cxi_get_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     uct_cxi_send_desc_t *desc = (uct_cxi_send_desc_t *)op;
@@ -279,16 +223,8 @@ static void uct_cxi_get_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
  */
 
 /*
- * uct_cxi_ep_put_bcopy — restricted-mode DMA PUT via bounce buffer.
- *
- * Acquires a pre-registered uct_cxi_send_desc_t from desc_pool, calls
- * pack_cb to fill the data area, then posts a c_full_dma_cmd C_CMD_PUT.
- * The descriptor's pre-computed iova/lac eliminate per-op IOVA arithmetic.
- *
- * Returns the number of bytes packed (ssize_t) on success, or a negative
- * ucs_status_t cast on resource exhaustion.  Source data is owned by the
- * transport from return until C_EVENT_ACK; caller may reuse its buffer
- * immediately.
+ * PUT via a bounce buffer from desc_pool, filled by pack_cb. Returns the
+ * packed length, or a negative status.
  */
 ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
                               void *arg, uint64_t remote_addr, uct_rkey_t rkey)
@@ -353,15 +289,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ep_get_bcopy — restricted-mode DMA GET via bounce buffer.
- *
- * Posts a c_full_dma_cmd C_CMD_GET targeting desc's pre-registered data
- * area.  On C_EVENT_REPLY, uct_cxi_get_bcopy_comp calls unpack_cb to
- * deliver the data to the caller, then invokes comp.
- *
- * Returns UCS_INPROGRESS; caller polls iface_progress until comp fires.
- */
+/* GET into a bounce buffer; uct_cxi_get_bcopy_comp unpacks it on the REPLY. */
 ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
                                    uct_unpack_callback_t unpack_cb,
                                    void *arg, size_t length,
@@ -403,20 +331,10 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
         cmd.user_ptr           = (uint64_t)(uintptr_t)desc;
 
         if (ucs_unlikely(rkey_p->is_rndv)) {
-            /* Unexpected-rendezvous data pull -- reached when UCP drives a
-             * generic pull for an unexpected-rendezvous arrival, on the
-             * same uct_ep the message arrived on. Unlike ordinary RMA
-             * (restricted, ep->dfa_rma[lac], rkey_p->iova + remote_addr),
-             * this targets the sender's rendezvous source PTE (matching
-             * mode, fixed rdzv_get_idx) with match_bits = the sender's own
-             * rdzv op id -- the same correlator uct_cxi_iface_tag_handle_
-             * rdzv_get() already expects, so its completion path fires
-             * unmodified. remote_addr is the sender's real remote_offset
-             * directly, not an rkey-relative RMA offset -- ep->rem_nid/
-             * rem_pid already identify the peer, so no translation is
-             * needed. Built in place, not via out-parameters -- struct
-             * c_full_dma_cmd's dfa/index_ext members are C bit-fields,
-             * whose address cannot be taken. */
+            /* Unexpected-rendezvous pull: unlike RMA this targets the sender's
+             * rendezvous source PTE (rdzv_get_idx), matching on its rdzv op
+             * id, with remote_addr its real offset. Built in place: dfa and
+             * index_ext are bit-fields. */
             uct_cxi_md_t     *rdzv_md = uct_cxi_iface_md(iface);
             union c_fab_addr  rdzv_dfa;
             uint8_t           rdzv_idx_ext;
@@ -462,12 +380,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ep_put_zcopy — post a restricted-mode DMA PUT command.
- *
- * Supports iovcnt == 1.  Completion arrives as C_EVENT_ACK on the shared EQ.
- * Returns UCS_INPROGRESS; the caller polls iface_progress until the ACK fires.
- */
+/* DMA PUT from a registered buffer (iovcnt == 1); completes on the ACK. */
 ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
                                    size_t iovcnt, uint64_t remote_addr,
                                    uct_rkey_t rkey, uct_completion_t *comp)
@@ -529,14 +442,7 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ep_get_zcopy — post a restricted-mode DMA GET command.
- *
- * Supports iovcnt == 1.  The NIC reads from remote_addr (via the remote RMA
- * portal identified by rkey->lac) and writes into the local buffer.
- * Completion arrives as C_EVENT_REPLY on the shared EQ.
- * Returns UCS_INPROGRESS; the caller polls iface_progress until the reply fires.
- */
+/* DMA GET into a registered buffer (iovcnt == 1); completes on the REPLY. */
 ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
                                    size_t iovcnt, uint64_t remote_addr,
                                    uct_rkey_t rkey, uct_completion_t *comp)
@@ -571,11 +477,7 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
         cmd.user_ptr           = (uint64_t)(uintptr_t)op;
 
         if (ucs_unlikely(rkey_p->is_rndv)) {
-            /* Unexpected-rendezvous data pull -- see the identical branch
-             * in uct_cxi_ep_get_bcopy() above for the full comment. Built
-             * in place, not via out-parameters -- struct c_full_dma_cmd's
-             * dfa/index_ext members are C bit-fields, whose address cannot
-             * be taken. */
+            /* Unexpected-rendezvous pull, as in uct_cxi_ep_get_bcopy(). */
             uct_cxi_md_t     *rdzv_md = uct_cxi_iface_md(iface);
             union c_fab_addr  rdzv_dfa;
             uint8_t           rdzv_idx_ext;

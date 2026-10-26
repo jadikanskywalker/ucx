@@ -1,16 +1,6 @@
 /**
- * CXI memory domain implementation.
- *
- * Modeled on the libfabric CXI provider (cxip_dom.c / cxip_if.c) and the
- * UCX UGNI transport (ugni_md.c) as design references.
- *
- * Lifecycle:
- *   query_md_resources  — enumerate physical CXI devices
- *   md_open             — open device, validate service, alloc LNI
- *   mem_reg             — cxil_map (pin pages, get IOVA + LAC)
- *   mkey_pack           — serialize {iova, lac} for remote peer
- *   mem_dereg           — cxil_unmap
- *   md_close            — destroy LNI, close device
+ * CXI memory domain: query_md_resources, md_open, mem_reg/dereg (pinned, rcache
+ * or ATS) and mkey_pack.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -80,14 +70,8 @@ static ucs_config_field_t uct_cxi_md_config_table[] = {
  */
 
 /*
- * uct_cxi_get_svc_id - read SLINGSHOT_SVC_IDS and return the entry for a
- * given device index (cxi0 → index 0, cxi1 → index 1, ...).
- *
- * SLINGSHOT_SVC_IDS is a comma-separated list; the SLURM plugin sets one
- * entry per NIC, e.g. "4,4,4,4" for four NICs all using service 4.
- *
- * Returns the svc_id on success, or -1 if the variable is absent or the
- * index is out of range.
+ * Service ID of device index \a dev from SLINGSHOT_SVC_IDS (one entry per
+ * NIC), or -1 if absent or out of range.
  */
 static int uct_cxi_get_svc_id(unsigned dev_id)
 {
@@ -124,11 +108,7 @@ static int uct_cxi_get_svc_id(unsigned dev_id)
     return svc_id;
 }
 
-/*
- * uct_cxi_get_vni - read SLINGSHOT_VNIS and return the first VNI token.
- *
- * Returns the VNI on success, or 0 if the variable is absent or unparseable.
- */
+/* First VNI of SLINGSHOT_VNIS, or 0 if absent or unparseable. */
 static uint16_t uct_cxi_get_vni(void)
 {
     char *env = getenv("SLINGSHOT_VNIS");
@@ -154,14 +134,7 @@ static uint16_t uct_cxi_get_vni(void)
     return vni;
 }
 
-/*
- * uct_cxi_log_svc_desc - dump one service descriptor's full detail (id,
- * enable/system/restriction flags, every UID/GID member, every VNI) at
- * trace verbosity. Called for every entry regardless of whether it ends up
- * selected, so a cluster's raw service configuration (including
- * disabled/system services) is visible with UCX_LOG_LEVEL=trace without
- * needing external tooling.
- */
+/* Trace-log one service descriptor in full. */
 static void uct_cxi_log_svc_desc(int idx, const struct cxi_svc_desc *desc)
 {
     unsigned k;
@@ -194,20 +167,10 @@ static void uct_cxi_log_svc_desc(int idx, const struct cxi_svc_desc *desc)
 }
 
 /*
- * uct_cxi_find_svc_by_membership - fall back to kernel-side service
- * discovery when the launcher does not export SLINGSHOT_SVC_IDS /
- * SLINGSHOT_DEVICES / SLINGSHOT_VNIS.
- *
- * Mirrors libfabric's CXI provider (cxip_nic_get_best_rgroup_vni in
- * prov/cxi/src/cxip_nic.c): scan the device's pre-configured services via
- * cxil_get_svc_list() and pick, in priority order, the first enabled
- * non-system service that is (a) restricted to our effective UID,
- * (b) restricted to our effective GID, or (c) unrestricted.
- *
- * On success returns the chosen service ID and fills *vni_p (from the
- * service's own VNI restriction, or 0 if the service does not restrict
- * VNIs — the caller decides what to do with an unrestricted VNI).  Returns
- * -1 if no usable service is found.
+ * Without launcher variables, pick a service as libfabric does
+ * (cxip_nic_get_best_rgroup_vni): the first enabled non-system service
+ * restricted to our UID, else our GID, else unrestricted. Fills \a *vni_p
+ * (0 if the service does not restrict VNIs); returns -1 if none is usable.
  */
 static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
 {
@@ -230,10 +193,8 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
     ucs_debug("cxi %s: querying service list (%u entries, euid %d egid %d)",
               dev->info.device_name, svc_list->count, (int)uid, (int)gid);
 
-    /* Priority: UID match, then GID match, then unrestricted. Walk the list
-     * back-to-front and lock in the first (i.e. highest-index) match for
-     * each category — matches cxip_nic_get_best_rgroup_vni exactly, so a
-     * process sees the same service UCX and libfabric/MPI would agree on. */
+    /* UID match, then GID, then unrestricted; the last match of each wins, as
+     * in libfabric. */
     for (i = (int)svc_list->count - 1; i >= 0; i--) {
         desc = svc_list->descs + i;
 
@@ -296,19 +257,9 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
 }
 
 /*
- * uct_cxi_get_rgroup_vni - resolve the (service ID, VNI) pair used to open
- * this device.  Two paths, tried in order (mirrors libfabric's CXI
- * provider: cxip_nic_get_rgroup_vni in prov/cxi/src/cxip_nic.c):
- *
- *  1. SLINGSHOT_SVC_IDS / SLINGSHOT_DEVICES / SLINGSHOT_VNIS, set by a
- *     Slingshot-aware launcher (e.g. the SLURM plugin).  Preferred when
- *     present, since it reflects what the WLM actually granted this job
- *     step.
- *  2. Kernel-side service discovery (uct_cxi_find_svc_by_membership) when
- *     the launcher does not export those variables.
- *
- * Returns UCS_OK with *svc_id_p / *vni_p filled, or UCS_ERR_NO_DEVICE if
- * neither path found a usable service.
+ * Resolve the (service ID, VNI) to open a device with: the launcher's
+ * SLINGSHOT_* variables if set, else service discovery by membership.
+ * UCS_ERR_NO_DEVICE if neither finds one.
  */
 static ucs_status_t uct_cxi_get_rgroup_vni(struct cxil_dev *dev,
                                            unsigned dev_id, int *svc_id_p,
@@ -340,10 +291,7 @@ static ucs_status_t uct_cxi_get_rgroup_vni(struct cxil_dev *dev,
     return UCS_OK;
 }
 
-/*
- * uct_cxi_devname_to_id - convert "cxiN" to the numeric device index N.
- * Returns -1 if the name does not match the expected pattern.
- */
+/* Device index N of "cxiN", or -1. */
 static int uct_cxi_devname_to_id(const char *name)
 {
     unsigned id;
@@ -362,16 +310,8 @@ static int uct_cxi_devname_to_id(const char *name)
  */
 
 /*
- * uct_cxi_query_md_resources - enumerate CXI devices available to this job.
- *
- * Advertises one MD resource per physical CXI device found by
- * cxil_get_device_list(), with no credential check here: whether this
- * process can actually use a device (SLINGSHOT_* env vars, or a
- * pre-configured service matching our uid/gid, or an unrestricted service —
- * see uct_cxi_get_rgroup_vni) is resolved per-device in md_open, same as
- * e.g. IB pkey access. This lets md_open's service-membership fallback run
- * on launchers that don't export SLINGSHOT_SVC_IDS; a device with no usable
- * service simply fails md_open and UCX skips it.
+ * One MD resource per CXI device, with no credential check: a device without
+ * a usable service fails md_open and is skipped.
  */
 ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
                                         uct_md_resource_desc_t **resources_p,
@@ -486,29 +426,8 @@ void uct_cxi_md_close(uct_md_h mdh)
  */
 
 /*
- * uct_cxi_do_map - call cxil_map and fill a mem handle.
- *
- * Shared by the direct registration path (uct_cxi_md_mem_reg) and the
- * rcache miss callback (uct_cxi_rcache_mem_reg_cb).  Both paths produce a
- * uct_cxi_mem_handle_t with a valid cxi_md; only the allocation strategy
- * differs (ucs_malloc vs embedded in the rcache region).
- *
- * cxil_map() pins the pages, programs the NIC's ATU, and fills cxi_md with:
- *   .iova  — page-aligned NIC-visible base address of the registration
- *   .va    — page-aligned virtual address base of the registration
- *   .lac   — memory access class (shared across all same-page-size mappings)
- *   .len   — page-aligned length of the mapping
- *
- * Both .iova and .va are page-aligned — they correspond to the page start,
- * not the exact buffer pointer passed to cxil_map.
- *
- * CXI_MAP_PIN ensures physical page pinning (required for DMA).
- * CXI_MAP_READ | CXI_MAP_WRITE grants bidirectional NIC access.
- *
- * For device memory (mem_type != HOST), CXI_MAP_DEVICE is added. dmabuf_fd
- * is optional: the Cassini driver supports CXI_MAP_DEVICE with or without
- * dmabuf hints (confirmed in shs-libcxi's own map.c device_map_multiple /
- * device_map_offset tests, both parameterized over use_dmabuf true/false).
+ * cxil_map (pinned, read/write; CXI_MAP_DEVICE for device memory) and fill
+ * \a mh. Shared by the direct and rcache registration paths.
  */
 ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
                                    size_t length, int dmabuf_fd,
@@ -536,19 +455,8 @@ ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
         return UCS_ERR_IO_ERROR;
     }
 
-    /*
-     * Precompute iova_offset = page_IOVA - page_VA.
-     *
-     * For any buffer VA within this registration:
-     *   NIC_IOVA(buf) = iova_offset + buf_VA
-     *               = (page_IOVA - page_VA) + buf_VA
-     *               = page_IOVA + (buf_VA - page_VA)
-     *
-     * Using cxi_md->va (the page-aligned VA) instead of the raw `address`
-     * parameter is critical: `address` may be non-page-aligned, which would
-     * cause `iova_offset + buf_VA` to resolve to `page_IOVA` (page start)
-     * rather than the correct per-byte IOVA.
-     */
+    /* iova_offset = page_IOVA - page_VA, from the page-aligned cxi_md->va (not
+         * \a address, which may be unaligned). */
     mh->iova_offset = mh->cxi_md->iova - mh->cxi_md->va;
 
     ucs_debug("cxi map addr %p len %zu iova 0x%"PRIx64" lac %u offset 0x%"PRIx64,
@@ -567,11 +475,7 @@ void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh)
 }
 
 /*
- * uct_cxi_check_lac — reject a registration that landed on any LAC other
- * than 0.  See UCT_CXI_MAX_LACS in cxi_iface.h: only LAC 0 is supported
- * (non-dmabuf GPU registration and huge-page host registration, the only
- * two paths that can produce a different LAC, are both unsupported).  On
- * rejection, unmaps mh so the caller only needs to free/release it.
+ * Reject a registration on any LAC but 0 (UCT_CXI_MAX_LACS), unmapping \a mh.
  */
 static ucs_status_t uct_cxi_check_lac(uct_cxi_mem_handle_t *mh)
 {
@@ -652,13 +556,7 @@ typedef struct uct_cxi_rcache_reg_arg {
     void                           *address;
 } uct_cxi_rcache_reg_arg_t;
 
-/*
- * Cache miss: the rcache calls this to create a new entry for a VA range it
- * has not seen before.  The region struct is already allocated by the rcache;
- * we only need to fill region->memh via cxil_map.  The rcache uses the
- * page-aligned (start, end) rather than the caller's original (va, len) so
- * that overlapping requests can share a single underlying mapping.
- */
+/* rcache miss: map the page-aligned range into region->memh. */
 static ucs_status_t
 uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
                           void *arg, ucs_rcache_region_t *rregion,
@@ -701,11 +599,7 @@ uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
     return uct_cxi_check_lac(&region->memh);
 }
 
-/*
- * Cache eviction: called when the region's refcount drops to zero and the
- * entry is removed from the page table.  Must release the cxil mapping
- * before the region struct is freed by the rcache.
- */
+/* rcache eviction: release the mapping before the rcache frees the region. */
 static void
 uct_cxi_rcache_mem_dereg_cb(void *context, ucs_rcache_t *rcache,
                             ucs_rcache_region_t *rregion)
@@ -734,12 +628,7 @@ static ucs_rcache_ops_t uct_cxi_rcache_ops = {
     .dump_region = uct_cxi_rcache_dump_region_cb
 };
 
-/*
- * Cached mem_reg: look up (or create) a cache entry for the requested range.
- * On a cache hit the reference count of the existing region is incremented and
- * no cxil_map call is made.  The returned uct_mem_h points directly into the
- * region struct and is valid as long as the caller holds its reference.
- */
+/* Cached mem_reg: reuse an overlapping region or create one. */
 static ucs_status_t
 uct_cxi_md_mem_rcache_reg(uct_md_h uct_md, void *address, size_t length,
                           const uct_md_mem_reg_params_t *params,
@@ -762,11 +651,7 @@ uct_cxi_md_mem_rcache_reg(uct_md_h uct_md, void *address, size_t length,
     return UCS_OK;
 }
 
-/*
- * Cached mem_dereg: release the caller's reference.  The cxil_unmap is
- * deferred until all references (user + cache's own page-table entry) are
- * dropped, at which point the rcache calls uct_cxi_rcache_mem_dereg_cb.
- */
+/* Cached mem_dereg: drop the reference; the unmap waits for the last one. */
 static ucs_status_t
 uct_cxi_md_mem_rcache_dereg(uct_md_h uct_md,
                             const uct_md_mem_dereg_params_t *params)
@@ -788,16 +673,7 @@ uct_cxi_md_mem_rcache_dereg(uct_md_h uct_md,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_md_mkey_pack - serialize the memory descriptor for restricted-mode
- * DMA.
- *
- * The initiator EP has the peer's {nid, pid, ptn} from device_addr and
- * iface_addr already; it needs only the memory-access fields from the rkey:
- *   iova  — iova_offset = cxi_md->iova - base_VA; lets ep_put_zcopy compute
- *            remote_iova = rkey->iova + remote_addr with a single addition
- *   lac   — Logical Address Context (page-table slot assigned by cxil_map)
- */
+/* Pack {iova_offset, lac}; the EP already has the peer's addresses. */
 static ucs_status_t
 uct_cxi_md_mkey_pack(uct_md_h mdh, uct_mem_h memh, void *address,
                      size_t length, const uct_md_mkey_pack_params_t *params,
@@ -873,14 +749,7 @@ uct_cxi_md_detect_memory_type(uct_md_h md, const void *address, size_t length,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ats_check - probe whether this LNI's hardware supports ATS.
- *
- * Attempts to map a small stack variable with CXI_MAP_ATS|CXI_MAP_PIN
- * (the probe flags used by libfabric).  A successful map + immediate unmap
- * confirms ATS is available; failure means the kernel or firmware does not
- * support it (returns 0 in that case).
- */
+/* Probe ATS support by mapping and unmapping a small variable. */
 static int uct_cxi_ats_check(struct cxil_lni *lni)
 {
     int            stack_var;
@@ -901,12 +770,8 @@ static int uct_cxi_ats_check(struct cxil_lni *lni)
 }
 
 /*
- * uct_cxi_ats_init - create the full-VA-space scalable ATS mapping.
- *
- * Maps VA 0 to 0xfffffffffffff000 with CXI_MAP_ATS (no CXI_MAP_PIN).
- * The resulting cxi_md carries a single LAC valid for every buffer.
- * Because the map starts at VA 0, iova_offset = ats_md->iova (base_VA = 0),
- * so ep_put_zcopy computes local_iova = ats_md->iova + buffer_VA uniformly.
+ * Map the whole VA space once with CXI_MAP_ATS (no pinning). The map starts at
+ * VA 0, so iova_offset = ats_md->iova.
  */
 static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
 {
@@ -938,12 +803,7 @@ static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
     return UCS_OK;
 }
 
-/*
- * ATS mem_reg: the scalable mapping covers every VA in the process.
- * Allocate a real uct_cxi_mem_handle_t so that ep_put_zcopy can access
- * iova_offset and lac uniformly regardless of ATS vs pinned mode.
- * iova_offset = ats_md->iova because the map starts at VA 0 (base_VA = 0).
- */
+/* ATS mem_reg: a handle with iova_offset = ats_md->iova. */
 static ucs_status_t
 uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
                        const uct_md_mem_reg_params_t *params,
@@ -997,10 +857,7 @@ uct_cxi_md_mem_ats_dereg(uct_md_h mdh,
     return UCS_OK;
 }
 
-/*
- * ATS mkey_pack: iova_offset = ats_md->iova (base_VA = 0), so the initiator
- * computes remote_iova = rkey->iova + remote_addr — same formula as pinned.
- */
+/* ATS mkey_pack: same formula as pinned, with iova_offset = ats_md->iova. */
 static ucs_status_t
 uct_cxi_md_mkey_pack_ats(uct_md_h mdh, uct_mem_h memh, void *address,
                          size_t length,
@@ -1110,11 +967,7 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
 
     nid = md->cxi_dev->info.nid;
 
-    /*
-     * Resolve which service ID / VNI to open this device with: prefer
-     * SLINGSHOT_* env vars injected by the launcher, else fall back to
-     * kernel-side service-membership discovery. See uct_cxi_get_rgroup_vni.
-     */
+    /* Service ID and VNI: launcher variables, else membership discovery. */
     status = uct_cxi_get_rgroup_vni(md->cxi_dev, dev_id, &svc_id, &vni);
     if (status != UCS_OK) {
         ucs_error("cxi no usable service found for device %s (dev_id %u): "
@@ -1127,12 +980,7 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     ucs_debug("cxi opening device %s dev_id %u svc_id %d vni %u",
               md_name, dev_id, svc_id, (unsigned)vni);
 
-    /*
-     * Validate the service: cxil_get_svc ensures the svc_id is known to the
-     * kernel and lets us read per-service resource limits (e.g. max TLEs).
-     * An absent or disabled service means the SLURM plugin didn't grant
-     * access — fail fast rather than hitting EKEYREVOKED on alloc_lni.
-     */
+    /* Fail fast on an unknown or disabled service rather than on alloc_lni. */
     ret = cxil_get_svc(md->cxi_dev, (unsigned)svc_id, &svc_desc);
     if (ret != 0) {
         ucs_error("cxil_get_svc dev %s svc_id %d failed: %s",
@@ -1148,12 +996,8 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
         goto err_close_dev;
     }
 
-    /*
-     * Allocate the LNI.  This is the authorization gate: the kernel checks
-     * the process's keyring credential (set by SLURM plugin) and returns
-     * EKEYREVOKED if the credential is absent or mismatched.  All subsequent
-     * resources (CMDQs, EVTQs, PTEs, memory maps) hang off this LNI.
-     */
+    /* The LNI is the authorization gate: EKEYREVOKED if the credential is
+         * missing or mismatched. */
     ret = cxil_alloc_lni(md->cxi_dev, &md->cxi_lni, (unsigned)svc_id);
     if (ret != 0) {
         ucs_error("cxil_alloc_lni dev %s svc_id %d failed: %s",
@@ -1178,16 +1022,8 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     md->ats_md          = NULL;
     md->dmabuf_enabled  = (cfg->enable_dmabuf != UCS_NO);
 
-    /*
-     * Optionally enable PCIe ATS scalable mapping.  ATS replaces per-buffer
-     * pinning with a single full-VA-space cxil_map; mem_reg becomes a no-op
-     * and IOVA is computed as ats_md->iova + VA at mkey_pack time.
-     *
-     * ATS takes priority over the rcache: if ATS is active there are no
-     * cxil_map calls per registration, so the cache would be pointless.
-     *
-     * Must be set up BEFORE uct_md_vfs_init and destroyed BEFORE the LNI.
-     */
+    /* ATS replaces per-buffer pinning and takes priority over the rcache. Set
+         * up before uct_md_vfs_init, destroyed before the LNI. */
     if (cfg->enable_ats != UCS_NO) {
         if (uct_cxi_ats_check(md->cxi_lni)) {
             status = uct_cxi_ats_init(md);
@@ -1211,16 +1047,8 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
         }
     }
 
-    /*
-     * Optionally create a registration cache (skipped when ATS is active).
-     * The cache eliminates repeated cxil_map/cxil_unmap calls for overlapping
-     * VA ranges.  When active, md->super.ops is replaced with the rcache
-     * variant.
-     *
-     * The rcache must be created BEFORE uct_md_vfs_init so that the VFS
-     * node can inspect rcache stats if desired.  It must be destroyed
-     * BEFORE the LNI in md_close because eviction calls cxil_unmap.
-     */
+    /* The rcache avoids repeated map/unmap of overlapping ranges (not with
+     * ATS). Create before uct_md_vfs_init, destroy before the LNI. */
     if (md->ats_md == NULL && cfg->enable_rcache != UCS_NO) {
         ucs_rcache_set_params(&rcache_params, &cfg->rcache);
         rcache_params.region_struct_size = sizeof(uct_cxi_rcache_region_t);

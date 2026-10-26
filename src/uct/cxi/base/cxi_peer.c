@@ -2,8 +2,8 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI connected-endpoint flow control: peer records and the control channel
- * handshake. See cxi_fc.h for the protocol.
+ * CXI connected-endpoint flow control: peer records, the handshake and the
+ * credit accounting. See cxi_fc.h for the protocol.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -13,8 +13,7 @@
 #include "cxi_iface.h"
 #include "cxi_ep.h"
 
-/* Normally only built when flow control is enabled (see Makefile.am); the
- * guard keeps a build that merely defines UCT_CXI_DISABLE_FC working too. */
+/* Only built with flow control (see Makefile.am). */
 #ifndef UCT_CXI_DISABLE_FC
 
 #include <ucs/debug/log.h>
@@ -33,9 +32,7 @@ static ucs_mpool_ops_t uct_cxi_fc_mpool_ops = {
 };
 
 
-/* The NID and PID of \a peer: worked out from the key (they are needed to log
- * or to send a control message, never per Active Message), so the record does
- * not hold them. */
+/* NID and PID of \a peer, derived from its key. */
 static UCS_F_ALWAYS_INLINE uint32_t
 uct_cxi_peer_nid(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer)
 {
@@ -49,10 +46,8 @@ uct_cxi_peer_pid(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer)
 }
 
 /*
- * Set \a timer on the wheel to go off in \a delay (not less than a slot, and
- * the wheel's own cap is a little over the longest delay used). The wheel is
- * only swept while it has timers, so when this is the first it may be far
- * behind: bring it up to date before anything is set on it.
+ * Set \a timer to go off in \a delay (at least one slot). The wheel is only
+ * swept while it has timers, so catch it up before adding the first.
  */
 static void uct_cxi_fc_timer_add(uct_cxi_iface_t *iface, ucs_wtimer_t *timer,
                                  ucs_time_t delay)
@@ -95,11 +90,9 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
     fc->pb_shift[0]     = uct_cxi_fc_pb_shift(slot_window,
                                               UCT_CXI_FC_PB_SLOT_BITS);
 
-    /* Hand credits back once this much is owed. The byte threshold leaves room
-     * for one maximum-size message: a sender blocked for lack of units has
-     * more than window - max_units outstanding, and once the target has
-     * processed all of it, that is more than the threshold, so a grant is
-     * always on its way. A class with no pool never asks for one. */
+    /* Grant once this much is owed. The byte threshold leaves room for one
+     * maximum-size message, so a sender blocked on units always has a grant
+     * on its way. A class with no pool never asks for one. */
     fc->grant_slots = ucs_max(1u, (uint32_t)(fc->slot_window * thresh));
     for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
         fc->unit_window[cls] = unit_window[cls];
@@ -110,8 +103,8 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
                                     unit_window[cls] - max_units[cls]));
     }
 
-    /* Random per interface instance, so a peer can tell a restarted process
-     * from the one it handshook with before. Never 0. */
+    /* Random per instance, to tell a restarted process from the one before.
+     * Never 0. */
     fc->epoch = (uint32_t)ucs_generate_uuid((uintptr_t)iface);
     if (fc->epoch == 0) {
         fc->epoch = 1;
@@ -130,8 +123,7 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
         goto err_peers;
     }
 
-    /* The resolution is the shortest retry delay: a timer can not be set for
-     * less than one slot. */
+    /* The resolution is the shortest retry delay. */
     status = ucs_twheel_init(&fc->twheel,
                              ucs_time_from_usec(UCT_CXI_CTRL_RETRY_BASE_US),
                              ucs_get_time());
@@ -160,8 +152,7 @@ void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface)
     });
     kh_destroy_inplace(uct_cxi_peer_hash, &fc->peers);
 
-    /* A handshake still going when the interface closes is normal: don't
-     * report it as a leak. */
+    /* Handshakes still going at close are not leaks. */
     ucs_mpool_cleanup(&fc->conn_pool, 0);
     ucs_twheel_cleanup(&fc->twheel);
 }
@@ -213,8 +204,7 @@ static uct_cxi_peer_t *uct_cxi_peer_lookup(uct_cxi_iface_t *iface,
            NULL : kh_value(&iface->fc.peers, iter);
 }
 
-/* A handshake is over (completed, failed, or not needed): stop resending, and
- * let the sends that were waiting on it run (or fail). */
+/* A handshake is over: stop resending and resume the sends waiting on it. */
 static void uct_cxi_peer_connected(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                    unsigned state)
 {
@@ -252,8 +242,8 @@ ucs_status_t uct_cxi_fc_reserve_slow(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
     case UCT_CXI_PEER_FAILED:
         return UCS_ERR_ENDPOINT_TIMEOUT;
     default:
-        /* Handshake still in flight. Not an interface resource: the pending
-         * queue waits for the CREP, which resumes it (see peer_connected). */
+        /* Handshake in flight: the pending queue waits for the CREP, which
+         * resumes it (uct_cxi_peer_connected). */
         iface->tx.credit_block = 1;
         return UCS_ERR_NO_RESOURCE;
     }
@@ -299,9 +289,7 @@ void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
     }
 }
 
-/* Apply a cumulative "processed so far" counter from a peer: \a wire is the
- * peer's full counter, truncated to \a bits bits. Spend nothing new if it is
- * not ahead of what was last applied (a duplicate or reordered grant). */
+/* Signed distance of the \a bits-bit wire counter from \a last. */
 static UCS_F_ALWAYS_INLINE int32_t
 uct_cxi_fc_grant_delta(uint32_t wire, uint32_t last, unsigned bits)
 {
@@ -311,11 +299,11 @@ uct_cxi_fc_grant_delta(uint32_t wire, uint32_t last, unsigned bits)
 }
 
 /*
- * Apply one cumulative counter from a peer: \a wire is the low \a bits bits
- * of the peer's counter in granules of 2^\a shift, and \a *last the whole
- * counter as last applied. Nothing is added if the wire value is not ahead of
- * it (a duplicate or reordered grant); otherwise the counter moves forward
- * to the granule, and \a *avail gets the difference. Returns whether it did.
+ * Apply a cumulative counter: \a wire is the low \a bits bits of the peer's
+ * counter in granules of 2^\a shift, \a *last the whole counter as last
+ * applied. A value not ahead of it (duplicate or reordered) adds nothing;
+ * otherwise \a *last advances and \a *avail gets the difference. Returns
+ * whether it advanced.
  */
 static UCS_F_ALWAYS_INLINE int
 uct_cxi_fc_apply_counter(uint32_t *last, int32_t *avail, uint32_t wire,
@@ -335,8 +323,8 @@ uct_cxi_fc_apply_counter(uint32_t *last, int32_t *avail, uint32_t wire,
     return 1;
 }
 
-/* The counters of a grant: \a slots, and the space of each class in \a
- * units. \a shift is the granule of each (NULL: counted exactly). */
+/* Apply a grant's counters: \a slots and \a units per class, in granules of
+ * \a shift (NULL: exact). */
 static void uct_cxi_fc_apply_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                    uint32_t slots,
                                    const uint32_t units[UCT_CXI_FC_NUM_CLASSES],
@@ -368,9 +356,8 @@ void uct_cxi_fc_apply_piggyback(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
     uint32_t units[UCT_CXI_FC_NUM_CLASSES];
     unsigned cls;
 
-    /* Before the handshake completes we do not know the peer's epoch, and
-     * have no credits to add to. The values are cumulative: the next one
-     * carries the same information. */
+    /* Before the handshake completes the peer's epoch is unknown; the next
+     * piggyback carries the same cumulative values. */
     if ((peer->state != UCT_CXI_PEER_UP) ||
         (((match_bits >> UCT_CXI_FC_PB_EPOCH_SHIFT) &
           UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_EPOCH_BITS)) !=
@@ -396,12 +383,10 @@ void uct_cxi_fc_refund(uct_cxi_iface_t *iface, uct_cxi_ep_t *ep, unsigned cls,
 {
     uct_cxi_peer_t *peer = ep->peer;
 
-    /* The send never reached the target's software, which therefore will
-     * never hand its credits back: take them back here. */
+    /* The target never saw the send, so it will not return the credits. */
     uct_cxi_fc_reclaim(iface, peer, cls, slots, units);
 
-    /* A credit grant may have gone with it. (Only Active Messages carry
-     * them.) */
+    /* A grant may have been lost with it (only Active Messages carry them). */
     if (cls == UCT_CXI_FC_AM) {
         uct_cxi_fc_resync(iface, peer);
     }
@@ -459,8 +444,8 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
         unsigned        cls;
 
         if (rc == C_RC_OK) {
-            /* Delivered: no need to say it again (a later grant may already
-             * have overtaken this one, hence the "only forward" test). */
+            /* Delivered (only move forward: a later grant may have
+             * overtaken). */
             if ((int32_t)(req->grant_slots - peer->rx.acked_slots) > 0) {
                 peer->rx.acked_slots = req->grant_slots;
             }
@@ -492,8 +477,7 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                       uct_cxi_peer_pid(iface, req->peer));
             uct_cxi_peer_connected(iface, req->peer, UCT_CXI_PEER_LEGACY);
         } else {
-            /* A CREQ is resent until answered and a lost CREP is answered
-             * by the next CREQ, so nothing to do here. */
+            /* A lost CREQ is resent and a lost CREP answers the next CREQ. */
             ucs_debug("cxi control message %u to nid 0x%x pid %u failed: rc=%d",
                       req->type, uct_cxi_peer_nid(iface, req->peer),
                       uct_cxi_peer_pid(iface, req->peer), rc);
@@ -522,9 +506,8 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
 
     switch (UCT_CXI_CTRL_TYPE(mb)) {
     case UCT_CXI_CTRL_CREQ:
-        /* The requester's identity is the event's initiator: create its
-         * record if this is the first we hear of it (without starting a
-         * handshake of our own: each direction is independent). */
+        /* The requester is the event's initiator. Create its record without
+         * starting a handshake of our own. */
         peer = uct_cxi_peer_get(iface, CXI_MATCH_ID_EP(md->pid_bits, process),
                                 CXI_MATCH_ID_PID(md->pid_bits, process));
         if (peer == NULL) {
@@ -532,14 +515,13 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
             return;
         }
         if ((peer->rx_epoch != 0) && (peer->rx_epoch != (uint32_t)hd)) {
-            /* The requester restarted: what we owed its previous incarnation
-             * means nothing to this one. */
+            /* The requester restarted: drop what we owed its previous
+             * incarnation. */
             memset(&peer->rx, 0, sizeof(peer->rx));
         }
         peer->rx_epoch = (uint32_t)hd;
 
-        /* Fire and forget: if this reply is lost, the requester resends its
-         * CREQ and gets another. */
+        /* Fire and forget: a lost reply makes the requester resend. */
         (void)uct_cxi_ctrl_send(
                 iface, peer, UCT_CXI_CTRL_CREP,
                 UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREP, iface->fc.epoch,
@@ -565,9 +547,7 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
         }
         peer->remote_epoch = UCT_CXI_CTRL_EPOCH24(mb);
 
-        /* The grant is the whole window: nothing has been spent yet. The
-         * granule of the counters its piggybacks carry follows from it, as it
-         * did for the peer when it sent it. */
+        /* The grant is the whole window; the piggyback granule follows. */
         memset(&peer->tx, 0, sizeof(peer->tx));
         peer->tx.avail_slots = UCT_CXI_CREP_SLOTS(hd);
         peer->pb_shift[0]    = uct_cxi_fc_pb_shift(UCT_CXI_CREP_SLOTS(hd),
@@ -613,10 +593,8 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
  */
 
 /*
- * Send \a conn's peer a CREQ and arm the timer for the next one (or for the
- * deadline). A CREQ that could not go out (no control slot, command queue
- * full) is tried again after the shortest delay, and does not count as an
- * attempt.
+ * Send \a conn's peer a CREQ and arm the timer for the next one. A CREQ that
+ * could not go out is retried after the shortest delay, uncounted.
  */
 static void uct_cxi_peer_conn_attempt(uct_cxi_peer_conn_t *conn)
 {
@@ -706,9 +684,8 @@ static int uct_cxi_fc_owed(const uct_cxi_peer_t *peer)
 }
 
 /*
- * uct_cxi_fc_send_grant -- tell \a peer how much of its traffic we have
- * processed, cumulatively. UCS_ERR_NO_RESOURCE (no control slot, command queue
- * full) leaves it queued to try again from progress.
+ * Tell \a peer how much of its traffic we have processed (cumulative).
+ * UCS_ERR_NO_RESOURCE if the control channel is full.
  */
 static ucs_status_t uct_cxi_fc_send_grant(uct_cxi_iface_t *iface,
                                           uct_cxi_peer_t *peer)
@@ -734,8 +711,7 @@ static ucs_status_t uct_cxi_fc_send_grant(uct_cxi_iface_t *iface,
     return status;
 }
 
-/* Put \a peer on the list of those waiting for a GRANT (see
- * uct_cxi_fc_flush_grants). */
+/* Queue \a peer for a GRANT (uct_cxi_fc_flush_grants). */
 static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 {
     if (ucs_list_is_empty(&peer->grants)) {
@@ -755,10 +731,8 @@ void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 }
 
 /*
- * Send the GRANTs that are waiting, oldest first, until one cannot be sent
- * (the TX queue is full: the others could not be either). Called from every
- * progress round while any wait, before the sends waiting in pending queues
- * get the room.
+ * Send the waiting GRANTs, oldest first, until the control channel is full.
+ * Called every progress round while any wait.
  */
 void uct_cxi_fc_flush_grants(uct_cxi_iface_t *iface)
 {

@@ -2,36 +2,18 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI UCT Active Message operations -- ep_am_short, ep_am_bcopy, ep_am_zcopy.
+ * CXI Active Message operations: am_short, am_bcopy, am_zcopy.
  *
- * TX model
- * ────────
- * All three send an unrestricted message to the remote AM PTE, addressed by
- * ep->dfa_am (NID+PID+pid_offset); no rkey is exchanged. Each is counted
- * against its ep and the interface's TX queue until its completion event, and
- * is charged against the credits the target granted (see cxi_fc.h).
+ * TX: each sends an unrestricted message to the remote AM PTE (ep->dfa_am),
+ * counted against its ep and the TX queue until its completion, and charged
+ * against the credits the target granted (cxi_fc.h).
+ *   short: an IDC message, no descriptor; its completion carries the ep and
+ *          the charge in its user_ptr (cxi_ep.h).
+ *   bcopy: a desc from desc_pool, packed, then a C_CMD_PUT; freed on the ACK.
+ *   zcopy: a C_CMD_PUT from the caller's registered buffer.
  *
- * ep_am_short (header + payload <= C_MAX_IDC_PAYLOAD_UNR):
- *   An unrestricted IDC message: the NIC takes the bytes from the command
- *   queue, so there is no descriptor and the caller's buffers are reusable at
- *   once. Its completion (an ACK on the TX EQ) carries the ep and the
- *   message's flow-control charge in its user_ptr, see cxi_ep.h.
- *
- * ep_am_bcopy (<= max_bcopy):
- *   Takes a pre-registered uct_cxi_send_desc_t from desc_pool, fills it with
- *   pack_cb, and posts a C_CMD_PUT from it. The descriptor goes back to the
- *   pool on the ACK. Returns the number of bytes packed.
- *
- * ep_am_zcopy (<= max_zcopy):
- *   Posts a C_CMD_PUT straight from the caller's registered buffer; the
- *   caller's completion fires on the ACK.
- *
- * RX model
- * ────────
- * iface_progress sees C_EVENT_PUT on the AM list, reads buffer_id to find
- * which buffer of the receive ring the NIC wrote into, and calls
- * uct_iface_invoke_am. The ring (several buffers, each a manage_local list
- * entry that unlinks itself near its end and is reposted) is managed in
+ * RX: progress sees C_EVENT_PUT on the AM list, finds the ring buffer from
+ * buffer_id and calls uct_iface_invoke_am. The ring is managed in
  * cxi_iface.c.
  */
 
@@ -59,10 +41,7 @@ uct_cxi_am_ep_iface(uct_cxi_ep_t *ep)
     return ucs_derived_of(ep->super.super.iface, uct_cxi_iface_t);
 }
 
-/*
- * AM bcopy completion: the bounce-buffer desc holds the sent payload.
- * No user callback for bcopy put — just return the descriptor.
- */
+/* AM bcopy completion: just return the descriptor. */
 static void uct_cxi_am_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
     ucs_mpool_put((uct_cxi_send_desc_t *)op);
@@ -75,14 +54,8 @@ static void uct_cxi_am_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
  */
 
 /*
- * uct_cxi_ep_am_short — unrestricted IDC AM send (≤ 184 B payload).
- *
- * Sends [header(8B)|payload] as one inline IDC message (see
- * uct_cxi_ep_idc_send). The NIC places the data in the remote AM list at its
- * managed write pointer. The send is tracked by its completion, which is what
- * lets a send that never arrived be noticed and its credits taken back.
- *
- * Returns UCS_OK on the same turn; caller's buffers are reusable immediately.
+ * Send [header(8B)|payload] (payload up to 184 B) as one inline IDC message.
+ * The caller's buffers are reusable on return.
  */
 ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
                                   uint64_t header, const void *payload,
@@ -145,15 +118,10 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
  */
 
 /*
- * uct_cxi_ep_send_rndv_hdr_announce -- one-time-per-ep control message
- * carrying {ep_id, md_index, where our rendezvous address table is} to the
- * peer, over the same unrestricted IDC path as uct_cxi_ep_am_short() above,
- * but with UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG set in match_bits instead of a real
- * am_id -- the receiver's AM dispatch (cxi_iface.c) checks that bit before
- * ever calling uct_iface_invoke_am(), routing this to
- * uct_cxi_iface_handle_rndv_hdr_announce() (cxi_tag.c) instead. To the flow
- * control it is an ordinary Active Message (credited, tracked); it is not
- * resent if it is lost, only sent again if the send was refused.
+ * Once per ep, send {ep_id, md_index, rendezvous address table} to the peer as
+ * an AM with UCT_CXI_RNDV_HDR_ANNOUNCE_FLAG in match_bits, which the receiver
+ * routes to uct_cxi_iface_handle_rndv_hdr_announce(). Credited and tracked
+ * like any AM; resent only if the send was refused.
  */
 ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
                                                 uint64_t ep_id,
@@ -205,18 +173,7 @@ ucs_status_t uct_cxi_ep_send_rndv_hdr_announce(uct_cxi_ep_t *ep,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ep_am_bcopy — unrestricted DMA AM send via bounce buffer.
- *
- * Acquires a pre-registered uct_cxi_send_desc_t from desc_pool (shared with
- * RMA put_bcopy), calls pack_cb to fill the data area, then posts a
- * c_full_dma_cmd C_CMD_PUT with restricted=0 targeting the remote AM PTE.
- * The NIC delivers data to the remote OVERFLOW LE; the remote iface_progress
- * sees C_EVENT_PUT and dispatches to the AM handler.
- *
- * Returns the number of bytes packed (ssize_t) on success.
- * Source data is in the transport's bounce buffer until C_EVENT_ACK.
- */
+/* AM via a bounce buffer from desc_pool. Returns the packed length. */
 ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
                              uct_pack_callback_t pack_cb, void *arg,
                              unsigned flags)
@@ -235,12 +192,9 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
-    /* The length is only known once it is packed, and pack_cb must run once:
-     * so ask only for one unit now (any credit at all) and charge the real
-     * cost afterwards. Credits may thereby dip below zero by up to one bcopy
-     * (max_bcopy bytes), which the byte window's slack absorbs; what matters
-     * is that a 1-byte message is never refused for want of room for a big
-     * one. */
+    /* The length is known only after packing, which must run once: reserve one
+     * unit now and charge the real cost afterwards (credits may dip below zero
+     * by up to one bcopy). */
     status = uct_cxi_fc_reserve(ep, iface, UCT_CXI_FC_AM,
                                 UCT_CXI_FC_SLOTS_AM, 1, &credited);
     if (ucs_unlikely(status != UCS_OK)) {
@@ -317,22 +271,10 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
  */
 
 /*
- * uct_cxi_ep_am_zcopy — unrestricted DMA AM send directly from user buffer.
- *
- * Zero-copy: the NIC DMAs from the caller's registered IOV buffer into the
- * remote AM PRIORITY ME.  The caller must keep the buffer valid until the
- * completion fires (C_EVENT_ACK → uct_invoke_completion).
- *
- * Header handling (max_hdr = 8, CXI has no send-side scatter-gather):
- *   Contiguous (header + header_length == iov[0].buffer):
- *     Single DMA from header pointer for header_length + iov_length.
- *   Non-contiguous (header from stack / different allocation):
- *     Header packed into cmd.header_data (8 bytes out-of-band).
- *     UCT_CXI_AM_HDR_FLAG set in match_bits.  Receiver prepends
- *     header_data before payload in the ME buffer.
- *
- * max_zcopy = buf_size - 8: payload must fit in one receiver ME buffer
- * (8 bytes reserved for header_data prepend).
+ * AM straight from the caller's registered buffer (no send-side gather). A
+ * header contiguous with the payload goes in one DMA; otherwise it travels
+ * in cmd.header_data with UCT_CXI_AM_HDR_FLAG set, and the receiver prepends
+ * it to the payload. The payload plus 8 bytes must fit one receive buffer.
  */
 ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
                                   const void *header, unsigned header_length,
