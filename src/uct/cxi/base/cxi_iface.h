@@ -36,8 +36,7 @@
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
 /* RX EQ slots, beyond what flow control accounts for, that sizing from the
  * credit windows leaves free: events are acknowledged to the NIC in batches,
- * so processed ones still hold slots for a moment, and control messages
- * (handshake, grants) are not credited. */
+ * so processed ones still hold slots for a moment. */
 #define UCT_CXI_EQ_SLACK       128U
 /* Flow-control credit unit: byte windows are counted in these, and a message
  * costs event slots plus UCT_CXI_FC_UNITS(len) byte credits of its class.
@@ -93,6 +92,14 @@ typedef enum {
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
+
+/* Control channel: the most control messages in flight (their completions
+ * hold the slots reserved in the control event queue), the depth of the
+ * command queue they go through (a message takes two commands), and the
+ * default depth of the event queue (UCX_CXI_CTRL_EQ_SIZE). */
+#define UCT_CXI_CTRL_MAX_INFLIGHT   64U
+#define UCT_CXI_CTRL_CMDQ_DEPTH     256U
+#define UCT_CXI_CTRL_EQ_NUM_EVENTS  256U
 
 /* AM receive ring.  UCX_CXI_AM_RX_BUF_SIZE and UCX_CXI_AM_RX_NUM_BUFS are
  * "auto" by default: the ring is sized from the credit windows (see
@@ -244,6 +251,10 @@ typedef struct uct_cxi_iface_config {
                                                     the ring and RX EQ are
                                                     sized for                  */
 #ifndef UCT_CXI_DISABLE_FC
+    unsigned                  ctrl_eq_size;    /**< Control event queue depth.
+                                                    -1 sentinel resolves to
+                                                    UCT_CXI_CTRL_EQ_NUM_EVENTS
+                                                    */
     int                       fc_enable;       /**< Handshake with peers and
                                                     open the control PTE       */
     double                    fc_connect_timeout; /**< Give up on a peer's
@@ -292,7 +303,7 @@ typedef struct uct_cxi_pte_fc {
  * hardware can report on a command queue's event queue
  * (C_EVENT_COMMAND_FAILURE, C_EVENT_ERROR). Those never occur in normal
  * operation; if more arrive than this holds, the queue drops the extras and
- * progress reports the drop. (Control messages are counted, like any send.) */
+ * progress reports the drop. (Control messages have a queue of their own.) */
 #define UCT_CXI_TX_EQ_UNTRACKED  8U
 
 /* Defined in cxi_tag.h (included after this header, via cxi_ep.h); only a
@@ -468,6 +479,29 @@ typedef struct uct_cxi_eq {
         size_t         pending_len;    /**< Byte length of pending_buf     */
     } grow;
 } uct_cxi_eq_t;
+
+#ifndef UCT_CXI_DISABLE_FC
+/**
+ * The control channel (cxi_ctrl.c): a PTE of its own, with its own event
+ * queue and command queue, so that control traffic neither shares the queues
+ * of the data path nor depends on their room. Its event queue holds what
+ * arrives at the PTE (C_EVENT_PUT) and the completions of what is sent
+ * (C_EVENT_ACK); the slots for the completions are reserved.
+ */
+typedef struct uct_cxi_ctrl {
+    int                   enabled;      /**< Opened (FC_ENABLE) */
+    uct_cxi_eq_t          eq;
+    struct cxi_cq         *cmdq;         /**< Where control messages are sent */
+    struct cxil_pte      *pte;
+    struct cxil_pte_map  *pte_map;
+    ucs_mpool_t           req_pool;     /**< uct_cxi_ctrl_req_t */
+    unsigned              outstanding;  /**< Control messages in flight */
+    unsigned              max_inflight; /**< Cap on outstanding: every message
+                                             yields one completion, for which
+                                             the event queue has a slot
+                                             reserved */
+} uct_cxi_ctrl_t;
+#endif
 
 /*
  * Endpoints destroyed with sends still in flight (uct_cxi_ep_destroy): their
@@ -829,6 +863,7 @@ typedef struct uct_cxi_iface {
 #ifndef UCT_CXI_DISABLE_FC
     /* ── Connected-endpoint flow control (peers + control channel) ──── */
     uct_cxi_fc_iface_t    fc;
+    uct_cxi_ctrl_t        ctrl;
 #endif
 
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */
@@ -948,6 +983,13 @@ ucs_status_t uct_cxi_iface_event_fd_get(uct_iface_h tl_iface, int *fd_p);
 BEGIN_C_DECLS
 
 /* cxi_iface.c */
+void         uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name,
+                                  unsigned num_events, unsigned reserved_slots,
+                                  int grow_enabled,
+                                  const uct_cxi_iface_config_t *config);
+ucs_status_t uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
+                             struct cxil_wait_obj *wait_obj);
+void         uct_cxi_eq_cleanup(uct_cxi_eq_t *eq);
 void         uct_cxi_fc_windows(const uct_cxi_iface_config_t *config,
                                 size_t am_max_msg, size_t tag_max_msg,
                                 uint32_t *slot_window_p,
@@ -965,9 +1007,24 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
                              uint32_t slot_window,
                              const uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES]);
 void         uct_cxi_fc_cleanup(uct_cxi_iface_t *iface);
-ucs_status_t uct_cxi_iface_open_ctrl_pte(uct_cxi_iface_t *iface,
-                                         struct cxil_lni *lni);
-void         uct_cxi_iface_close_ctrl_pte(uct_cxi_iface_t *iface);
+
+/* cxi_ctrl.c */
+ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
+                               const uct_cxi_iface_config_t *config,
+                               struct cxil_lni *lni);
+void         uct_cxi_ctrl_close(uct_cxi_iface_t *iface);
+
+/**
+ * Send a control message to \a peer's control PTE; UCS_ERR_NO_RESOURCE if the
+ * channel has no room (retry later). \a grant_slots and \a grant_units are
+ * what a GRANT carries, and are handed back with its completion.
+ */
+ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
+                               unsigned type, uint64_t match_bits,
+                               uint64_t header_data, uint32_t grant_slots,
+                               const uint32_t *grant_units);
+
+/* cxi_peer.c */
 
 /**
  * Find or create the peer record for remote interface (\a nid, \a pid).

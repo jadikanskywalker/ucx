@@ -316,20 +316,6 @@ typedef struct uct_cxi_fc_iface {
      * came from, to spare a hash lookup per message. */
     uint32_t          rx_cache_key;
     uct_cxi_peer_t   *rx_cache_peer;
-    ucs_mpool_t       ctrl_req_pool; /**< uct_cxi_ctrl_req_t: a control message
-                                          is counted in iface->tx.outstanding
-                                          like any send, so there are never
-                                          more than max_inflight of them */
-
-    /* Control PTE: matching, one persistent zero-length list entry that
-     * accepts every message, so control traffic consumes no buffer and can
-     * only be refused when the receive event queue is full. */
-    struct {
-        struct cxil_pte      *pte;
-        struct cxil_pte_map  *pte_map;
-        uint16_t              ptn;   /**< cached for the event dispatch */
-        uct_cxi_pte_fc_t      fc;
-    } ctrl;
 } uct_cxi_fc_iface_t;
 
 #endif /* UCT_CXI_FC_H */

@@ -172,10 +172,6 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
  */
 #define UCT_CXI_USER_PTR_SHORT  1ULL
 
-/* A user_ptr that is a pointer to a control request (cxi_fc.h), not an op or
- * an ep. */
-#define UCT_CXI_USER_PTR_CTRL   2ULL
-
 /* Set in the user_ptr of a tracked short charged to the tag class. */
 #define UCT_CXI_USER_PTR_TAG    4ULL
 
@@ -257,7 +253,6 @@ uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep,
                       unsigned cls, unsigned units, int credited)
 {
     ucs_assert(((uintptr_t)ep & (UCT_CXI_USER_PTR_SHORT |
-                                 UCT_CXI_USER_PTR_CTRL |
                                  UCT_CXI_USER_PTR_TAG)) == 0);
     ucs_assert(((uint64_t)(uintptr_t)ep & ~UCT_CXI_USER_PTR_PTR_MASK) == 0);
     ucs_assert(units <= UCT_CXI_USER_PTR_UNITS_MASK);

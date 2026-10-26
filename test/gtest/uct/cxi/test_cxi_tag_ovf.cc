@@ -937,8 +937,6 @@ protected:
          * the one whose user_ptr is the rendezvous operation. */
         const ack_rec *mine = NULL;
         for (size_t i = 0; i < acks.size(); i++) {
-            EXPECT_FALSE(acks[i].user_ptr & UCT_CXI_USER_PTR_CTRL)
-                    << "a control message's ACK was read raw";
             if ((kind != SEND_RNDV) ||
                 (acks[i].user_ptr == (uint64_t)(uintptr_t)rop)) {
                 mine = &acks[i];

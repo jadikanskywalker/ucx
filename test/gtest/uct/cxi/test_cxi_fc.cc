@@ -173,7 +173,7 @@ protected:
 UCS_TEST_P(test_cxi_fc_legacy, peer_without_control_channel)
 {
     ASSERT_NE(nullptr, cxi_iface(sender()));
-    ASSERT_EQ(nullptr, cxi_iface(receiver())->fc.ctrl.pte)
+    ASSERT_EQ(nullptr, cxi_iface(receiver())->ctrl.pte)
             << "FC_ENABLE=n must not open the control PTE";
 
     sender().connect_to_iface(0, receiver());
@@ -278,7 +278,7 @@ UCS_TEST_P(test_cxi_fc_off, no_peers_when_disabled)
     uct_cxi_iface_t *siface = ucs_derived_of(sender().iface(), uct_cxi_iface_t);
 
     EXPECT_EQ(nullptr, ucs_derived_of(sender().ep(0), uct_cxi_ep_t)->peer);
-    EXPECT_EQ(nullptr, siface->fc.ctrl.pte);
+    EXPECT_EQ(nullptr, siface->ctrl.pte);
     EXPECT_EQ(0u, kh_size(&siface->fc.peers));
 }
 
@@ -369,23 +369,24 @@ UCS_TEST_P(test_cxi_fc_credits, sends_block_without_credits_then_resume)
 }
 
 /**
- * A credit grant that finds the TX queue full waits, and goes when there is
- * room again, with nothing else in flight to announce it (so it is the
- * timer's retry that sends it). Until then the sender has not got the
- * credits back.
+ * A credit grant that finds the control channel full waits, and goes when
+ * there is room again, with nothing else in flight to announce it (so it is
+ * the retry of the progress loop that sends it). Until then the sender has
+ * not got the credits back.
  */
-UCS_TEST_P(test_cxi_fc_credits, grant_waits_for_tx_room_then_goes)
+UCS_TEST_P(test_cxi_fc_credits, grant_waits_for_control_room_then_goes)
 {
     count_receives();
     cxi_connect(sender(), 0, receiver());
     uct_ep_h         ep     = sender().ep(0);
     uct_cxi_peer_t  *peer   = peer_of(sender(), 0);
     uct_cxi_iface_t *riface = cxi_iface(receiver());
-    unsigned         saved  = riface->tx.max_inflight;
+    unsigned         saved  = riface->ctrl.max_inflight;
     unsigned         sent   = 0;
 
-    /* As far as the receiver knows its TX queue has no room for a message. */
-    riface->tx.max_inflight = 0;
+    /* As far as the receiver knows its control channel has no room for a
+     * message. */
+    riface->ctrl.max_inflight = 0;
 
     /* Half a window, the threshold at which the receiver owes a grant. */
     while (sent < MSG_WINDOW / 2) {
@@ -405,7 +406,7 @@ UCS_TEST_P(test_cxi_fc_credits, grant_waits_for_tx_room_then_goes)
             << "credits came back although there was no room to send them";
     EXPECT_FALSE(ucs_list_is_empty(&riface->fc.grants));
 
-    riface->tx.max_inflight = saved;
+    riface->ctrl.max_inflight = saved;
     ASSERT_TRUE(progress_until([&]() {
         return peer->tx.avail_slots == (int)MSG_WINDOW;
     })) << "the waiting grant was never sent";

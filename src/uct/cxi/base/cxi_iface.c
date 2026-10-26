@@ -295,6 +295,16 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      UCS_CONFIG_TYPE_UINT},
 
 #ifndef UCT_CXI_DISABLE_FC
+    {"CTRL_EQ_SIZE", "-1",
+     "Control event queue depth (number of hardware events): the control\n"
+     "messages that arrive (handshakes, credit grants) and the completions\n"
+     "of those sent, which have slots of their own reserved (64). -1\n"
+     "(default) resolves to 256. A message that arrives when no slot is\n"
+     "free is refused and sent again by its sender. Rounded up to a whole\n"
+     "number of pages (64 events).",
+     ucs_offsetof(uct_cxi_iface_config_t, ctrl_eq_size),
+     UCS_CONFIG_TYPE_INT},
+
     {"FC_ENABLE", "y",
      "Connected-endpoint flow control: open the control PTE and handshake\n"
      "with each peer when an endpoint to it is created. When off, this\n"
@@ -766,7 +776,7 @@ ucs_status_t uct_cxi_query_devices(uct_md_h md,
  * uct_cxi_eq_init() and the poll loop consume. \a num_events is rounded up to
  * whole pages: the driver requires a page-aligned queue length.
  */
-static void
+void
 uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name, unsigned num_events,
                      unsigned reserved_slots, int grow_enabled,
                      const uct_cxi_iface_config_t *config)
@@ -981,7 +991,7 @@ uct_cxi_iface_rx_eq_events(const uct_cxi_iface_config_t *config,
  * have filled in eq->num_events, eq->reserved_slots_cfg and eq->grow.* (the
  * resolved config) beforehand.
  */
-static ucs_status_t
+ucs_status_t
 uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
                 struct cxil_wait_obj *wait_obj)
 {
@@ -1064,7 +1074,7 @@ static void uct_cxi_eq_abort_resize(uct_cxi_eq_t *eq)
  * uct_cxi_eq_cleanup -- destroy the hardware queue and release its buffer.
  * Everything bound to the queue (PTEs, command queues) must already be gone.
  */
-static void uct_cxi_eq_cleanup(uct_cxi_eq_t *eq)
+void uct_cxi_eq_cleanup(uct_cxi_eq_t *eq)
 {
     int ret;
 
@@ -1459,12 +1469,12 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
 
 #ifndef UCT_CXI_DISABLE_FC
     /* Step 17: connected-endpoint flow control -- per-peer state and the
-     * control PTE its handshake runs on. */
+     * control channel its handshake runs on. */
     status = uct_cxi_fc_init(self, config, slot_window, unit_window);
     if (status != UCS_OK) {
         goto err_rdzv_pte;
     }
-    status = uct_cxi_iface_open_ctrl_pte(self, lni);
+    status = uct_cxi_ctrl_open(self, config, lni);
     if (status != UCS_OK) {
         goto err_fc;
     }
@@ -1568,7 +1578,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_cxi_iface_t)
 
 #ifndef UCT_CXI_DISABLE_FC
     /* Opened last, closed first. */
-    uct_cxi_iface_close_ctrl_pte(self);
+    uct_cxi_ctrl_close(self);
     uct_cxi_fc_cleanup(self);
 #endif
 
@@ -1834,9 +1844,6 @@ static void uct_cxi_iface_recover_ptes(uct_cxi_iface_t *iface)
     uct_cxi_iface_pte_recover(iface, iface->am.pte, &iface->am.fc);
     uct_cxi_iface_pte_recover(iface, iface->tag.pte, &iface->tag.fc);
     uct_cxi_iface_pte_recover(iface, iface->rdzv.pte, &iface->rdzv.fc);
-#ifndef UCT_CXI_DISABLE_FC
-    uct_cxi_iface_pte_recover(iface, iface->fc.ctrl.pte, &iface->fc.ctrl.fc);
-#endif
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         uct_cxi_iface_pte_recover(iface, iface->rma.pte[lac],
                                   &iface->rma.fc[lac]);
@@ -1868,12 +1875,6 @@ uct_cxi_iface_pte_by_index(uct_cxi_iface_t *iface, uint16_t ptlte_index,
         *pte_p = iface->rdzv.pte;
         return &iface->rdzv.fc;
     }
-#ifndef UCT_CXI_DISABLE_FC
-    if ((iface->fc.ctrl.pte != NULL) && (ptlte_index == iface->fc.ctrl.ptn)) {
-        *pte_p = iface->fc.ctrl.pte;
-        return &iface->fc.ctrl.fc;
-    }
-#endif
     for (lac = 0; lac < iface->rma.lac_count; lac++) {
         if ((iface->rma.pte[lac] != NULL) &&
             (ptlte_index == iface->rma.pte[lac]->ptn)) {
@@ -2265,13 +2266,14 @@ uct_cxi_iface_ep_release(uct_cxi_iface_t *iface, uct_cxi_ep_t *ep)
 
 /*
  * What each event queue holds. The TX queue gets the completions (ACK, REPLY)
- * of the commands issued with it as their cmd.eq; everything else is raised by
- * a PTE and lands on the RX queue, with the REPLY of the few Gets issued from
- * an event handler, which point at the RX queue so that they need no TX queue
- * slot (the address read of an unexpected rendezvous, the software rendezvous
- * Get) and the REPLY of the NIC's own rendezvous Gets. The two queues are
- * polled and dispatched by separate functions, so neither pays for the kinds
- * of event only the other can get.
+ * of the commands issued with it as their cmd.eq; everything raised by a PTE
+ * of the data path lands on the RX queue, with the REPLY of the few Gets
+ * issued from an event handler, which point at the RX queue so that they need
+ * no TX queue slot (the address read of an unexpected rendezvous, the
+ * software rendezvous Get) and the REPLY of the NIC's own rendezvous Gets. The
+ * control queue has the control PTE's arrivals and the completions of the
+ * control messages. The queues are polled and dispatched by separate
+ * functions, so none pays for the kinds of event only another can get.
  */
 #define UCT_CXI_TX_EVENT_MASK  (UCS_BIT(C_EVENT_ACK) | UCS_BIT(C_EVENT_REPLY))
 
@@ -2349,9 +2351,8 @@ uct_cxi_iface_rx_drain_step(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq)
 /*
  * TX queue: an event is the completion of a send we issued. Whatever the send
  * was, its user_ptr says how to account it: an IDC short is tracked by its ep
- * alone (and carries its flow-control charge in the pointer), a control
- * message by its request, anything else by a send op, whose ep is never NULL on
- * this queue.
+ * alone (and carries its flow-control charge in the pointer), anything else
+ * by a send op, whose ep is never NULL on this queue.
  */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_iface_handle_tx_event(uct_cxi_iface_t *iface,
@@ -2395,13 +2396,6 @@ uct_cxi_iface_handle_tx_event(uct_cxi_iface_t *iface,
                 (unsigned)((user_ptr >> UCT_CXI_USER_PTR_UNITS_SHIFT) &
                            UCT_CXI_USER_PTR_UNITS_MASK));
         uct_cxi_iface_ep_release(iface, ep);
-#ifndef UCT_CXI_DISABLE_FC
-    } else if (ucs_unlikely(user_ptr & UCT_CXI_USER_PTR_CTRL)) {
-        /* Flow-control control message, not tied to any ep. */
-        uct_cxi_iface_ctrl_tx_done(
-                iface, (uct_cxi_ctrl_req_t *)(uintptr_t)(
-                        user_ptr & ~UCT_CXI_USER_PTR_CTRL), event);
-#endif
     } else {
         uct_cxi_send_op_t *op = (uct_cxi_send_op_t *)(uintptr_t)user_ptr;
         uct_cxi_ep_t      *ep = op->ep;
@@ -2530,12 +2524,6 @@ uct_cxi_iface_rx_put(uct_cxi_iface_t *iface, const union c_event *event)
         } else {
             uct_cxi_iface_tag_handle_eager_match(iface, event);
         }
-#ifndef UCT_CXI_DISABLE_FC
-    } else if (ucs_unlikely(event->tgt_long.ptlte_index ==
-                            iface->fc.ctrl.ptn)) {
-        /* Flow-control control channel (handshake). */
-        uct_cxi_iface_handle_ctrl_msg(iface, event);
-#endif
     } else if (ucs_unlikely(event->tgt_long.return_code != C_RC_OK)) {
         uct_cxi_iface_am_put_failed(iface, event);
     } else {
@@ -2749,33 +2737,90 @@ uct_cxi_iface_poll_tx(uct_cxi_iface_t *iface)
     return n;
 }
 
+#ifndef UCT_CXI_DISABLE_FC
+/*
+ * Control queue: a message that arrived at the control PTE, or the completion
+ * of one we sent. It is bounded by the messages in flight and the room it
+ * leaves for arrivals, never grown, and has no PTE to recover (the control PTE
+ * does not disable itself: a message that finds no room is refused).
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_iface_handle_ctrl_event(uct_cxi_iface_t *iface,
+                                const union c_event *event)
+{
+    if (ucs_likely(event->hdr.event_type == C_EVENT_PUT)) {
+        uct_cxi_iface_handle_ctrl_msg(iface, event);
+    } else if (event->hdr.event_type == C_EVENT_ACK) {
+        uct_cxi_iface_ctrl_tx_done(iface,
+                                   (uct_cxi_ctrl_req_t *)(uintptr_t)
+                                           event->init_short.user_ptr,
+                                   event);
+    } else {
+        uct_cxi_iface_event_unhandled(&iface->ctrl.eq, event);
+    }
+}
+
+static UCS_F_ALWAYS_INLINE unsigned
+uct_cxi_iface_poll_ctrl(uct_cxi_iface_t *iface)
+{
+    uct_cxi_eq_t *eq = &iface->ctrl.eq;
+    unsigned      n;
+
+    for (n = 0; n < eq->max_poll; n++) {
+        const union c_event *event = cxi_eq_get_event(eq->evtq);
+
+        if (event == NULL) {
+            break;
+        }
+
+        uct_cxi_iface_handle_ctrl_event(iface, event);
+    }
+
+    if (ucs_unlikely(cxi_eq_get_drops(eq->evtq))) {
+        uct_cxi_iface_eq_drops(iface, eq);
+    }
+
+    if (n > 0) {
+        cxi_eq_ack_events(eq->evtq);
+    }
+
+    return n;
+}
+#endif
+
 static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 {
     uct_cxi_iface_t *iface = ucs_derived_of(tl_iface, uct_cxi_iface_t);
-    unsigned         n;
+    unsigned         n     = 0;
+
+#ifndef UCT_CXI_DISABLE_FC
+    /* The control channel first: it depends on nothing the data path does,
+     * and what it brings (a handshake, credits) is what lets that path go
+     * on. */
+    if (ucs_likely(iface->ctrl.enabled)) {
+        n = uct_cxi_iface_poll_ctrl(iface);
+
+        /* A credit grant that could not be sent goes now that the completions
+         * of the messages before it have freed room for it (the sender of
+         * those credits may be unable to send until it gets them). */
+        if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.grants))) {
+            uct_cxi_fc_flush_grants(iface);
+        }
+
+        /* Timers of the handshake: resends of requests and their deadlines. A
+         * reply that has just arrived has cancelled the resend it would
+         * otherwise fire. The wheel only has timers while there is something
+         * to wait for. */
+        if (ucs_unlikely(!ucs_twheel_is_empty(&iface->fc.twheel))) {
+            ucs_twheel_sweep(&iface->fc.twheel, ucs_get_time());
+        }
+    }
+#endif
 
     /* Each queue gets its own EQ_MAX_POLL budget, so neither a receive flood
      * nor a burst of completions can starve the other. */
-    n  = uct_cxi_iface_poll_rx(iface);
+    n += uct_cxi_iface_poll_rx(iface);
     n += uct_cxi_iface_poll_tx(iface);
-
-#ifndef UCT_CXI_DISABLE_FC
-    /* A credit grant that could not be sent (the sender of those credits may
-     * be unable to send until it gets them) goes before the sends that wait
-     * in pending queues. */
-    if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.grants))) {
-        uct_cxi_fc_flush_grants(iface);
-    }
-
-    /* Timers of the handshake: resends of requests and their deadlines. The
-     * wheel only has timers while there is something to wait for. It is swept
-     * after both queues are drained: a reply that arrived cancels the resend
-     * it would otherwise fire, and the room the completions freed is there
-     * for the resends that do. */
-    if (ucs_unlikely(!ucs_twheel_is_empty(&iface->fc.twheel))) {
-        ucs_twheel_sweep(&iface->fc.twheel, ucs_get_time());
-    }
-#endif
 
     /* Retry any sends queued via uct_ep_pending_add() now that this round
      * of completions may have freed cmdq/op_pool/desc_pool resources.

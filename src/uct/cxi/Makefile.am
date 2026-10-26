@@ -33,13 +33,14 @@ libuct_cxi_la_SOURCES = \
     base/cxi_md.c \
     base/cxi_tag.c
 
-# Connected-endpoint flow control (per-peer state, handshake, credits); see
-# --disable-cxi-fc.
+# Connected-endpoint flow control (per-peer state, handshake, credits) and the
+# control channel it runs on; see --disable-cxi-fc.
 if CXI_FC
 noinst_HEADERS += \
     base/cxi_fc.h
 
 libuct_cxi_la_SOURCES += \
+    base/cxi_ctrl.c \
     base/cxi_peer.c
 endif
 

@@ -33,9 +33,9 @@ static ucs_mpool_ops_t uct_cxi_fc_mpool_ops = {
 };
 
 
-/* The NID and PID of \a peer, and where its control PTE is: all worked out
- * from the key (they are needed to send a control message or to log, never per
- * Active Message), so the record does not hold them. */
+/* The NID and PID of \a peer: worked out from the key (they are needed to log
+ * or to send a control message, never per Active Message), so the record does
+ * not hold them. */
 static UCS_F_ALWAYS_INLINE uint32_t
 uct_cxi_peer_nid(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer)
 {
@@ -46,15 +46,6 @@ static UCS_F_ALWAYS_INLINE uint32_t
 uct_cxi_peer_pid(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer)
 {
     return CXI_MATCH_ID_PID(uct_cxi_iface_md(iface)->pid_bits, peer->key);
-}
-
-static UCS_F_ALWAYS_INLINE void
-uct_cxi_peer_ctrl_dfa(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer,
-                      union c_fab_addr *dfa, uint8_t *idx_ext)
-{
-    cxi_build_dfa(uct_cxi_peer_nid(iface, peer), uct_cxi_peer_pid(iface, peer),
-                  uct_cxi_iface_md(iface)->pid_bits, UCT_CXI_PTE_CTRL, dfa,
-                  idx_ext);
 }
 
 /*
@@ -99,7 +90,6 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
 
     memset(fc, 0, sizeof(*fc));
     fc->enabled         = config->fc_enable;
-    fc->ctrl.ptn        = UINT16_MAX; /* matches no PTE until one is opened */
     fc->connect_timeout = ucs_time_from_sec(config->fc_connect_timeout);
     fc->slot_window     = slot_window;
     fc->pb_shift[0]     = uct_cxi_fc_pb_shift(slot_window,
@@ -131,23 +121,13 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
     ucs_list_head_init(&fc->grants);
 
     ucs_mpool_params_reset(&mp_params);
-    mp_params.elem_size       = sizeof(uct_cxi_ctrl_req_t);
-    mp_params.elems_per_chunk = 32;
-    mp_params.ops             = &uct_cxi_fc_mpool_ops;
-    mp_params.name            = "cxi-ctrl-req";
-    status = ucs_mpool_init(&mp_params, &fc->ctrl_req_pool);
-    if (status != UCS_OK) {
-        goto err_peers;
-    }
-
-    ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_peer_conn_t);
     mp_params.elems_per_chunk = 32;
     mp_params.ops             = &uct_cxi_fc_mpool_ops;
     mp_params.name            = "cxi-peer-conn";
     status = ucs_mpool_init(&mp_params, &fc->conn_pool);
     if (status != UCS_OK) {
-        goto err_ctrl_pool;
+        goto err_peers;
     }
 
     /* The resolution is the shortest retry delay: a timer can not be set for
@@ -162,8 +142,6 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
 
 err_conn_pool:
     ucs_mpool_cleanup(&fc->conn_pool, 1);
-err_ctrl_pool:
-    ucs_mpool_cleanup(&fc->ctrl_req_pool, 1);
 err_peers:
     kh_destroy_inplace(uct_cxi_peer_hash, &fc->peers);
     return status;
@@ -182,139 +160,10 @@ void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface)
     });
     kh_destroy_inplace(uct_cxi_peer_hash, &fc->peers);
 
-    /* A control request still in flight when the interface closes is normal
-     * (its completion is simply never processed), and so is a handshake still
-     * going: don't report them as leaks. */
-    ucs_mpool_cleanup(&fc->ctrl_req_pool, 0);
+    /* A handshake still going when the interface closes is normal: don't
+     * report it as a leak. */
     ucs_mpool_cleanup(&fc->conn_pool, 0);
     ucs_twheel_cleanup(&fc->twheel);
-}
-
-
-/* -------------------------------------------------------------------------
- * Control PTE
- * -------------------------------------------------------------------------
- */
-
-ucs_status_t uct_cxi_iface_open_ctrl_pte(uct_cxi_iface_t *iface,
-                                         struct cxil_lni *lni)
-{
-    uct_cxi_fc_iface_t *fc = &iface->fc;
-    const union c_event *ev;
-    struct c_target_cmd  le = {};
-    ucs_status_t         status;
-    int                  ret;
-
-    if (!fc->enabled) {
-        return UCS_OK;
-    }
-
-    {
-        /* en_flowctrl: when the receive event queue is full the PTE disables
-         * itself and the sender sees C_RC_PT_DISABLED, instead of the event
-         * being lost -- the only way this PTE can refuse a message, since its
-         * list entry holds no buffer. */
-        struct cxi_pt_alloc_opts pt_opts = {
-            .is_matching    = 1,
-            .use_long_event = 1,
-            .en_flowctrl    = 1
-        };
-        ret = cxil_alloc_pte(lni, iface->rx_eq.evtq, &pt_opts, &fc->ctrl.pte);
-    }
-    if (ret != 0) {
-        ucs_error("cxi cxil_alloc_pte CTRL: %s", strerror(-ret));
-        return UCS_ERR_IO_ERROR;
-    }
-
-    ret = cxil_map_pte(fc->ctrl.pte, iface->domain, (int)UCT_CXI_PTE_CTRL,
-                       false, &fc->ctrl.pte_map);
-    if (ret != 0) {
-        ucs_error("cxi cxil_map_pte CTRL: %s", strerror(-ret));
-        goto err_destroy_pte;
-    }
-
-    /* Transition the PTE DISABLED -> ENABLED; spin for the STATE_CHANGE. */
-    {
-        struct c_set_state_cmd ss = {};
-        bool                   enabled = false;
-
-        ss.command.opcode = C_CMD_TGT_SETSTATE;
-        ss.ptlte_index    = fc->ctrl.pte->ptn;
-        ss.ptlte_state    = C_PTLTE_ENABLED;
-
-        ret = cxi_cq_emit_target(iface->tgt.cmdq, &ss);
-        if (ret != 0) {
-            ucs_error("cxi CTRL SETSTATE: %d", ret);
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(iface->tgt.cmdq);
-
-        while (!enabled) {
-            while ((ev = cxi_eq_get_event(iface->rx_eq.evtq)) != NULL) {
-                if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
-                    ev->tgt_long.initiator.state_change.ptlte_state
-                            == C_PTLTE_ENABLED) {
-                    enabled = true;
-                }
-            }
-            cxi_eq_ack_events(iface->rx_eq.evtq);
-        }
-    }
-
-    /* One persistent, zero-length list entry that accepts everything. */
-    le.command.opcode          = C_CMD_TGT_APPEND;
-    le.ptl_list                = C_PTL_LIST_PRIORITY;
-    le.ptlte_index             = fc->ctrl.pte->ptn;
-    le.op_put                  = 1;
-    le.use_once                = 0;
-    le.manage_local            = 0;
-    le.event_link_disable      = 1;
-    le.event_unlink_disable    = 1;
-    le.unexpected_hdr_disable  = 1;
-    le.match_id                = CXI_MATCH_ID_ANY;
-    le.ignore_bits             = UINT64_MAX;
-    le.match_bits              = 0;
-    le.start                   = 0;
-    le.length                  = 0;
-    status = uct_cxi_iface_tgt_post(iface, &le);
-    if (status != UCS_OK) {
-        ucs_error("cxi CTRL LE APPEND: %s", ucs_status_string(status));
-        goto err_unmap_pte;
-    }
-
-    fc->ctrl.ptn = fc->ctrl.pte->ptn;
-    ucs_debug("cxi CTRL PTE ptn %u enabled", fc->ctrl.ptn);
-    return UCS_OK;
-
-err_unmap_pte:
-    cxil_unmap_pte(fc->ctrl.pte_map);
-    fc->ctrl.pte_map = NULL;
-err_destroy_pte:
-    cxil_destroy_pte(fc->ctrl.pte);
-    fc->ctrl.pte = NULL;
-    return UCS_ERR_IO_ERROR;
-}
-
-void uct_cxi_iface_close_ctrl_pte(uct_cxi_iface_t *iface)
-{
-    uct_cxi_fc_iface_t *fc = &iface->fc;
-    int                 ret;
-
-    fc->ctrl.ptn = UINT16_MAX;
-    if (fc->ctrl.pte_map != NULL) {
-        ret = cxil_unmap_pte(fc->ctrl.pte_map);
-        if (ret != 0) {
-            ucs_warn("cxi cxil_unmap_pte CTRL failed: %s", strerror(-ret));
-        }
-        fc->ctrl.pte_map = NULL;
-    }
-    if (fc->ctrl.pte != NULL) {
-        ret = cxil_destroy_pte(fc->ctrl.pte);
-        if (ret != 0) {
-            ucs_warn("cxi cxil_destroy_pte CTRL failed: %s", strerror(-ret));
-        }
-        fc->ctrl.pte = NULL;
-    }
 }
 
 
@@ -599,83 +448,12 @@ uct_cxi_peer_t *uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface,
  * -------------------------------------------------------------------------
  */
 
-/*
- * uct_cxi_ctrl_send -- send one zero-payload control message to \a peer's
- * control PTE. It is a send like any other as far as the TX queue goes: it
- * takes one of the iface->tx.max_inflight places until its completion, so
- * UCS_ERR_NO_RESOURCE if there is none free or the command queue is full, and
- * the caller just tries again later (a GRANT from the list of waiting ones, a
- * CREQ from its timer, a CREP when the requester sends its CREQ again).
- */
-static ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface,
-                                      uct_cxi_peer_t *peer, unsigned type,
-                                      uint64_t match_bits, uint64_t header_data,
-                                      uint32_t grant_slots,
-                                      const uint32_t *grant_units)
-{
-    uct_cxi_ctrl_req_t  *req;
-    union c_fab_addr     dfa;
-    uint8_t              idx_ext;
-    int                  ret;
-
-    if (iface->tx.outstanding >= iface->tx.max_inflight) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    req = ucs_mpool_get(&iface->fc.ctrl_req_pool);
-    if (req == NULL) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-    req->peer        = peer;
-    req->type        = type;
-    req->grant_slots = grant_slots;
-    if (grant_units != NULL) {
-        memcpy(req->grant_units, grant_units, sizeof(req->grant_units));
-    } else {
-        memset(req->grant_units, 0, sizeof(req->grant_units));
-    }
-    uct_cxi_peer_ctrl_dfa(iface, peer, &dfa, &idx_ext);
-
-    {
-        struct c_cstate_cmd cstate = {};
-        cstate.event_send_disable  = 1;
-        cstate.restricted          = 0;
-        cstate.initiator           = iface->match_id;
-        cstate.index_ext           = idx_ext;
-        uct_cxi_idc_track_cstate(&cstate, iface);
-
-        ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(req);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    {
-        struct c_idc_msg_hdr hdr = {};
-        hdr.dfa         = dfa;
-        hdr.match_bits  = match_bits;
-        hdr.header_data = header_data;
-        hdr.user_ptr    = (uint64_t)(uintptr_t)req | UCT_CXI_USER_PTR_CTRL;
-
-        ret = cxi_cq_emit_idc_msg(iface->tx.cmdq, &hdr, hdr.data, 0);
-    }
-    if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(req);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    cxi_cq_ring(iface->tx.cmdq);
-    iface->tx.outstanding++;
-    return UCS_OK;
-}
-
 void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                                 const union c_event *event)
 {
     int rc = cxi_event_rc(event);
 
-    iface->tx.outstanding--;
+    iface->ctrl.outstanding--;
     if (req->type == UCT_CXI_CTRL_GRANT) {
         uct_cxi_peer_t *peer = req->peer;
         unsigned        cls;
