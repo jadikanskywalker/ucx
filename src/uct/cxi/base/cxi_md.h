@@ -22,11 +22,7 @@ typedef struct uct_cxi_md_config {
 } uct_cxi_md_config_t;
 
 
-/**
- * CXI memory domain.  Holds the open device handle and the LNI, which gate
- * all hardware resources (CMDQs, EVTQs, PTEs, memory maps).  Opened once per
- * physical device per process; multiple ifaces share the same MD.
- */
+/** CXI memory domain: the open device and its LNI, shared by all ifaces. */
 typedef struct uct_cxi_md {
     uct_md_t          super;      /**< Base MD — must be first */
     uct_cxi_device_t  device;     /**< Device descriptor (name, dev_id, nid) */
@@ -44,34 +40,18 @@ typedef struct uct_cxi_md {
 
 
 /**
- * Memory handle returned by mem_reg.  Wraps the libcxi memory descriptor
- * plus one precomputed field for the DMA hot path.
- *
- * iova_offset = cxi_md->iova - base_VA
- *
- * This lets ep_put_zcopy compute the local NIC-visible address with a single
- * addition: local_iova = iova_offset + buffer_VA.  Without it the initiator
- * would need base_VA as a separate field and perform a subtraction per send.
- *
- * For ATS mode iova_offset = ats_md->iova (base_VA = 0 for the scalable map).
- * For pinned mode iova_offset = cxi_md->iova - address (address from cxil_map).
+ * Memory handle from mem_reg. iova_offset (cxi_md->iova - base VA) gives the
+ * NIC address of a buffer as iova_offset + buffer VA. In ATS mode it is
+ * ats_md->iova (base VA 0).
  */
 typedef struct uct_cxi_mem_handle {
     struct cxi_md *cxi_md;      /**< Libcxi descriptor; needed for cxil_unmap
                                  *   and for cxi_md->lac in DMA commands       */
-    uint64_t       iova_offset; /**< Precomputed: cxi_md->iova - cxi_md->va
-                                 *   (page_IOVA - page_VA).
-                                 *   NIC address of any buf in this registration:
-                                 *   IOVA(buf) = iova_offset + buf_VA          */
+    uint64_t       iova_offset; /**< cxi_md->iova - cxi_md->va */
 } uct_cxi_mem_handle_t;
 
 
-/**
- * Registration cache region.  One is allocated per unique (page-aligned) VA
- * range by the rcache infrastructure; mem_reg callbacks fill @a memh.  The
- * embedded @a memh is handed to callers as uct_mem_h so the two structs have
- * the same lifetime.
- */
+/** Registration cache region; the embedded memh is handed out as uct_mem_h. */
 typedef struct uct_cxi_rcache_region {
     ucs_rcache_region_t  super; /**< Base class — must be first */
     uct_cxi_mem_handle_t memh;  /**< Embedded handle exposed as uct_mem_h */
@@ -79,36 +59,17 @@ typedef struct uct_cxi_rcache_region {
 
 
 /**
- * Remote key packed by mkey_pack and unpacked by rkey_unpack.
- *
- * In restricted-mode DMA the initiator drives the memory access entirely:
- * routing uses {nid, pid, ptn} from the connected EP's device_addr and
- * iface_addr; the memory itself is addressed by {iova, lac} from the rkey.
- * nid is not packed here — the EP already has it from device_addr.
+ * Packed remote key. The initiator routes by the EP's addresses and
+ * addresses memory by {iova, lac}.
  */
 /**
- * Remote key packed by mkey_pack and unpacked by rkey_unpack.
- *
- * iova stores iova_offset = cxi_md->iova - base_VA, so the initiator can
- * compute the target's NIC-visible address with one addition:
- *   remote_iova = rkey->iova + remote_addr
- *
- * This works for both pinned and ATS registrations.  The initiator's NIC
- * cannot resolve the target's VA directly — IOVAs are per-LNI and private
- * to the target's IOMMU namespace — so the target must include IOVA info.
+ * Remote key. iova is the target's iova_offset, so the initiator computes
+ * remote_iova = rkey->iova + remote_addr (IOVAs are private to the target).
  */
 /*
- * is_rndv/rendezvous_id: a second flavor of this packed rkey, for the
- * unexpected-rendezvous path only (cxi_tag.c's tag_handle_search_delete_
- * confirm_rndv(), uct_cxi_ep_get_zcopy/bcopy's is_rndv branch in cxi_rma.c).
- * There's no real memory key to pack here -- the receiver synthesizes this
- * on the stack from hardware event fields, since the Get it drives targets
- * this transport's own rendezvous source PTE, not a registered buffer. It
- * still rides through uct_tag_unexp_rndv_cb_t's rkey_buf and back out
- * through UCP's generic rkey_unpack()/get_zcopy() unchanged (rkey_unpack()
- * already does a verbatim struct copy). iova/lac are unused when is_rndv is
- * set; mkey_pack() always sets is_rndv=0 explicitly (the buffer isn't
- * necessarily zeroed).
+ * is_rndv/rendezvous_id: a synthesized rkey for the unexpected-rendezvous
+ * pull, which targets the sender's rendezvous source PTE instead of a
+ * registered buffer. iova/lac are unused when set; mkey_pack() clears it.
  */
 typedef struct uct_cxi_rkey {
     uint64_t iova;          /**< iova_offset = cxi_md->iova - base_VA (see above) */

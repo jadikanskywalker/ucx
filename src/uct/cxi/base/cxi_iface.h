@@ -27,26 +27,17 @@
 
 #define UCT_CXI_NAME "cxi"
 
-/* Event queue sizing.  UCT_CXI_EQ_NUM_EVENTS is what UCX_CXI_EQ_SIZE's -1
- * sentinel default resolves to — the actual runtime size is
- * uct_cxi_eq_t::num_events, resolved at iface_open together with the
- * TX pool caps (see UCS_CLASS_INIT_FUNC).  UCT_CXI_EQ_ENTRY_SIZE is a
- * hardware constant. */
+/* Default EQ depth (UCX_CXI_EQ_SIZE=-1) and the hardware event size. */
 #define UCT_CXI_EQ_NUM_EVENTS  1024U
 #define UCT_CXI_EQ_ENTRY_SIZE  64U   /* sizeof(union c_event) */
 /* RX EQ slots, beyond what flow control accounts for, that sizing from the
  * credit windows leaves free: events are acknowledged to the NIC in batches,
  * so processed ones still hold slots for a moment. */
 #define UCT_CXI_EQ_SLACK       128U
-/* Flow-control credit unit: byte windows are counted in these, and a message
- * costs event slots plus UCT_CXI_FC_UNITS(len) byte credits of its class.
- * Defined here, outside the UCT_CXI_DISABLE_FC guard, because the send paths
- * compute the cost whether or not it is charged. */
-/* Largest windows the CREP can express (and so the largest the receive
- * buffers and the RX EQ are ever sized for: see uct_cxi_fc_windows()): 24 bits of event slots, and 20 bits of
- * buffer space per class in multiples of UCT_CXI_FC_WINDOW_GRAIN units (4 KiB,
- * so up to 4 GiB). Nothing else limits a window: the piggyback and GRANT
- * counters do not need to hold one (see uct_cxi_fc_pb_shift). */
+/* Flow-control credit unit; outside the FC guard since sends compute costs
+ * regardless. */
+/* Largest windows a CREP can express: 24 bits of slots, 20 bits per class in
+ * UCT_CXI_FC_WINDOW_GRAIN units (up to 4 GiB). */
 #define UCT_CXI_FC_WINDOW_GRAIN     64u
 #define UCT_CXI_FC_MAX_SLOT_WINDOW  ((1u << 24) - 1)
 #define UCT_CXI_FC_MAX_UNIT_WINDOW  (((1u << 20) - 1) * UCT_CXI_FC_WINDOW_GRAIN)
@@ -55,63 +46,43 @@
 #define UCT_CXI_FC_UNITS(_len) \
     ((unsigned)(((_len) + UCT_CXI_FC_UNIT - 1) / UCT_CXI_FC_UNIT))
 
-/* The event slots a message is charged: the most events it can leave in the
- * receive event queue at the same time until it has been processed, other than
- * those of a posted receive. An Active Message leaves its arrival. An eager tag
- * message that matches no posted receive leaves its arrival, and then the
- * outcome of the search we make for it once the arrival has been handled: one
- * at a time. A rendezvous leaves the outcome of the search and the completion
- * of the read of its source address, both issued when the arrival is handled:
- * two at a time. (The events of a receive, whether it matched on arrival or
- * claimed an unexpected message later, are paid for by the receive's own
- * budget, UCT_CXI_TAG_RECV_EVENTS each; the sender of a message that matches a
- * posted receive takes its charge back when it is told so.) */
+/* Event slots charged per message: the most events it leaves in the RX EQ at
+ * once, besides a posted receive's own (UCT_CXI_TAG_RECV_EVENTS each). An AM
+ * leaves its arrival; an eager tag message its arrival, then the search
+ * outcome; a rendezvous the search outcome and the source-address read. */
 #define UCT_CXI_FC_SLOTS_AM          1u
 #define UCT_CXI_FC_SLOTS_TAG_EAGER   1u
 #define UCT_CXI_FC_SLOTS_TAG_RNDV    2u
 #define UCT_CXI_FC_MAX_SLOTS         UCT_CXI_FC_SLOTS_TAG_RNDV
 
-/**
- * What a message is charged against. The receive event queue is one resource
- * shared by everything a peer sends, so event slots are one pool for all
- * classes; the receive buffers are not, each class has its own ring, so each
- * has its own byte pool.
- */
+/** Credit pools: event slots are one pool (the RX EQ is shared), buffer space
+ *  one per class (each has its own ring). */
 typedef enum {
     UCT_CXI_FC_AM,           /**< Active Messages: the AM ring */
     UCT_CXI_FC_TAG,          /**< tag matching: the overflow ring */
     UCT_CXI_FC_NUM_CLASSES
 } uct_cxi_fc_class_t;
 
-/* How long a command posted from an event handler (uct_cxi_iface_tgt_post(),
- * the address read of an unexpected rendezvous) waits for room in a full
- * command queue before giving up. The NIC normally frees room within
- * microseconds. */
+/* How long a command posted from an event handler waits for a full command
+ * queue. */
 #define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
 
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
 
-/* Control channel: the most control messages in flight (their completions
- * hold the slots reserved in the control event queue), the depth of the
- * command queue they go through (a message takes two commands), and the
- * default depth of the event queue (UCX_CXI_CTRL_EQ_SIZE). */
+/* Control channel: most messages in flight, command queue depth (two commands
+ * per message) and default EQ depth (UCX_CXI_CTRL_EQ_SIZE). */
 #define UCT_CXI_CTRL_MAX_INFLIGHT   64U
 #define UCT_CXI_CTRL_CMDQ_DEPTH     256U
 #define UCT_CXI_CTRL_EQ_NUM_EVENTS  256U
 
-/* AM receive ring.  UCX_CXI_AM_RX_BUF_SIZE and UCX_CXI_AM_RX_NUM_BUFS are
- * "auto" by default: the ring is sized from the credit windows (see
- * uct_cxi_iface_size_am_ring()), whether or not flow control is on, so that
- * the two can be compared with the same buffers. */
+/* AM ring: UCX_CXI_AM_RX_BUF_SIZE and _NUM_BUFS are "auto", sized from the
+ * credit windows (uct_cxi_iface_size_am_ring) with or without flow control. */
 #define UCT_CXI_AM_RX_NUM_BUFS_MAX      64
 
-/* Automatic buffer size with flow control: a multiple of the largest message,
- * so the tail the NIC strands in each buffer (see min_free in
- * uct_cxi_iface_post_am_le) stays a small fraction of it, but not below this
- * floor, which keeps the number of buffers (and so of LEs) low for small
- * messages. */
+/* Auto buffer size: a multiple of the largest message, so the stranded tail
+ * (min_free) stays small, above a floor that keeps the LE count low. */
 #define UCT_CXI_AM_RX_BUF_SIZE_MIN      (1024u * 1024u)
 #define UCT_CXI_AM_RX_BUF_PER_MSG       4u
 
@@ -120,41 +91,17 @@ typedef enum {
 
 
 /*
- * Number of Logical Address Contexts (LACs) supported per iface.
+ * LACs per iface: fixed at 1. Only non-dmabuf GPU and huge-page host
+ * registrations land on another, and uct_cxi_md_mem_reg() rejects them. More
+ * would need a lazily opened PTE per LAC (a restricted packet has no LAC
+ * field). Compile-time since it sizes arrays.
  *
- * Deliberately fixed at 1 (LAC 0 only) -- not a hardware limit (the NIC
- * supports up to C_NUM_LACS = 8). Only two registration paths can ever
- * produce a driver-assigned LAC != 0: non-dmabuf/raw-P2P GPU memory
- * registration, and huge-page host registration. Both are unsupported;
- * uct_cxi_md_mem_reg() rejects any registration whose LAC isn't 0 with
- * UCS_ERR_UNSUPPORTED, so this is never violated in practice. The
- * supported GPU path (dmabuf-backed, via cuda_copy) always lands on LAC 0.
- *
- * Supporting LAC != 0 is possible but nontrivial: a restricted op's wire
- * packet carries no LAC field at all (verified: cassini_user_defs.h's
- * struct c_port_restricted_hdr has only opcode/index_ext/remote_offset/
- * request_len), so routing would need one PTE per LAC, opened lazily
- * (eagerly opening a PTE for a LAC before any registration under it
- * exists was tried and produced C_RC_INVALID_AC). See the
- * project_cxi_multi_lac_lazy_pte_deferred memory for the full design if
- * this scope needs to expand again.
- *
- * This is a compile-time constant because it controls array sizes in
- * uct_cxi_iface_t and uct_cxi_ep_t; a runtime flag would not shrink them.
- *
- * Portal table entry (PTE) pid_offset assignment:
- *   pid_offsets 0 .. UCT_CXI_MAX_LACS-1  → RMA/AMO, one per LAC
- *   pid_offset  UCT_CXI_MAX_LACS          → Tag-matching (Phase 7)
- *   pid_offset  UCT_CXI_MAX_LACS + 1      → Active messages (Phase 6)
- *   pid_offset  UCT_CXI_MAX_LACS + 2      → Flow-control control channel
- *
- * The rendezvous source-exposure PTE (Phase B) is NOT in this scheme --
- * confirmed on real hardware (every NIC-auto-issued rendezvous Get failed
- * with C_RC_PTLTE_NOT_FOUND) that its pid_idx is a fixed, hardware/driver-
- * mandated value (md->cxi_dev->info.rdzv_get_idx), not something software
- * gets to choose, unlike every PTE above. See uct_cxi_iface_open_rdzv_pte's
- * own comment (cxi_tag.c) and libfabric's matching use of
- * iface->dev->info.rdzv_get_idx (cxip_msg_hpc.c:377, cxip_rdzv_pte.c:290).
+ * PTE pid_offsets:
+ *   0 .. UCT_CXI_MAX_LACS-1   RMA/AMO, one per LAC
+ *   UCT_CXI_MAX_LACS          tag matching
+ *   UCT_CXI_MAX_LACS + 1      active messages
+ *   UCT_CXI_MAX_LACS + 2      flow-control control channel
+ * The rendezvous source PTE uses the fixed md->cxi_dev->info.rdzv_get_idx.
  */
 #define UCT_CXI_MAX_LACS   1
 #define UCT_CXI_PTE_TAG    UCT_CXI_MAX_LACS
@@ -162,22 +109,13 @@ typedef enum {
 #define UCT_CXI_PTE_CTRL  (UCT_CXI_MAX_LACS + 2)
 
 
-/**
- * Node-level address — one per physical NIC.
- * Used by the initiator to route packets to the correct fabric node.
- */
+/** Node-level address, one per NIC. */
 typedef struct uct_cxi_device_addr {
     uint32_t nid; /**< NIC fabric address */
 } UCS_S_PACKED uct_cxi_device_addr_t;
 
-/**
- * Per-iface address.
- *
- * Advertises only the PID.  Per-operation pid_offsets (0..UCT_CXI_MAX_LACS-1
- * for RMA, UCT_CXI_PTE_TAG for tag, UCT_CXI_PTE_AM for AM) are protocol
- * constants; the initiator adds them when building the DFA so iface_addr
- * stays compact.
- */
+/** Per-iface address: the PID. PTE pid_offsets are protocol constants added
+ *  when building a DFA. */
 typedef struct uct_cxi_iface_addr {
     uint32_t pid; /**< CXI Port ID assigned by cxil_alloc_domain */
 } UCS_S_PACKED uct_cxi_iface_addr_t;
@@ -226,35 +164,25 @@ typedef struct uct_cxi_iface_config {
                                               UCS_ULUNITS_AUTO                      */
     size_t                    tag_ovf_buf_size; /**< Size of each overflow buffer, or
                                               UCS_MEMUNITS_AUTO                     */
-    size_t                    tag_eager_max;    /**< Max eager tag message; the
-                                              overflow ring buffers are at least
-                                              twice as large (see
-                                              uct_cxi_iface_open_tag_pte)           */
+    size_t                    tag_eager_max;    /**< Max eager tag message */
     unsigned                  tag_max_outstanding; /**< Max simultaneously-posted
                                               priority LEs (hard ceiling 65535 --
                                               buffer_id is uint16_t)                */
     unsigned                  tag_fence_interval; /**< Posted receives between
                                               fences (see uct_cxi_tag_pend_t)       */
-    unsigned                  fc_msg_window;   /**< Event slot credits granted
-                                                    to each peer, shared by
-                                                    all message classes (also
-                                                    what the RX EQ is sized
-                                                    for without flow control)  */
+    unsigned                  fc_msg_window;   /**< Event slots granted per
+                                                    peer */
     size_t                    fc_byte_window;  /**< Active Message buffer
                                                     credits granted to each
                                                     peer                       */
     size_t                    fc_tag_byte_window; /**< Tag matching buffer
                                                     credits granted to each
                                                     peer                       */
-    unsigned                  fc_active_senders; /**< Peers sending at their
-                                                    full window at once, which
-                                                    the ring and RX EQ are
-                                                    sized for                  */
+    unsigned                  fc_active_senders; /**< Peers at full window at
+                                                      once */
 #ifndef UCT_CXI_DISABLE_FC
-    unsigned                  ctrl_eq_size;    /**< Control event queue depth.
-                                                    -1 sentinel resolves to
-                                                    UCT_CXI_CTRL_EQ_NUM_EVENTS
-                                                    */
+    unsigned                  ctrl_eq_size;    /**< Control EQ depth, -1:
+                                                    default */
     int                       fc_enable;       /**< Handshake with peers and
                                                     open the control PTE       */
     double                    fc_connect_timeout; /**< Give up on a peer's
@@ -268,22 +196,10 @@ typedef struct uct_cxi_iface_config {
 
 
 /**
- * Per-PTE flow-control recovery state — tracks disable/re-enable flapping
- * so sustained overload escalates (log + stop retrying) instead of spinning
- * SETSTATE commands forever.  One instance per locally-owned PTE that arms
- * flow control (AM, tag, rendezvous); the RMA/AMO PTEs do not (see
- * uct_cxi_iface_open_rma_pte).
- *
- * `exhausted` tracks matching-resource exhaustion (LE/overflow-list, not
- * EQ capacity) independently of EQ-fill `DRAINING`
- * (uct_cxi_eq_t::need_to_drain) — draining EQ events doesn't free
- * buffer/LE capacity, so the two need separate state.  Only ever set for
- * `iface->am.fc` — never for the RMA/AMO PTEs, whose catch-all LE is a single
- * persistent non-consuming LE with no matching resource to exhaust (see the
- * design notes in cxi_iface.c's STATE_CHANGE handling).
- * `onload_cb` is a reserved, currently-unused extension point for TAG,
- * which will need an onload step (TGT_SEARCH_AND_DELETE) before repost —
- * reserved now so TAG doesn't need to reshape this struct later.
+ * Per-PTE recovery state: flap counting, so sustained overload gives up
+ * instead of re-enabling forever. One per PTE that arms flow control (AM, tag,
+ * rendezvous). `exhausted` marks matching-resource exhaustion (AM only),
+ * apart from EQ-fill draining since draining frees no buffers.
  */
 typedef struct uct_cxi_pte_fc {
     ucs_time_t flap_window_start; /**< Start of the current flap-counting window */
@@ -298,13 +214,9 @@ typedef struct uct_cxi_pte_fc {
 #include "cxi_fc.h"
 #endif
 
-/* TX event queue slots kept out of iface->tx.max_inflight, because the events
- * that use them are not counted in iface->tx.outstanding: the single
- * synchronous get_short's REPLY (1), plus a few for the error events the
- * hardware can report on a command queue's event queue
- * (C_EVENT_COMMAND_FAILURE, C_EVENT_ERROR). Those never occur in normal
- * operation; if more arrive than this holds, the queue drops the extras and
- * progress reports the drop. (Control messages have a queue of their own.) */
+/* TX EQ slots kept out of tx.max_inflight for events not counted in
+ * tx.outstanding: the get_short REPLY and a few hardware error events (extra
+ * ones are dropped and reported by progress). */
 #define UCT_CXI_TX_EQ_UNTRACKED  8U
 
 /* Defined in cxi_tag.h (included after this header, via cxi_ep.h); only a
@@ -313,19 +225,9 @@ typedef struct uct_cxi_pte_fc {
 struct uct_cxi_rdzv_op;
 
 /*
- * Per-peer cache of the two constant-for-the-life-of-the-ep fields of
- * UCP's unexpected-rndv header (ep_id, md_index), populated by that peer's
- * one-time control-message announce (uct_cxi_ep_send_rndv_hdr_announce /
- * uct_cxi_iface_handle_rndv_hdr_announce, cxi_am.c/cxi_tag.c). The header's
- * third field, req_id, varies per message and travels via header_data on
- * every rendezvous Put instead. Growable hash keyed by initiator
- * (event->tgt_long.initiator.initiator.process): the number of distinct
- * peers isn't knowable in advance, and a fixed-size table would either
- * waste memory or, worse, evict a still-needed entry under load -- same
- * reasoning as uct_srd_ep_hash's own per-peer table (uct/ib/efa/srd/
- * srd_iface.h). One entry per peer that has ever sent an announce, for the
- * life of the iface; never removed (a later announce from the same peer
- * just overwrites the existing entry).
+ * Per-peer cache of the constant {ep_id, md_index} fields of UCP's unexpected
+ * rendezvous header, filled by the peer's one-time announce. A hash keyed by
+ * initiator, one entry per peer for the life of the iface.
  */
 typedef struct uct_cxi_rndv_peer_hdr {
     uint64_t ep_id;
@@ -337,14 +239,10 @@ typedef struct uct_cxi_rndv_peer_hdr {
 KHASH_MAP_INIT_INT(uct_cxi_rndv_peer_hash, uct_cxi_rndv_peer_hdr_t)
 
 /**
- * One unexpected eager message with data that a posted receive is to take, as
- * far as its two events are concerned: the Put into the overflow list
- * (arrival), and the receive's delayed match. They are produced by different
- * pipelines of the NIC and either can be seen first; the data is only known to
- * be in the overflow buffer once the arrival has been, so whichever comes
- * first waits for the other (iface->tag.eager_pairs, keyed by the message's
- * address in the overflow buffer, which both carry). Same as libfabric's
- * match_put_event(). A message that goes to UCP instead is not kept here.
+ * An unexpected eager message that a posted receive takes: its overflow-list
+ * arrival and the receive's delayed match are separate events, in either order,
+ * so the first waits for the other (iface->tag.eager_pairs, keyed by the
+ * message's address in the overflow buffer).
  */
 typedef struct uct_cxi_eager_pair {
     uint64_t      seq;       /**< when the arrival was handled, in the numbering
@@ -357,11 +255,9 @@ typedef struct uct_cxi_eager_pair {
 KHASH_MAP_INIT_INT64(uct_cxi_eager_pair_hash, uct_cxi_eager_pair_t)
 
 /**
- * The unexpected messages held for the report to UCP that come from one sender
- * with one tag, in the order they arrived (see uct_cxi_unexp_report_t in
- * cxi_tag.h). That is the order UCP is told of them in: messages of other
- * streams are not ordered against these. A stream exists while it has an
- * entry, and is found by (sender, tag) in iface->tag.unexp_streams.
+ * Unexpected messages held for the report to UCP from one sender with one tag,
+ * in arrival order (uct_cxi_unexp_report_t); found by (sender, tag) in
+ * iface->tag.unexp_streams while any are held.
  */
 typedef struct uct_cxi_unexp_stream {
     ucs_list_link_t              live;      /**< iface->tag.unexp_live, while in
@@ -376,21 +272,15 @@ typedef struct uct_cxi_unexp_stream {
 } uct_cxi_unexp_stream_t;
 
 /*
- * A receive that has been posted, and may still take a message that is in the
- * overflow list. Hardware gives an unexpected message to a receive appended
- * after it landed, and tells us only afterwards (the delayed match, from its
- * command pipeline); UCP must not be handed that message in the meantime, nor
- * be left to think the receive is still free. So the receives are kept in the
- * order they were posted, in a ring (iface->tag.pend): the first PENDING one
- * whose tag matches is the one a message that arrives unexpected goes to (see
- * uct_cxi_tag_claim()), and it is CLAIMED. A receive is SPENT once its outcome
- * is known (a match, a cancel).
+ * A posted receive that may still take a message from the overflow list.
+ * Hardware reports such a match only afterwards (the delayed match), so
+ * receives are kept in posting order in iface->tag.pend: an unexpected message
+ * goes to the first PENDING one whose tag matches (uct_cxi_tag_claim), which
+ * becomes CLAIMED, and is SPENT once its outcome is known.
  *
- * The ring is bounded by fences (uct_cxi_tag_fence_post()): a search that
- * matches nothing, posted every TAG_FENCE_INTERVAL receives. Commands are
- * executed in order, so when its event is seen every receive before it has
- * been appended and has had whatever messages it was going to take reported,
- * and those receives leave the ring (pend_tail moves over them).
+ * A fence (uct_cxi_tag_fence_post: a search matching nothing, every
+ * TAG_FENCE_INTERVAL receives) bounds the ring: when its event arrives, every
+ * receive before it has been appended and reported, and leaves the ring.
  */
 typedef struct uct_cxi_tag_pend {
     uint64_t tag;
@@ -418,12 +308,8 @@ KHASH_INIT(uct_cxi_unexp_stream_hash, uct_cxi_unexp_key_t,
            uct_cxi_unexp_stream_t *, 1, uct_cxi_unexp_key_hash,
            uct_cxi_unexp_key_equal)
 
-/**
- * Event queue state: the hardware EQ, its backing buffer, and the sizing,
- * drain-gated PTE recovery, and preemptive-growth state that belong to it.
- * The iface owns two (rx_eq, tx_eq), hence a struct rather than loose
- * uct_cxi_iface_t fields.
- */
+/** An event queue: the hardware EQ and its buffer, with its sizing, PTE
+ *  recovery and growth state. */
 typedef struct uct_cxi_eq {
     const char    *name;           /**< "rx" / "tx", for log messages */
     struct cxi_eq *evtq;           /**< The hardware event queue */
@@ -432,41 +318,21 @@ typedef struct uct_cxi_eq {
     unsigned       num_events;     /**< Runtime EQ depth -- resolved from
                                         UCX_CXI_EQ_SIZE / UCX_CXI_TX_EQ_SIZE
                                         at iface_open; see UCS_CLASS_INIT_FUNC */
-    unsigned       max_poll;       /**< Max events drained per
-                                        iface_progress() call -- resolved
-                                        from UCX_CXI_EQ_MAX_POLL. Bounds
-                                        the drain loop the same way every
-                                        other UCX transport bounds its
-                                        CQ/event poll (RC/UD/DC's
-                                        TX/RX_MAX_POLL, TCP's
-                                        UCT_TCP_MAX_EVENTS), so a steady
-                                        flood can't keep the loop running
-                                        past the point where the post-loop
-                                        fill-threshold/drop checks would
-                                        still have time to act. */
+    unsigned       max_poll;       /**< Max events drained per progress
+                                         call (UCX_CXI_EQ_MAX_POLL) */
 
     /* ── PTE flow-control recovery (drain-gated re-enable) ──────────── */
-    unsigned       need_to_drain;  /**< >0 while waiting to drain enough of the EQ
-                                        before re-checking/re-enabling disabled
-                                        PTEs; decremented once per event drained
-                                        in iface_progress(), 0 = not recovering */
+    unsigned       need_to_drain;  /**< >0 while draining before PTEs are
+                                         re-enabled; one per event processed */
     unsigned       drain_pct;      /**< Resolved from config at iface_open */
     unsigned       reserved_slots_cfg; /**< Resolved from config at iface_open;
                                         persisted so eq.grow can restore it
                                         if the resize changes the count */
-    unsigned       reserved_slots; /**< Current absolute reserved-slot
-                                        count, kept in sync with the
-                                        value cxil_evtq_adjust_reserved_fc()
-                                        reports after each change      */
+    unsigned       reserved_slots; /**< Current reserved slots, as reported by
+                                         cxil_evtq_adjust_reserved_fc() */
 
-    /* ── Preemptive EQ growth (fill-threshold-triggered resize) ──────
-     * Independent of need_to_drain's reactive drain-and-recover path
-     * above — this acts *before* a disable ever happens, on a hardware
-     * fill-percentage status update rather than an actual drop/disable
-     * event. The two coexist without coupling: DRAINING/EXHAUSTED remain
-     * the backstop once eq_max_len is reached or a burst outruns one
-     * resize round-trip. See the STATE_CHANGE/EQ_SWITCH handling in
-     * cxi_iface.c. */
+    /* Preemptive growth: a hardware fill-threshold update triggers a resize
+     * before any disable; reactive recovery stays the backstop. */
     struct {
         int            enabled;        /**< Resolved from dynamic_eq_growth */
         unsigned       thresh_pct;     /**< Resolved from eq_grow_thresh_pct */
@@ -483,11 +349,8 @@ typedef struct uct_cxi_eq {
 
 #ifndef UCT_CXI_DISABLE_FC
 /**
- * The control channel (cxi_ctrl.c): a PTE of its own, with its own event
- * queue and command queue, so that control traffic neither shares the queues
- * of the data path nor depends on their room. Its event queue holds what
- * arrives at the PTE (C_EVENT_PUT) and the completions of what is sent
- * (C_EVENT_ACK); the slots for the completions are reserved.
+ * The control channel (cxi_ctrl.c): its own PTE, event queue (arrivals and send
+ * completions, whose slots are reserved) and command queue.
  */
 typedef struct uct_cxi_ctrl {
     int                   enabled;      /**< Opened (FC_ENABLE) */
@@ -497,28 +360,20 @@ typedef struct uct_cxi_ctrl {
     struct cxil_pte_map  *pte_map;
     ucs_mpool_t           req_pool;     /**< uct_cxi_ctrl_req_t */
     unsigned              outstanding;  /**< Control messages in flight */
-    unsigned              max_inflight; /**< Cap on outstanding: every message
-                                             yields one completion, for which
-                                             the event queue has a slot
-                                             reserved */
+    unsigned              max_inflight; /**< Cap on outstanding; one reserved EQ
+                                              slot per message */
 } uct_cxi_ctrl_t;
 #endif
 
 /*
- * Endpoints destroyed with sends still in flight (uct_cxi_ep_destroy): their
- * completions find the ep through a pointer stored in the command, so the ep
- * has to outlive them. The last completion frees it; this set is how the
- * iface finds any that are left when it closes first, since their
- * completions will then never be processed. Keyed by ep address.
+ * Endpoints destroyed with sends in flight: the last completion frees each, and
+ * the iface frees any left at close. Keyed by ep address.
  */
 KHASH_SET_INIT_INT64(uct_cxi_zombie_ep_hash)
 
 /**
- * CXI interface instance.
- *
- * Hardware resources are grouped into sub-structs by function.  Resources
- * are allocated in a fixed order in UCS_CLASS_INIT_FUNC and must be
- * destroyed in strict reverse order.
+ * CXI interface instance. Resources are allocated in UCS_CLASS_INIT_FUNC order
+ * and destroyed in reverse.
  */
 typedef struct uct_cxi_iface {
     uct_base_iface_t  super;               /**< Must be first */
@@ -532,30 +387,21 @@ typedef struct uct_cxi_iface {
         size_t           max_bcopy;        /**< Max payload per bcopy op (from config) */
         unsigned         outstanding;      /**< Total in-flight sends (all EPs) */
 #ifndef UCT_CXI_DISABLE_FC
-        uint8_t          credit_block;     /**< Set by a send that returned
-                                                UCS_ERR_NO_RESOURCE for lack of
-                                                flow-control credits (not of an
+        uint8_t          credit_block;     /**< Set by a send refused for
+                                                lack of credits (not an
                                                 interface resource), for the
-                                                pending-queue dispatch to read */
+                                                pending dispatch to read */
 #endif
-        unsigned         max_inflight;     /**< Cap on outstanding: every counted
-                                                send yields exactly one TX EQ
-                                                event, so this is the TX EQ depth
-                                                minus UCT_CXI_TX_EQ_UNTRACKED.
-                                                Sends beyond it are refused with
-                                                UCS_ERR_NO_RESOURCE (-> pending
-                                                queue), never queued in the EQ */
-        /* Pending-request queue: when a send returns UCS_ERR_NO_RESOURCE,
-         * uct_ep_pending_add() queues the caller's callback here via the
-         * EP's arb_group.  Drained from uct_cxi_iface_progress() once TX
-         * completions free up cmdq/pool resources. */
+        unsigned         max_inflight;     /**< Cap on outstanding: TX EQ
+                                                depth minus
+                                                UCT_CXI_TX_EQ_UNTRACKED.
+                                                Beyond it sends get
+                                                UCS_ERR_NO_RESOURCE. */
+        /* Pending sends: uct_ep_pending_add() queues them on the ep's
+         * arb_group; progress runs them. */
         ucs_arbiter_t    arbiter;
-        /* Short-GET scratch: a page-aligned heap allocation so the NIC's DMA
-         * writes land in their own page, away from CPU-hot iface struct
-         * fields (prevents false sharing / cache line invalidation).
-         * Single-threaded poll model guarantees at most one get_short in
-         * flight at a time; the implementation spins until C_EVENT_REPLY
-         * and then memcpy's into the caller's buffer. */
+        /* get_short scratch, page-aligned to keep NIC writes off hot iface
+         * fields. */
         khash_t(uct_cxi_zombie_ep_hash) zombie_eps; /**< Destroyed eps with
                                                           sends in flight   */
         uint8_t              *get_short_buf; /**< Page-aligned, NIC DMA target    */
@@ -567,14 +413,10 @@ typedef struct uct_cxi_iface {
         struct cxi_cq   *cmdq;             /**< Target command queue for LE management */
     } tgt;
 
-    /* ── Event queues; event_type dispatches to the handler ─────────────
-     * Two queues share one wait object:
-     *  - tx_eq: completions (ACK/REPLY) of commands issued on tx.cmdq. Sized
-     *    from the TX pool caps, so it cannot overflow; never grown.
-     *  - rx_eq: everything the NIC reports for our own PTEs (incoming
-     *    PUT/GET/..., STATE_CHANGE, command-queue events of tgt.cmdq).
-     *    Sized by EQ_SIZE; the only queue that can fill from the network,
-     *    so the only one with PTE flow-control recovery and growth. */
+    /* ── Event queues ──
+     *  - tx_eq: ACK/REPLY of commands on tx.cmdq; sized from the TX pool caps.
+     *  - rx_eq: everything for our PTEs; the only queue the network can fill,
+     *    so the only one with recovery and growth. */
     struct cxil_wait_obj *wait_obj;        /**< Interrupt / epoll fd for progress */
     uct_cxi_eq_t          rx_eq;
     uct_cxi_eq_t          tx_eq;
@@ -589,25 +431,18 @@ typedef struct uct_cxi_iface {
         struct cxil_pte_map *pte_map[UCT_CXI_MAX_LACS];
     } rma;
 
-    /* ── Tag-matching portal (unrestricted, pid_offset = UCT_CXI_PTE_TAG) ────
-     * Real hardware matching (is_matching=1, genuinely exploited here --
-     * unlike AM's identically-configured but always-wildcarded PTE).
-     * Two independent LE populations share it: on-demand, use_once
-     * priority LEs (one per tag_recv_zcopy() call, ctx[]/free_list[]
-     * below) bound directly to the caller's own registered buffer for
-     * zero-copy direct match, and a genuine Portals4 overflow-list ring
-     * (rx_base/rx_mh below) catching unexpected messages -- see cxi_tag.c
-     * for why this is a real overflow list, unlike the AM ring. */
+    /* ── Tag-matching portal (pid_offset = UCT_CXI_PTE_TAG) ──
+     * Hardware matching with two LE populations: use_once priority LEs, one per
+     * tag_recv_zcopy() bound to the caller's buffer, and an overflow-list ring
+     * catching unexpected messages. */
     struct {
         struct cxil_pte     *pte;          /**< NULL until HW tag offload enabled */
-        int32_t              ptn;          /**< pte->ptn, or -1 while there is no
-                                                pte: what an event's ptlte_index is
-                                                compared with, without going
-                                                through pte */
-        struct c_target_cmd  recv_le;      /**< The priority-list entry every
-                                                posted receive is, but for the
-                                                buffer and the tag to match
-                                                (see tag_recv_zcopy) */
+        int32_t              ptn;          /**< pte->ptn, or -1 if no PTE;
+                                                compared with an event's
+                                                ptlte_index */
+        struct c_target_cmd  recv_le;      /**< The priority LE every posted
+                                                receive is, but for buffer
+                                                and tag */
         struct cxil_pte_map *pte_map;
         int                  enabled;      /**< Opened this run: UCP supplied both
                                                 HW_TM callbacks and TAG_ENABLE!=no */
@@ -618,133 +453,68 @@ typedef struct uct_cxi_iface {
         uct_tag_unexp_rndv_cb_t  rndv_cb;
         void                     *rndv_arg;
 
-        /* Outstanding priority-LE tracking -- one slot per posted
-         * tag_recv_zcopy() call. buffer_id on the APPEND command is the
-         * only correlation field hardware returns (c_target_cmd has no
-         * user_ptr, unlike c_full_dma_cmd), so it doubles as the slot
-         * index into ctx[]. */
+        /* One slot per posted tag_recv_zcopy(); the APPEND's buffer_id (the
+         * only field hardware returns) indexes ctx[]. */
         uct_tag_context_t  **ctx;          /**< [max_outstanding]; NULL = free */
         uint16_t             *free_list;   /**< Stack of free slot indices     */
         unsigned              free_count;  /**< Valid entries in free_list     */
         unsigned              max_outstanding;
 
-        /* Per-slot force-cancel bookkeeping -- deliberately NOT stored in
-         * the ctx's own priv (uct_cxi_tag_ctx_priv_t used to have its own
-         * cancel_force field there; removed once every reader moved to
-         * this array instead, since a field no event handler may ever
-         * read again has no reason to keep existing). force=1 means UCP
-         * "assumes the cancel is... successful" the
-         * instant it calls tag_recv_cancel() (uct.h's own doc comment)
-         * and is free to recycle the ucp_request_t ctx/priv live in for a
-         * completely different receive before our async C_EVENT_UNLINK
-         * confirmation (or a real match landing on the same slot in the
-         * meantime) ever arrives -- confirmed on real hardware
-         * (cxi_tag.c:1511's own assertion firing with a *different*,
-         * live receive's own priv->slot value once UCP reused the
-         * memory). Any handler touching a slot must check cancel_ctx[slot]
-         * .force first, before dereferencing ctx/priv for anything -- if
-         * set, reclaim using only this struct's own fields, never ctx.
-         *
-         * rndv_seen exists because a force-cancelled *rendezvous* receive
-         * can still have up to 3 more real hardware events arrive for its
-         * slot (Put/Put_Overflow, Rendezvous, Reply -- see
-         * UCT_CXI_RNDV_SEEN_* in cxi_tag.h), all of which must be drained
-         * before the slot number is safe to reuse (the underlying LE/pull
-         * is still physically in flight in hardware until then --
-         * reclaiming the slot number early risks a second, unrelated
-         * receive sharing the same buffer_id while the old one's
-         * remaining events are still arriving). Since priv->rndv_flags
-         * (where this accumulation normally lives) is exactly the unsafe-
-         * to-touch memory this struct exists to avoid, tag_recv_cancel()
-         * snapshots whatever's accumulated so far into rndv_seen at the
-         * moment force-cancel is requested (still safe: read
-         * synchronously, before UCP can have reused anything), and every
-         * later event for this slot accumulates into it instead of priv
-         * from then on. Unused (stays 0) for a plain eager receive. */
+        /* Per-slot force-cancel state, kept out of the ctx's priv: after a
+         * forced cancel UCP may reuse that memory before our UNLINK arrives, so
+         * handlers check cancel_ctx[slot].force before touching ctx. rndv_seen
+         * snapshots the rendezvous events seen at cancel time (up to 3 more may
+         * arrive, UCT_CXI_RNDV_SEEN_*); all must drain before the slot is
+         * reused. Stays 0 for an eager receive. */
         struct {
             uint8_t force;
             uint8_t rndv_seen;
         } *cancel_ctx; /**< [max_outstanding] */
 
-        /* Overflow ring: same shape as am.rx_base/am.rx_mh (contiguous
-         * alloc, one registration, buffer_id-indexed, manage_local), real
-         * overflow-list semantics (unexpected_hdr_disable=0). Each
-         * message's data stays in place until whichever event resolves it
-         * (a real priority-LE delayed match, or our own SEARCH_AND_DELETE)
-         * -- see ovf_refcnt below for why a buffer generation can't be
-         * reposted just because its last arrival set auto_unlinked. */
+        /* Overflow ring, shaped like am.rx_base with overflow-list semantics. A
+         * message stays in place until its resolving event (a delayed match or
+         * our SEARCH_AND_DELETE); see ovf_refcnt. */
         uint8_t              *rx_base;
         uct_cxi_mem_handle_t  rx_mh;
         unsigned              num_bufs;
         size_t                buf_size;
-        size_t                unexp_max;   /**< Unexpected messages that can be
-                                                held at once (entries, streams):
-                                                what the credits allow, if flow
-                                                control is on */
-        size_t                max_msg;     /**< Largest eager message: what is
+        size_t                unexp_max;   /**< Unexpected messages held at
+                                                once (entries, streams): what
+                                                the credits allow with flow
+                                                control */
+        size_t                max_msg;     /**< Largest eager message:
                                                 advertised, and the LEs'
-                                                min_free, so that one always
-                                                fits in what is left of the
-                                                buffer it matched */
+                                                min_free so one always fits */
 
-        /* Per-buffer-generation reference count -- mirrors libfabric's own
-         * cxip_ptelist_buf refcount/consumed design (cxip_ptelist_buf.c).
-         * Incremented on a C_EVENT_PUT into this buffer only when
-         * mlength>0 -- an mlength==0 arrival has no payload actually
-         * sitting in the overflow buffer's memory for anything to read
-         * later, so there is nothing to protect and no reference is taken
-         * for it at all. Decremented, symmetrically, only by whichever
-         * event both resolves that specific message AND actually read its
-         * payload (uct_cxi_iface_tag_ovf_release(), called only when that
-         * event's own mlength>0 too). A buffer generation's auto_unlinked
-         * flag (set on its last arrival) only records that a repost is
-         * *pending* (ovf_repost_pending) -- the actual repost is deferred
-         * until refcnt drains to 0, so an unresolved earlier message in the
-         * same generation can never have its memory reused out from under
-         * it.
-         *
-         * Signed, not unsigned: the event that decrements a given arrival's
-         * reference (a real priority-LE delayed match, or our own
-         * SEARCH_AND_DELETE outcome) is not guaranteed to be delivered
-         * after that same arrival's own raw C_EVENT_PUT -- confirmed on
-         * real hardware (a second cluster hit refcnt==0 inside
-         * uct_cxi_iface_tag_ovf_release() before that arrival's own
-         * increment had run). A decrement can thus transiently land before
-         * its matching increment, taking this negative; uct_cxi_iface_tag_
-         * ovf_release() and tag_handle_ovf_arrival() both only ever act on
-         * the exact value 0 via uct_cxi_iface_tag_ovf_maybe_repost() (never
-         * "<= 0"), so this transient state never triggers a premature
-         * repost -- it just waits for the out-of-order increment to bring
-         * it back to net zero. */
+        /* Per-buffer-generation reference count (as libfabric's
+         * cxip_ptelist_buf). Taken on a PUT with mlength > 0, dropped by the
+         * event that resolves the message after reading its payload
+         * (uct_cxi_iface_tag_ovf_release). auto_unlinked only marks a repost
+         * pending; it happens at zero. Signed: the resolving event can arrive
+         * before the PUT's own increment, so it may go transiently negative;
+         * reposting acts on exactly 0 only. */
         int32_t              *ovf_refcnt;          /**< [num_bufs] */
         uint8_t              *ovf_repost_pending; /**< [num_bufs] */
 
-        /* uct_cxi_rdzv_get_op_t pool for software-issued (get_issued==0)
-         * rendezvous Gets -- see cxi_tag.h. Capped the same as
-         * max_outstanding: can never have more outstanding software Gets
-         * than outstanding priority-LE receives. */
+        /* Pool of software-issued rendezvous Gets, capped like
+         * max_outstanding. */
         ucs_mpool_t           rdzv_get_op_pool;
 
-        /* Per-peer unexpected-rndv header cache -- see uct_cxi_rndv_peer_
-         * hdr_t's own doc comment above. Populated by uct_cxi_iface_
-         * handle_rndv_hdr_announce() (cxi_tag.c), the receive-side handler
-         * for each peer's one-time control-message announce. */
+        /* Per-peer unexpected-rndv header cache, filled by
+         * uct_cxi_iface_handle_rndv_hdr_announce(). */
         khash_t(uct_cxi_rndv_peer_hash) rndv_peer_cache;
 
         /* Unexpected eager messages with data that have had one of their
          * two events, see uct_cxi_eager_pair_t. */
         khash_t(uct_cxi_eager_pair_hash) eager_pairs;
 
-        /* Unexpected messages held for the report to UCP -- see
-         * uct_cxi_unexp_report_t in cxi_tag.h. unexp_ents is a registered
-         * array of tag.max_outstanding entries (each is also the landing
-         * buffer of its own address read), with unexp_free their free list.
-         * They are chained per (sender, tag) in unexp_streams, found by that
-         * key, with unexp_stream_pool the streams' storage and
-         * unexp_stream_free their free list. unexp_wait holds the rendezvous
-         * whose sender's announce is not seen yet. unexp_held counts the
-         * rendezvous entries in the chains, so the eager path only looks for
-         * a stream when it is not 0. */
+        /* Unexpected messages held for the report to UCP
+         * (uct_cxi_unexp_report_t): unexp_ents is a registered array (also each
+         * address read's landing buffer) with free list unexp_free, chained per
+         * (sender, tag) in unexp_streams (storage unexp_stream_pool, free list
+         * unexp_stream_free). unexp_wait holds rendezvous whose sender's
+         * announce is not seen yet; unexp_held counts rendezvous entries, so
+         * the eager path looks for a stream only when it is not 0. */
         khash_t(uct_cxi_unexp_stream_hash) unexp_streams;
         uct_cxi_unexp_stream_t *unexp_stream_pool;
         uct_cxi_unexp_stream_t *unexp_stream_free;
@@ -761,12 +531,10 @@ typedef struct uct_cxi_iface {
                                                      as they are handled: the
                                                      order of a stream's chain */
 
-        /* The posted receives that may take an unexpected message: see
-         * uct_cxi_tag_pend_t. pend_head is where the next is put and
-         * pend_tail the oldest not yet covered by a fence (both count up and
-         * wrap; an index is the count modulo UCT_CXI_TAG_PEND_SIZE).
-         * slot_pos[slot] is a receive's count. fences[] holds, for each fence
-         * in flight (fence_tail..fence_head), the pend_head it covers. */
+        /* Receives that may take an unexpected message (uct_cxi_tag_pend_t).
+         * pend_head and pend_tail count up and wrap (index modulo
+         * UCT_CXI_TAG_PEND_SIZE); slot_pos[slot] is a receive's count; fences[]
+         * holds the pend_head each in-flight fence covers. */
         uct_cxi_tag_pend_t   *pend;        /**< [UCT_CXI_TAG_PEND_SIZE] */
         uint32_t             *slot_pos;    /**< [max_outstanding] */
         uint32_t             *fences;      /**< [UCT_CXI_TAG_PEND_SIZE] */
@@ -780,54 +548,34 @@ typedef struct uct_cxi_iface {
         uct_cxi_pte_fc_t      fc;          /**< Recovery state for tag.pte */
     } tag;
 
-    /* ── Rendezvous source-exposure portal (matching, pid_offset =
-     * md->cxi_dev->info.rdzv_get_idx -- a fixed hardware-mandated value,
-     * see UCT_CXI_MAX_LACS's own comment above) ──────────────────────
-     * Same shape as libfabric's own DEFAULT rendezvous protocol source
-     * PTE (cxip_rdzv_match_pte_alloc/cxip_rdzv_pte_src_req_alloc,
-     * cxip_rdzv_pte.c): is_matching=1, one persistent whole-LAC-range
-     * catch-all LE (match_bits=0/ignore_bits=~0, fully wildcarded -- we
-     * have nothing to disambiguate at the matching level itself, being
-     * LAC-0-only; matching mode is used here purely to put the resulting
-     * Get on the wire format that actually carries match_bits, see
-     * uct_ep_tag_rndv_zcopy's own comment). Differs from a genuine
-     * matching PTE like TAG/AM only in still being op_get-only, no
-     * op_put. LAC 0 only, opened eagerly at iface_open whenever tag
-     * offload is enabled (rendezvous has no meaning without it). See
-     * cxi_tag.c. */
+    /* ── Rendezvous source-exposure portal (pid_offset = rdzv_get_idx, fixed by
+     * hardware) ──
+     * As libfabric's default rendezvous source PTE: matching, one wildcard LE
+     * over the whole range, op_get only; matching mode only puts the Get on
+     * the wire format that carries match_bits. LAC 0, opened when tag offload
+     * is enabled (cxi_tag.c). */
     struct {
         struct cxil_pte      *pte;        /**< NULL until HW tag offload enabled */
-        int32_t               ptn;        /**< pte->ptn, or -1 while there is no
-                                               pte (see tag.ptn) */
+        int32_t               ptn;        /**< pte->ptn, or -1 if no PTE;
+                                               compared with an event's
+                                               ptlte_index */
         struct cxil_pte_map  *pte_map;
         int                   enabled;
 
-        /* Outstanding zcopy-exposed sends, one entry per
-         * uct_ep_tag_rndv_zcopy() call not yet completed or cancelled.
-         * ops[] is a plain fixed-size array (not a pool) indexed by a
-         * small dense id that IS the array index -- the arriving
-         * C_EVENT_GET's own match_bits carries this id back to us
-         * (DEFAULT-protocol style, see uct_ep_tag_rndv_zcopy and
-         * uct_cxi_iface_tag_handle_rdzv_get), giving O(1) lookup instead
-         * of the address-based linear scan this replaced. Capped at
-         * UCT_CXI_RDZV_MAX_OUTSTANDING_MAX (256) -- see cxi_tag.h for
-         * why: the id has to survive a hop through the Put's own 8-bit
-         * cmd.rendezvous_id field first. */
+        /* Outstanding rndv sends (uct_ep_tag_rndv_zcopy) by a dense id that the
+         * C_EVENT_GET match_bits carries back. At most
+         * UCT_CXI_RDZV_MAX_OUTSTANDING_MAX: the id passes through an 8-bit
+         * field. */
         struct uct_cxi_rdzv_op *ops;       /**< [max_outstanding] */
         uint32_t              *free_ids;   /**< Stack of free indices into ops[] */
         uint32_t               free_count;
         uint32_t               max_outstanding;
 
-        /* Source addresses of the outstanding rendezvous sends, by id:
-         * addr_table[id] is the IOVA of the buffer that rendezvous exposes.
-         * Registered, so a peer can read it with an ordinary RMA Get (its
-         * base address reaches the peer in this ep's one-time announce). The
-         * hardware does not tell a target the source address of a
-         * rendezvous it takes off the unexpected list -- the event's
-         * remote_offset is 0 there -- so a target that needs it reads the
-         * slot. Written once per rendezvous send, before its Put. Sized for
-         * every possible 8-bit id, so that a read can never fall outside
-         * it. */
+        /* addr_table[id]: IOVA of the buffer rendezvous id exposes, registered
+         * so a peer can read it with an RMA Get (base sent in the ep's
+         * announce); the hardware gives a target no source address for an
+         * unexpected rendezvous. Written before the Put; all 256 ids, so a read
+         * stays inside. */
         uint64_t              *addr_table;
         uct_cxi_mem_handle_t   addr_table_mh;
         size_t                 addr_table_len;   /**< registered bytes */
@@ -839,13 +587,10 @@ typedef struct uct_cxi_iface {
     struct {
         struct cxil_pte      *pte;         /**< Unrestricted AM portal */
         struct cxil_pte_map  *pte_map;
-        /* N-buffer rotation on the PRIORITY list.  All buffers are posted
-         * at init.  The NIC writes to the head buffer using manage_local=1.
-         * When remaining space drops below max_msg (the LE's min_free), the
-         * NIC auto-unlinks that buffer and moves to the next, and the Put that
-         * did it is flagged auto_unlinked, which reposts the buffer at the
-         * tail of the list.  A Put that does not fit what is left of a linked
-         * buffer is not tried against the next one: it fails with NO_SPACE. */
+        /* PRIORITY-list ring of manage_local buffers, all posted at init. A
+         * buffer unlinks itself when less than max_msg is left, flagging the
+         * Put that did it (auto_unlinked), which reposts it at the tail. A Put
+         * that does not fit the linked buffer fails with NO_SPACE. */
         uint8_t              *rx_base;     /**< Single contiguous allocation */
         uct_cxi_mem_handle_t  rx_mh;       /**< Single cxil_map for rx_base  */
         unsigned              num_bufs;    /**< Runtime buffer count          */
@@ -868,12 +613,8 @@ typedef struct uct_cxi_iface {
     /* ── Domain (VNI + PID) ─────────────────────────────────────────── */
     struct cxil_domain   *domain;
 
-    /* The identity this interface sends as the "initiator" of every
-     * unrestricted command (CXI_MATCH_ID of its pid and NIC address). The
-     * target's events report the initiator exactly as the sender put it in the
-     * command, so a sender that leaves it zero is indistinguishable from every
-     * other to the receiver, which keys per-peer state on it (see
-     * tag.rndv_peer_cache). Restricted RMA/AMO commands have no such field. */
+    /* The "initiator" of every unrestricted command; targets key per-peer state
+     * on it (tag.rndv_peer_cache). Restricted RMA/AMO commands have none. */
     uint32_t              match_id;
 
 } uct_cxi_iface_t;
@@ -886,14 +627,8 @@ uct_cxi_iface_md(uct_cxi_iface_t *iface)
 }
 
 /*
- * uct_cxi_rc_to_status — map a CXI hardware return code to a ucs_status_t
- * for completion reporting.
- *
- * C_RC_PT_DISABLED maps to UCS_ERR_BUSY rather than a connection/endpoint
- * failure code: the target PTE is in a known, actively-recovering state
- * (en_flowctrl), not a broken connection — UCS_ERR_BUSY's "try again"
- * connotation matches that. Everything else not explicitly handled here
- * maps to the generic UCS_ERR_IO_ERROR.
+ * Map a hardware return code to a status: PT_DISABLED is UCS_ERR_BUSY (the
+ * target is recovering, "try again"); anything unlisted UCS_ERR_IO_ERROR.
  */
 static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_rc_to_status(int rc)
 {
@@ -920,11 +655,8 @@ ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
 END_C_DECLS
 
 /**
- * A command could not be written to the TX command queue (\a ret is what the
- * emit returned) and the send is going back to its caller as
- * UCS_ERR_NO_RESOURCE. A full queue (-ENOSPC) is the ordinary reason, a
- * resource shortage like any other the caller retries from its pending queue,
- * and says nothing; anything else is unexpected and is logged.
+ * A command could not be emitted (\a ret): -ENOSPC is an ordinary shortage and
+ * silent; anything else is logged.
  */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_tx_emit_error(const void *obj, const char *what, int ret)
@@ -935,16 +667,9 @@ uct_cxi_tx_emit_error(const void *obj, const char *what, int ret)
 }
 
 /**
- * Submit a 64-byte target command (struct c_target_cmd or struct
- * c_set_state_cmd) on the target command queue.
- *
- * A full queue is transient -- it only means the NIC has not consumed what
- * was already rung -- so on failure this waits in place until there is room,
- * for at most UCT_CXI_TGT_CMDQ_TIMEOUT_SEC. Callers (event handlers that
- * cannot hand a failure back to anyone) can therefore treat UCS_OK as "the
- * NIC has it". Returns UCS_ERR_TIMED_OUT if the queue stays full for the
- * whole timeout (a wedged NIC), or UCS_ERR_IO_ERROR on any other emit
- * failure.
+ * Submit a 64-byte target command. A full queue is transient, so this waits up
+ * to UCT_CXI_TGT_CMDQ_TIMEOUT_SEC; event handlers can treat UCS_OK as "the NIC
+ * has it". UCS_ERR_TIMED_OUT if still full, else UCS_ERR_IO_ERROR.
  */
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd)
@@ -1021,9 +746,8 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
 void         uct_cxi_ctrl_close(uct_cxi_iface_t *iface);
 
 /**
- * Send a control message to \a peer's control PTE; UCS_ERR_NO_RESOURCE if the
- * channel has no room (retry later). \a grant_slots and \a grant_units are
- * what a GRANT carries, and are handed back with its completion.
+ * Send a control message to \a peer; UCS_ERR_NO_RESOURCE if the channel is
+ * full. \a grant_slots and \a grant_units are what a GRANT carries.
  */
 ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                unsigned type, uint64_t match_bits,
@@ -1032,10 +756,8 @@ ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
 
 /* cxi_peer.c */
 
-/**
- * Find or create the peer record for remote interface (\a nid, \a pid).
- * Returns NULL only if memory for the record could not be allocated.
- */
+/** Find or create the record of remote iface (\a nid, \a pid); NULL on no
+ *  memory. */
 uct_cxi_peer_t *uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid,
                                  uint32_t pid);
 
@@ -1068,11 +790,8 @@ void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
 /** Make runnable the endpoints of \a peer that were waiting for credits. */
 void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
 
-/**
- * Take back the credits of a send to \a peer that the target will never hand
- * back: it never arrived, or the target does not track it (a tag message that
- * matched a posted receive).
- */
+/** Take back credits the target will never return: the send was lost, or the
+ *  target does not track it (a tag message that matched a posted receive). */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_fc_reclaim(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer, unsigned cls,
                    unsigned slots, unsigned units)
@@ -1102,11 +821,8 @@ void uct_cxi_fc_unblock_ep(struct uct_cxi_ep *ep);
 
 END_C_DECLS
 
-/**
- * The record for the sender of the Active Message just received, or NULL.
- * A sender without flow control has none and is not charged, so there is
- * nothing to hand back to it.
- */
+/** The record of the sender of the AM just received, or NULL (no flow control:
+ *  not charged). */
 static UCS_F_ALWAYS_INLINE uct_cxi_peer_t *
 uct_cxi_fc_rx_peer(uct_cxi_iface_t *iface, uint32_t process)
 {
@@ -1118,11 +834,8 @@ uct_cxi_fc_rx_peer(uct_cxi_iface_t *iface, uint32_t process)
     return uct_cxi_fc_rx_peer_slow(iface, process);
 }
 
-/**
- * A message of class \a cls and \a mlength bytes from \a peer, which the
- * sender charged \a slots event slots, has been processed: the sender's
- * credits for it are now ours to give back.
- */
+/** A message of \a cls and \a mlength bytes from \a peer, charged \a slots, was
+ *  processed: its credits are ours to return. */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_fc_rx_done(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                    unsigned cls, unsigned slots, uint32_t mlength)

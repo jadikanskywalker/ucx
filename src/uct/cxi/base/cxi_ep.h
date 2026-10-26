@@ -18,18 +18,11 @@
 #include <cxi_prov_hw.h>
 
 /**
- * Per-send-op tracking record.
+ * Per-send tracking record, the user_ptr of its ACK/REPLY. From
+ * iface->tx.op_pool, or the first field of a uct_cxi_send_desc_t for bcopy.
  *
- * Allocated from iface->tx.op_pool for zcopy/short ops, or embedded as the
- * first field of uct_cxi_send_desc_t for bcopy ops.  Stored via user_ptr so
- * that iface_progress can retrieve it on C_EVENT_ACK or C_EVENT_REPLY.
- *
- * handler: NULL for zcopy/short (default path: invoke comp, mpool_put op).
- *          Set for bcopy: handler owns completion + returns desc to pool.
- *          Receives the real completion status — must skip any data
- *          copy/unpack (unpack_cb, memcpy) unless status == UCS_OK, since
- *          a failed GET/fetch's "result" buffer was never actually written
- *          by the remote and must not be delivered to the caller.
+ * handler: NULL for zcopy (invoke comp, free op). Set for bcopy: it completes
+ * and frees the desc, and must not unpack data unless status == UCS_OK.
  */
 typedef struct uct_cxi_send_op {
     struct uct_cxi_ep *ep;      /**< Owning EP — used to decrement outstanding */
@@ -38,29 +31,19 @@ typedef struct uct_cxi_send_op {
 #ifndef UCT_CXI_DISABLE_FC
     uint32_t           fc_units;    /**< flow-control cost of buffer space, in
                                          units, of class fc_class...          */
-    uint8_t            fc_slots;    /**< ...and in event slots, to take back if
-                                         the send fails or is answered from the
-                                         priority list; 0 if it was not
-                                         charged. Must be 0 whenever the op is
-                                         not in use: set when the pool creates
-                                         it, cleared by the completion that
-                                         consumed it                          */
+    uint8_t            fc_slots;    /**< ...and in event slots, to take back
+                                         on failure or a priority match; 0 if
+                                         uncharged. Must be 0 when the op is
+                                         unused.                              */
     uint8_t            fc_class;    /**< uct_cxi_fc_class_t of the charge   */
 #endif
 } uct_cxi_send_op_t;
 
 
 /**
- * Bounce-buffer descriptor for put_bcopy / get_bcopy.
- *
- * op must be first so that (uct_cxi_send_op_t *)desc == &desc->op; the NIC
- * stores desc as user_ptr and iface_progress casts it back to send_op_t.
- *
- * iova and lac are pre-computed at pool initialisation time (obj_init
- * callback) from the chunk's cxil_map registration — zero per-op overhead.
- *
- * The data payload immediately follows the struct: (uint8_t *)(desc + 1).
- * Its size is iface->tx.max_bcopy.
+ * Bounce-buffer descriptor for put_bcopy / get_bcopy. \a op must be first
+ * (desc is the user_ptr). iova and lac are set at pool init. The payload
+ * follows the struct, iface->tx.max_bcopy bytes.
  */
 typedef struct uct_cxi_send_desc {
     uct_cxi_send_op_t       op;         /**< Must be first                          */
@@ -73,17 +56,10 @@ typedef struct uct_cxi_send_desc {
 
 
 /**
- * CXI endpoint.
+ * CXI endpoint. All DFAs are built at ep_create.
  *
- * rem_nid and rem_pid identify the remote peer.  All DFAs are built eagerly
- * at ep_create — no hot-path conditional needed.
- *
- * dfa_rma[lac]: per-LAC DFA for restricted-mode RMA/AMO (pid_offset = lac).
- *   All UCT_CXI_MAX_LACS entries are built at ep_create; an operation
- *   selects dfa_rma[rkey->lac] -- the *target* buffer's LAC, since that's
- *   what determines which of the target's per-LAC PTEs/LEs must resolve
- *   remote_offset (see cxi_rma.c for why routing has to be per-LAC).
- * dfa_am: DFA for unrestricted Active Messages (pid_offset = UCT_CXI_PTE_AM).
+ * dfa_rma[lac]: restricted RMA/AMO DFA; an operation uses the entry of the
+ *   target buffer's LAC (rkey->lac), which selects the target PTE.
  */
 typedef struct uct_cxi_ep {
     uct_base_ep_t     super;                              /**< Must be first */
@@ -100,47 +76,23 @@ typedef struct uct_cxi_ep {
     ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */
 #ifndef UCT_CXI_DISABLE_FC
     struct uct_cxi_peer *peer;         /**< Remote iface's flow-control state,
-                                             shared with every ep to it; NULL
-                                             when flow control is off */
+                                             shared by its eps; NULL if off */
     struct uct_cxi_ep *next_blocked;   /**< Next ep waiting for credits on the
                                              same peer (uct_cxi_peer_t::blocked) */
     uint8_t           fc_listed;       /**< Is on peer->blocked */
 #endif
-    uint8_t           destroyed;       /**< uct_ep_destroy() was called while
-                                             sends were still in flight; the
-                                             last completion frees the ep (see
-                                             uct_cxi_ep_destroy) */
-    uint8_t           rndv_hdr_announced; /**< 0 until this ep's one-time
-                                             rendezvous-header announce
-                                             (ep_id, md_index) has been sent
-                                             -- see uct_ep_tag_rndv_zcopy and
-                                             uct_cxi_ep_send_rndv_hdr_announce
-                                             in cxi_am.c. Not resent once
-                                             sent (only reset to 0 when the
-                                             send is refused, so the next
-                                             rndv send retries). */
+    uint8_t           destroyed;       /**< destroyed with sends in flight; the
+                                             last completion frees it */
+    uint8_t           rndv_hdr_announced; /**< the one-time rendezvous-header
+                                               announce has been sent */
 } uct_cxi_ep_t;
 
 /*
- * uct_cxi_iface_tx_blocked -- true if this send should be deferred to the
- * pending/arbiter retry path rather than attempted now.
- *
- * Two independent reasons, both gate identically (return
- * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion -- no new
- * caller-visible status):
- *   - pte_fc->exhausted: the *specific* PTE this op targets has hit
- *     matching-resource exhaustion (AM only -- pass NULL for RMA/AMO ops,
- *     which never populate this; see uct_cxi_pte_fc_t). Unrelated PTEs'
- *     traffic is unaffected.
- *   - iface->tx.outstanding >= iface->tx.max_inflight: the TX event queue
- *     has no slot left for another completion. Every counted send yields
- *     exactly one TX event, so this is what keeps the queue from
- *     overflowing: a send takes a slot when it is rung and gives it back
- *     when its completion is processed (RC's tx_cq_available, per iface).
- *
- * Deliberately not gated on the RX EQ being drained after a drop: with
- * separate TX and RX event queues, local sends only produce TX completions
- * and can no longer refill the RX queue out from under that drain.
+ * True if a send must wait on the pending queue (UCS_ERR_NO_RESOURCE):
+ *   - the target PTE hit matching-resource exhaustion (\a pte_fc, NULL for
+ *     RMA/AMO);
+ *   - the TX queue has no slot for another completion: each counted send
+ *     yields one event, so tx.max_inflight keeps the queue from overflowing.
  */
 static UCS_F_ALWAYS_INLINE int
 uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
@@ -151,26 +103,14 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
 }
 
 /*
- * IDC "short" sends (AM, tag, rendezvous-header announce) carry no per-send
- * descriptor, so their completion is tracked by tagging the command's user_ptr
- * with UCT_CXI_USER_PTR_SHORT and storing the ep pointer itself: no pool
- * element to take or return, and the completion handler gets the ep it needs
- * to account the send against. Ops, which are pointers to a uct_cxi_send_op_t
- * (at least 8-byte aligned), never have this bit set.
+ * A short (IDC) send has no descriptor: its user_ptr is the ep pointer tagged
+ * with UCT_CXI_USER_PTR_SHORT (ops are aligned pointers and never have the
+ * bit). Bits [62:56] carry its flow-control cost in units, bit 63 whether it
+ * was charged, and bit 2 (UCT_CXI_USER_PTR_TAG) the class (set for tag
+ * matching), so a failed send can be refunded.
  *
- * The top byte of a short's user_ptr carries its flow-control cost, so a
- * failed one can be refunded without a descriptor to look it up in: bits
- * [62:56] the cost in units (a short is at most 192 bytes, 3 units), bit 63
- * set if it was charged at all. Userspace pointers have those bits clear. The
- * class it was charged to is bit 2, set for tag matching (an endpoint is at
- * least 8-byte aligned); its event slots are those of the class's short
- * message: one, for an Active Message or an eager tag message.
- *
- * Tracked Active Message shorts exist to make connected-endpoint flow control
- * possible -- without a completion there is nothing to refund a lost send's
- * credit from -- so a build without it keeps the untracked fire-and-forget
- * path for them. Restricted shorts (RMA, atomics) are tracked in every build:
- * the flush has to wait for them.
+ * Active Message shorts are tracked only with flow control (no refund
+ * otherwise); restricted shorts (RMA, atomics) always, for the flush.
  */
 #define UCT_CXI_USER_PTR_SHORT  1ULL
 
@@ -182,13 +122,7 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
 #define UCT_CXI_USER_PTR_CREDITED       (1ULL << 63)
 #define UCT_CXI_USER_PTR_PTR_MASK       ((1ULL << UCT_CXI_USER_PTR_UNITS_SHIFT) - 1)
 
-/*
- * The user_ptr of a restricted short (an RMA put_short or a non-fetching
- * atomic): its ep, and nothing else. Nothing is charged, so it is accounted to
- * its ep alone, like any other tagged short, and nothing needs a send op: its
- * completion has no callback and no data to deliver, and a failure is
- * reported by the ep's flush, as for every other send.
- */
+/* The user_ptr of an uncharged restricted short (put_short, atomic post). */
 static UCS_F_ALWAYS_INLINE uint64_t
 uct_cxi_ep_restricted_user_ptr(const uct_cxi_ep_t *ep)
 {
@@ -250,22 +184,15 @@ uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned cls,
 
 #else
 
-/**
- * Make the send's completion event land on the TX EQ. Goes in the c_state
- * command that precedes the IDC message.
- */
+/** Report the send's completion on the TX EQ (in the preceding c_state). */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
 {
     cstate->eq = iface->tx_eq.evtq->eqn;
 }
 
-/**
- * Tag the completion with \a ep and the send's flow-control cost. For an
- * unrestricted IDC message the event's user_ptr is the one in the message's
- * own header -- the c_state command's user_ptr only applies to restricted IDC
- * puts -- so this goes in the c_idc_msg_hdr, not the c_state.
- */
+/** Tag the completion with \a ep and the flow-control cost (in the message
+ *  header: an unrestricted IDC ignores the c_state user_ptr). */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep,
                       unsigned cls, unsigned units, int credited)
@@ -295,13 +222,10 @@ ucs_status_t uct_cxi_fc_reserve_slow(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
 END_C_DECLS
 
 /**
- * May a send of class \a cls costing \a slots event slots and \a units of
- * that class's buffer space go out to this ep's peer? If so, \a *credited_p
- * says whether it must be charged (the peer is credit-controlled) or not (no
- * flow control: the peer is LEGACY, or the ep has no peer record). If not,
- * UCS_ERR_NO_RESOURCE: no credits of either kind, or the handshake is still
- * in flight; iface->tx.credit_block is set so the pending queue knows to wait
- * for credits rather than for interface resources.
+ * May a send of class \a cls costing \a slots and \a units go to this ep's
+ * peer? \a *credited_p says whether it must be charged (not for LEGACY peers).
+ * Else UCS_ERR_NO_RESOURCE (no credits, or handshake in flight) with
+ * iface->tx.credit_block set.
  */
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_cxi_fc_reserve(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, unsigned cls,
@@ -338,11 +262,9 @@ uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited, unsigned cls, unsigned slots,
 }
 
 /**
- * match_bits to piggyback on an outgoing Active Message to this ep's peer:
- * the credits we owe it for messages it sent us and we have processed, or 0
- * if nothing is owed. The counters go in granules (see uct_cxi_fc_pb_shift),
- * so a piggyback is only worth sending once a counter has moved on by at least
- * one. See uct_cxi_fc_pb_sent() for the other half.
+ * match_bits to piggyback on an Active Message to this ep's peer: the credits
+ * we owe it, or 0 if less than a granule is owed (uct_cxi_fc_pb_sent() is the
+ * other half).
  */
 static UCS_F_ALWAYS_INLINE uint64_t
 uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
@@ -393,11 +315,7 @@ uct_cxi_fc_pb_advance(uint32_t *adv, uint32_t ret, unsigned shift)
     }
 }
 
-/**
- * The message carrying \a bits (from uct_cxi_fc_pb_bits) has been rung: the
- * peer now knows our counters to the granule, no further than that. (A GRANT
- * may have told it more exactly: that stays.)
- */
+/** The message carrying \a bits (uct_cxi_fc_pb_bits) has been rung. */
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_fc_pb_sent(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, uint64_t bits)
 {
@@ -428,18 +346,11 @@ uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned cls,
 #endif /* UCT_CXI_DISABLE_FC */
 
 /**
- * Send \a length bytes of \a data as one unrestricted inline (IDC) message to
- * \a dfa: a c_state command that says where the send's completion goes, then
- * the message itself, rung together, with the send counted against its ep and
- * tracked by its completion (see uct_cxi_idc_track_hdr; \a cls, \a units and
- * \a credited are its flow-control charge, which the caller applies).
- * \a header_data travels out of band with the message, and is 0 for all but a
- * tagged software rendezvous request.
- *
- * UCS_ERR_NO_RESOURCE if the command queue has no room, with nothing counted.
- * A c_state already written then stays in the queue, harmlessly: every IDC
- * send writes its own before its message. \a what names the caller in the
- * log if the failure is not a full queue.
+ * Send \a length bytes of \a data as one unrestricted IDC message to \a dfa,
+ * counted against its ep and tracked by its completion. \a cls, \a units and
+ * \a credited are its flow-control charge, which the caller applies;
+ * \a header_data is 0 except for a tagged software rendezvous request.
+ * UCS_ERR_NO_RESOURCE if the command queue is full, with nothing counted.
  */
 static UCS_F_ALWAYS_INLINE ucs_status_t
 uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,

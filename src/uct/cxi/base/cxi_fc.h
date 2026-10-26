@@ -2,52 +2,32 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI connected-endpoint flow control: per-peer state and the control channel
- * that establishes it.
+ * CXI connected-endpoint flow control: per-peer state and the handshake that
+ * establishes it.
  *
- * The CXI hardware is connectionless, so the transport builds a software
- * connection per remote interface (a "peer"), shared by every endpoint to it.
- * A peer is set up by a two-message handshake on a dedicated control PTE:
+ * The hardware is connectionless, so the transport keeps a software "peer"
+ * per remote interface, shared by every endpoint to it. A peer is set up by
+ * a handshake on the control channel (cxi_ctrl.c):
  *
  *   initiator                                 target
  *     CREQ(epoch) ------------------------->  creates its peer record
  *     <---------------- CREP(echo, windows)   grants the initiator its windows
  *
- * Each direction is independent: the initiator learns the windows the target
- * grants it, and nothing is needed in the other direction until that side
- * creates endpoints of its own.
+ * Each direction is independent.
  *
- * The windows are credits, of two kinds. Event slots bound the receive event
- * queue, which everything a peer sends shares: a message costs the slots of
- * the events it can leave in the queue until it has been processed. Buffer
- * space (in units of UCT_CXI_FC_UNIT bytes) bounds a receive ring, and each
- * class of message that has a ring of its own (Active Messages, tag matching;
- * see uct_cxi_fc_class_t) has a pool of its own. A sender may not send
- * without credits of both kinds, so it can never have more outstanding to a
- * target than the target granted. The target hands credits back only after it
- * has processed a message (run its handler), which is what ties the send rate
- * to the target's processing rate. Credits go back as CUMULATIVE counters, "I
- * have processed N slots and M units from you so far": the sender applies the
- * increase over what it last saw, so a lost, duplicated or reordered grant is
- * harmless, and the next one repairs it. They ride piggybacked on any Active
- * Message to that peer, or on a pure GRANT control message once half a window
- * is owed. A peer whose target has no control PTE (built with
- * --disable-cxi-fc, or UCX_CXI_FC_ENABLE=n) is marked LEGACY and treated as a
- * plain connectionless peer.
+ * The windows are credits of two kinds: event slots, which bound the receive
+ * EQ, and buffer space (UCT_CXI_FC_UNIT bytes) per message class that has a
+ * ring of its own (uct_cxi_fc_class_t). A sender needs both to send. The
+ * target returns credits after processing a message, as CUMULATIVE counters,
+ * so a lost, duplicated or reordered grant is repaired by the next one. They
+ * ride on any Active Message to that peer (piggyback), or on a GRANT message
+ * once half a window is owed. A peer without a control PTE (--disable-cxi-fc
+ * or UCX_CXI_FC_ENABLE=n) is LEGACY: uncredited, treated as connectionless.
  *
- * Without credits nothing ties a sender to its target's processing rate, and
- * the transport cannot make up for it. A target that falls behind (a stream of
- * small tagged messages, whose each costs it an arrival, a search, a callback
- * and a receive to post) fills its receive event queue or its unexpected
- * list; the hardware then disables its portal table entry (flow control, with
- * the reason EQ full or unexpected-list failure), recovery enables it again,
- * and the messages sent in between are lost without the sender being told:
- * UCP tag_bw at 8 B, with flow control off, stops after about a thousand
- * messages in some runs (a larger UCX_CXI_EQ_SIZE only moves where). A
- * build or run without flow control is for bring-up and debugging, with
- * traffic the target keeps up with.
+ * Without credits a slow target can overflow its queues and lose messages
+ * silently; that is for bring-up and debugging only.
  *
- * This header is included only by cxi_iface.h, after uct_cxi_pte_fc_t.
+ * Included only by cxi_iface.h, after uct_cxi_pte_fc_t.
  */
 
 #ifndef UCT_CXI_FC_H
@@ -64,22 +44,17 @@
 #include <cxi_prov_hw.h>
 
 
-/* Control channel protocol version; a message with another version is
- * ignored (the sender then times out and treats the peer as FAILED). */
+/* Messages with another version are ignored (the handshake then times out). */
 #define UCT_CXI_CTRL_VERSION  2u
 
-/* Connection retry: a CREQ with no CREP yet is resent after this long,
- * doubling per attempt up to the cap. The retries are timers of a timer wheel
- * (uct_cxi_fc_iface_t::twheel) whose resolution is this base delay, so every
- * delay is at least one slot. */
+/* CREQ resend delay, doubling per attempt up to the cap. The timer wheel's
+ * resolution is the base delay. */
 #define UCT_CXI_CTRL_RETRY_BASE_US  50
 #define UCT_CXI_CTRL_RETRY_MAX_US   50000
 
 /*
- * Control message wire layout. Messages are zero-payload IDC sends to the
- * peer's control PTE; everything travels in the 128 bits of match_bits and
- * header_data, which the control PTE's wildcarded list entry delivers
- * verbatim.
+ * Control message layout, in the match_bits and header_data of a zero-payload
+ * send:
  *
  *   match_bits  [63:60] type   [59:56] version
  *               [55:32] sender's own epoch, low 24 bits
@@ -91,33 +66,27 @@
  *                     matching buffer space, the latter two in multiples of
  *                     UCT_CXI_FC_WINDOW_GRAIN units
  *               GRANT: [63:32] event slots processed, [31:0] Active Message
- *                     buffer space processed (the whole counters, see below)
+ *                     buffer space processed (the whole counters)
  *
- * The epoch is random per interface instance; echoing it lets a requester
- * discard a CREP answering a CREQ from a previous incarnation of itself.
+ * The epoch is random per interface instance; the echo lets a requester
+ * discard a CREP meant for a previous incarnation of itself.
  */
 enum {
     UCT_CXI_CTRL_CREQ  = 1,
     UCT_CXI_CTRL_CREP  = 2,
-    UCT_CXI_CTRL_GRANT = 3   /**< the credits processed so far, cumulative:
-                                  see the layout above */
+    UCT_CXI_CTRL_GRANT = 3   /**< cumulative credits processed so far */
 };
 
 /*
- * Credit return piggybacked on an Active Message's match_bits. The AM list
- * entry wildcards every match bit and the transport itself uses only bits
- * 0-6 (am_id, header flag, announce flag), so bits 7-63 arrive verbatim. A
- * piggyback carries all three cumulative counters (event slots, and the buffer
- * space of each class), each cut down to the low bits of the counter in
- * granules of 2^shift (see uct_cxi_fc_pb_shift):
+ * Credit return piggybacked on an Active Message's match_bits (bits 0-6 are
+ * the am_id and flags). It carries the low bits of the three cumulative
+ * counters, in granules of 2^shift (uct_cxi_fc_pb_shift):
  *
  *   [7]      valid
  *   [21:8]   event slots processed, 14 bits
  *   [38:22]  Active Message buffer space processed, 17 bits
  *   [55:39]  tag matching buffer space processed, 17 bits
  *   [63:56]  sender's epoch, low 8 bits (rejects a stale incarnation)
- *
- * A pure GRANT carries the whole counters.
  */
 #define UCT_CXI_FC_PB_VALID        (1ULL << 7)
 #define UCT_CXI_FC_PB_SLOT_SHIFT   8
@@ -134,14 +103,11 @@ enum {
 #define UCT_CXI_FC_NUM_POOLS       (1 + UCT_CXI_FC_NUM_CLASSES)
 
 /*
- * The least s such that a window of \a window, in granules of 2^s, is below
- * half of what \a bits bits can tell apart. A counter on the wire is the low
- * \a bits bits of the real one in such granules, and the receiver of it works
- * out the whole by taking the nearest value to the last it knew; what it is
- * ahead by is never more than the window, so that is unambiguous. Both sides
- * know the window (it is what the CREP granted), hence the shift, and no
- * window is too large: a large one is just counted more coarsely. The
- * remainder less than a granule stays owed until more has been processed.
+ * The least s such that \a window, in granules of 2^s, is below half of what
+ * \a bits bits can tell apart. The receiver reconstructs the whole counter as
+ * the value nearest the last one it knew, which is unambiguous since the
+ * counter never leads by more than the window. A remainder below a granule
+ * stays owed.
  */
 static UCS_F_ALWAYS_INLINE unsigned
 uct_cxi_fc_pb_shift(uint32_t window, unsigned bits)
@@ -212,24 +178,17 @@ struct uct_cxi_ep;
 struct uct_cxi_peer_conn;
 
 /**
- * One remote interface. Shared by all endpoints to it and kept for the life
- * of the local interface: the remote may keep sending after our last endpoint
- * to it is gone, so its record must outlive them (the same reasoning as
- * tag.rndv_peer_cache). So its size is a cost of every connection, and holds
- * only what is needed for as long as the peer is used: what the handshake
- * needs lives in a uct_cxi_peer_conn_t, taken from a pool for as long as the
- * handshake lasts, and the peer's NID and PID, and where its control PTE is,
- * are worked out from \a key when a control message is sent.
+ * One remote interface, shared by all endpoints to it. It outlives them (the
+ * remote may keep sending), so it is kept small: handshake state lives in a
+ * pooled uct_cxi_peer_conn_t, and the NID and PID are derived from \a key.
  */
 typedef struct uct_cxi_peer {
-    uint32_t          key;          /**< CXI_MATCH_ID(pid_bits, pid, nid) --
-                                         the value hardware reports as an
-                                         event's initiator */
+    uint32_t          key;          /**< CXI_MATCH_ID(pid_bits, pid, nid): the
+                                         initiator hardware reports */
     uint8_t           state;        /**< uct_cxi_peer_state_t */
     uint8_t           pb_shift[UCT_CXI_FC_NUM_POOLS];
-                                    /**< granule of the counters this peer's
-                                         piggybacks carry (uct_cxi_fc_pb_shift
-                                         of the windows it granted us) */
+                                    /**< granule of this peer's piggybacked
+                                         counters */
 
     /* Learned from the peer */
     uint32_t          remote_epoch; /**< CREP: the peer's epoch, low 24 bits */
@@ -241,21 +200,16 @@ typedef struct uct_cxi_peer {
     /* Handshake in progress (state DOWN or CREQ_SENT), NULL otherwise */
     struct uct_cxi_peer_conn *conn;
 
-    /* Pure GRANT waiting to be sent (no ctrl slot or command queue room) */
-    ucs_list_link_t   grants;       /**< link in fc.grants */
+    ucs_list_link_t   grants;       /**< link in fc.grants: a GRANT waits for
+                                         control channel room */
 
-    /* Endpoints to this peer whose pending queue is waiting for credits,
-     * descheduled from the arbiter until a grant, the CREP or a refund
-     * makes them runnable again (see uct_cxi_peer_resume). Singly linked
-     * through uct_cxi_ep_t::next_blocked, so an ep costs one pointer. */
+    /* Endpoints waiting for credits, descheduled from the arbiter until a
+     * grant, the CREP or a refund (uct_cxi_peer_resume). Linked through
+     * uct_cxi_ep_t::next_blocked. */
     struct uct_cxi_ep *blocked;
 } uct_cxi_peer_t;
 
-/**
- * A peer's handshake while it lasts: from the first CREQ until the CREP (or
- * a verdict of LEGACY or FAILED). The CREQ is resent on a timer until
- * answered.
- */
+/** A peer's handshake, from the first CREQ until the CREP or a verdict. */
 typedef struct uct_cxi_peer_conn {
     ucs_wtimer_t      timer;        /**< next CREQ (re)send, or the deadline */
     struct uct_cxi_iface *iface;
@@ -268,17 +222,15 @@ KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
 
 
 /**
- * A control message in flight. Fire-and-forget: the only thing the
- * completion looks at is a PTLTE_NOT_FOUND on a CREQ, which means the peer
- * has no control channel. Everything else (a dropped CREQ, a dropped CREP) is
- * repaired by the CREQ being resent until a CREP arrives.
+ * A control message in flight. Fire-and-forget: its completion only matters
+ * for PTLTE_NOT_FOUND on a CREQ (peer has no control channel) and for a GRANT.
  */
 typedef struct uct_cxi_ctrl_req {
     uct_cxi_peer_t   *peer;
     unsigned          type;         /**< UCT_CXI_CTRL_CREQ, _CREP or _GRANT */
-    uint32_t          grant_slots;  /**< GRANT: the cumulative values sent, */
+    uint32_t          grant_slots;  /**< GRANT: cumulative values sent, */
     uint32_t          grant_units[UCT_CXI_FC_NUM_CLASSES];
-                                    /**<   to record as delivered on its ACK */
+                                    /**<   recorded as delivered on its ACK */
 } uct_cxi_ctrl_req_t;
 
 
@@ -286,16 +238,15 @@ typedef struct uct_cxi_ctrl_req {
  * Per-interface flow-control state.
  */
 typedef struct uct_cxi_fc_iface {
-    int               enabled;      /**< FC_ENABLE: off => every peer LEGACY and
-                                         no control PTE is opened */
+    int               enabled;      /**< FC_ENABLE; off: no control PTE, all
+                                         peers LEGACY */
     uint32_t          epoch;        /**< random, identifies this incarnation */
     uint32_t          slot_window;  /**< what we grant each peer: event slots, */
     uint32_t          unit_window[UCT_CXI_FC_NUM_CLASSES];
                                     /**<   and buffer space of each class (0:
                                          the class is not in use) */
     uint8_t           pb_shift[UCT_CXI_FC_NUM_POOLS];
-                                    /**< granule of the counters our piggybacks
-                                         carry: of our own windows */
+                                    /**< granule of our piggybacked counters */
     uint32_t          grant_slots;  /**< owe this many slots to a peer, or */
     uint32_t          grant_units[UCT_CXI_FC_NUM_CLASSES];
                                     /**<   this many units of a class: send a
@@ -306,14 +257,10 @@ typedef struct uct_cxi_fc_iface {
     unsigned          num_connecting; /**< handshakes in progress: the wheel is
                                          only swept while there are any */
     ucs_mpool_t       conn_pool;    /**< uct_cxi_peer_conn_t */
-    ucs_list_link_t   grants;       /**< peers with a GRANT still to send, in
-                                         the order they were found to need
-                                         one. Retried by every progress round
-                                         while any wait
-                                         (uct_cxi_fc_flush_grants). */
+    ucs_list_link_t   grants;       /**< peers with a GRANT to send, oldest
+                                         first (uct_cxi_fc_flush_grants) */
 
-    /* One-entry cache for the receive path: the peer the last Active Message
-     * came from, to spare a hash lookup per message. */
+    /* Peer of the last Active Message received, to skip the hash lookup. */
     uint32_t          rx_cache_key;
     uct_cxi_peer_t   *rx_cache_peer;
 } uct_cxi_fc_iface_t;

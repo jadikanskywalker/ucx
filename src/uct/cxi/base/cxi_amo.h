@@ -2,14 +2,7 @@
  * Copyright (c) 2026. ALL RIGHTS RESERVED.
  * See file LICENSE for terms.
  *
- * CXI Atomic Memory Operation declarations.
- *
- * All AMOs use restricted-mode IDC commands (c_cstate_cmd + c_idc_amo_cmd)
- * targeting the same catch-all RMA LE (pid_offset = LAC).  The NIC performs
- * the atomic read-modify-write at the target's memory location.
- *
- * Post (non-fetching): C_EVENT_ACK on completion.
- * Fetch / CSWAP:       C_EVENT_REPLY when result is DMA'd to local buffer.
+ * CXI atomic memory operation declarations (see cxi_amo.c).
  */
 
 #ifndef UCT_CXI_AMO_H
