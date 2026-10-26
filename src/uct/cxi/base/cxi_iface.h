@@ -981,7 +981,7 @@ ucs_status_t uct_cxi_iface_event_fd_get(uct_iface_h tl_iface, int *fd_p);
 
 BEGIN_C_DECLS
 
-/* cxi_iface.c */
+/* cxi_eq.c */
 void         uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name,
                                   unsigned num_events, unsigned reserved_slots,
                                   int grow_enabled,
@@ -989,6 +989,13 @@ void         uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name,
 ucs_status_t uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
                              struct cxil_wait_obj *wait_obj);
 void         uct_cxi_eq_cleanup(uct_cxi_eq_t *eq);
+void         uct_cxi_eq_abort_resize(uct_cxi_eq_t *eq);
+void         uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface,
+                                         uct_cxi_eq_t *eq);
+void         uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface,
+                                            uct_cxi_eq_t *eq);
+
+/* cxi_iface.c */
 void         uct_cxi_fc_windows(const uct_cxi_iface_config_t *config,
                                 size_t am_max_msg, size_t tag_max_msg,
                                 uint32_t *slot_window_p,

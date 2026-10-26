@@ -27,6 +27,7 @@ libuct_cxi_la_SOURCES = \
     base/cxi_am.c \
     base/cxi_amo.c \
     base/cxi_ep.c \
+    base/cxi_eq.c \
     base/cxi_iface.c \
     base/cxi_rma.c \
     base/cxi_device.c \
