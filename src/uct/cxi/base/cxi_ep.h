@@ -17,29 +17,6 @@
 
 #include <cxi_prov_hw.h>
 
-/*
- * Per-endpoint adaptive backoff, applied after observing a
- * C_RC_PT_DISABLED-class TX completion on this EP's own sends.
- *
- * Two independent controls, both needed (see uct_cxi_ep_tx_complete):
- *   - max_outstanding bounds *concurrency* — how many ops this EP may have
- *     in flight. Halved (floor 1) on failure, doubled back toward
- *     unconstrained after a healthy streak.
- *   - retry_backoff_until bounds *cadence* — how soon this EP may submit
- *     (or have a queued pending request retried) again after a failure.
- *     Exponential per consecutive failure, capped, reset on success.
- * A fixed concurrency cap alone doesn't slow *how fast* a freed slot gets
- * reused (the arbiter can redrive a queued retry on the very next
- * progress() call, microseconds later) — that's what previously caused
- * sub-100us retry bursts tripping the PTE flap limit under load.
- */
-#define UCT_CXI_FC_BACKOFF_BASE_US        100      /* first-failure backoff */
-#define UCT_CXI_FC_BACKOFF_MAX_US         100000   /* 100ms cap */
-#define UCT_CXI_FC_HEALTHY_STREAK         8        /* consecutive OK completions
-                                                        before growing back */
-#define UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED UINT_MAX
-
-
 /**
  * Per-send-op tracking record.
  *
@@ -121,18 +98,6 @@ typedef struct uct_cxi_ep {
     unsigned          outstanding;     /**< In-flight send ops for this EP */
     uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
     ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */
-    unsigned          max_outstanding; /**< Adaptive concurrency cap — new sends
-                                             on this EP return UCS_ERR_NO_RESOURCE
-                                             once outstanding reaches this.
-                                             UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED
-                                             = unconstrained (default). */
-    ucs_time_t        retry_backoff_until; /**< Adaptive retry cadence — new
-                                             sends *and* already-queued pending
-                                             retries on this EP are held back
-                                             until this deadline. 0 = no
-                                             backoff in effect. */
-    unsigned          consecutive_failures;  /**< For backoff/shrink growth */
-    unsigned          consecutive_successes; /**< For backoff/grow reset    */
 #ifndef UCT_CXI_DISABLE_FC
     struct uct_cxi_peer *peer;         /**< Remote iface's flow-control state,
                                              shared with every ep to it; NULL
@@ -157,39 +122,14 @@ typedef struct uct_cxi_ep {
 } uct_cxi_ep_t;
 
 /*
- * uct_cxi_ep_tx_complete_slow — update this EP's adaptive backoff state after
- * a TX completion that changes it (see uct_cxi_ep_tx_complete() below).
- * Defined in cxi_ep.c.
- */
-void uct_cxi_ep_tx_complete_slow(uct_cxi_ep_t *ep, ucs_status_t status);
-
-/*
- * uct_cxi_ep_tx_complete — the usual completion (success, on an ep whose
- * concurrency cap has never been cut, or has grown back to unconstrained) has
- * nothing to update: the cap cannot grow further, and a streak of successes
- * only matters to an ep that has failed. Everything else is for
- * uct_cxi_ep_tx_complete_slow().
- */
-static UCS_F_ALWAYS_INLINE void
-uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status)
-{
-    if (ucs_unlikely((status != UCS_OK) ||
-                     (ep->max_outstanding !=
-                      UCT_CXI_EP_MAX_OUTSTANDING_UNLIMITED))) {
-        uct_cxi_ep_tx_complete_slow(ep, status);
-    }
-}
-
-
-/*
- * uct_cxi_ep_fc_blocked — true if this send should be deferred to the
+ * uct_cxi_iface_tx_blocked -- true if this send should be deferred to the
  * pending/arbiter retry path rather than attempted now.
  *
- * Four independent reasons, all gate identically (return
- * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion — no new
+ * Two independent reasons, both gate identically (return
+ * UCS_ERR_NO_RESOURCE, same as ordinary pool exhaustion -- no new
  * caller-visible status):
  *   - pte_fc->exhausted: the *specific* PTE this op targets has hit
- *     matching-resource exhaustion (AM only — pass NULL for RMA/AMO ops,
+ *     matching-resource exhaustion (AM only -- pass NULL for RMA/AMO ops,
  *     which never populate this; see uct_cxi_pte_fc_t). Unrelated PTEs'
  *     traffic is unaffected.
  *   - iface->tx.outstanding >= iface->tx.max_inflight: the TX event queue
@@ -197,25 +137,17 @@ uct_cxi_ep_tx_complete(uct_cxi_ep_t *ep, ucs_status_t status)
  *     exactly one TX event, so this is what keeps the queue from
  *     overflowing: a send takes a slot when it is rung and gives it back
  *     when its completion is processed (RC's tx_cq_available, per iface).
- *   - ep->outstanding >= ep->max_outstanding: this EP's adaptive
- *     concurrency cap (see uct_cxi_ep_tx_complete).
- *   - ep->retry_backoff_until: this EP's adaptive retry-cadence backoff,
- *     set after a C_RC_PT_DISABLED-class completion. Zero (the usual) is
- *     tested first so that the clock is only read while a backoff is set.
  *
  * Deliberately not gated on the RX EQ being drained after a drop: with
  * separate TX and RX event queues, local sends only produce TX completions
  * and can no longer refill the RX queue out from under that drain.
  */
 static UCS_F_ALWAYS_INLINE int
-uct_cxi_ep_fc_blocked(uct_cxi_ep_t *ep, const uct_cxi_iface_t *iface,
-                      const uct_cxi_pte_fc_t *pte_fc)
+uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
+                         const uct_cxi_pte_fc_t *pte_fc)
 {
     return ucs_unlikely(((pte_fc != NULL) && pte_fc->exhausted) ||
-                         (iface->tx.outstanding >= iface->tx.max_inflight) ||
-                         (ep->outstanding >= ep->max_outstanding) ||
-                         ((ep->retry_backoff_until != 0) &&
-                          (ep->retry_backoff_until > ucs_get_time())));
+                         (iface->tx.outstanding >= iface->tx.max_inflight));
 }
 
 /*

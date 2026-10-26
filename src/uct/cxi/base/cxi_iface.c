@@ -2099,7 +2099,7 @@ uct_cxi_iface_handle_state_change(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq,
              * rotating buffers all simultaneously full; RMA/AMO
              * can't reach this path, see uct_cxi_pte_fc_t).
              * Independent of EQ-fill: gate new AM sends via
-             * am.fc.exhausted (uct_cxi_ep_fc_blocked) and
+             * am.fc.exhausted (uct_cxi_iface_tx_blocked) and
              * attempt recovery right away rather than waiting on
              * drain progress, which doesn't free buffer/LE
              * capacity. */
@@ -2204,12 +2204,6 @@ uct_cxi_iface_ep_tx_done(uct_cxi_iface_t *iface, const union c_event *event,
         uct_cxi_fc_reclaim(iface, ep->peer, cls, slots, units);
     }
 #endif
-    /* Target PTE in graceful recovery (en_flowctrl) or any
-     * other completion status feeds this EP's adaptive
-     * concurrency cap / retry cadence — see
-     * uct_cxi_ep_tx_complete(). No wire message needed: this
-     * is a purely local, self-observed signal. */
-    uct_cxi_ep_tx_complete(ep, status);
     /* Latch the worst status seen across every op draining
      * while a flush is pending on this EP — first failure
      * sticks (uct_completion_update_status). The final
@@ -2762,31 +2756,22 @@ static unsigned uct_cxi_iface_progress(uct_iface_h tl_iface)
 
     /* Each queue gets its own EQ_MAX_POLL budget, so neither a receive flood
      * nor a burst of completions can starve the other. */
-    n = uct_cxi_iface_poll_rx(iface);
-
-    {
-        unsigned n_tx = uct_cxi_iface_poll_tx(iface);
-
-        n += n_tx;
+    n  = uct_cxi_iface_poll_rx(iface);
+    n += uct_cxi_iface_poll_tx(iface);
 
 #ifndef UCT_CXI_DISABLE_FC
-        /* Completions free room in the TX queue, and a credit grant waiting
-         * for it (the sender of those credits may be unable to send until it
-         * gets them) goes before the sends that wait in pending queues. */
-        if (ucs_unlikely((n_tx != 0) &&
-                         !ucs_list_is_empty(&iface->fc.grants))) {
-            uct_cxi_fc_flush_grants(iface);
-        }
-#endif
+    /* A credit grant that could not be sent (the sender of those credits may
+     * be unable to send until it gets them) goes before the sends that wait
+     * in pending queues. */
+    if (ucs_unlikely(!ucs_list_is_empty(&iface->fc.grants))) {
+        uct_cxi_fc_flush_grants(iface);
     }
 
-#ifndef UCT_CXI_DISABLE_FC
-    /* Timers of the flow-control machinery: resends of handshake requests,
-     * their deadlines, and retries of credit grants that could not be sent.
-     * The wheel only has timers while there is something to wait for. It is
-     * swept after both queues are drained: a reply that arrived cancels the
-     * resend it would otherwise fire, and the room the completions freed is
-     * there for the resends and retries that do. */
+    /* Timers of the handshake: resends of requests and their deadlines. The
+     * wheel only has timers while there is something to wait for. It is swept
+     * after both queues are drained: a reply that arrived cancels the resend
+     * it would otherwise fire, and the room the completions freed is there
+     * for the resends that do. */
     if (ucs_unlikely(!ucs_twheel_is_empty(&iface->fc.twheel))) {
         ucs_twheel_sweep(&iface->fc.twheel, ucs_get_time());
     }

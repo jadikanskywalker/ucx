@@ -3050,7 +3050,7 @@ uct_cxi_tag_short_send(uct_cxi_ep_t *ep, uct_tag_t tag, uint64_t imm,
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_UNR, what);
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -3109,7 +3109,7 @@ ssize_t uct_cxi_ep_tag_eager_bcopy(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_ERR_INVALID_PARAM; /* the mark of a rendezvous request */
     }
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->tag.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -3201,7 +3201,7 @@ ucs_status_t uct_cxi_ep_tag_eager_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
     }
     UCT_CHECK_LENGTH(length, 0, iface->tag.max_msg, "tag_eager_zcopy");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->tag.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -3364,7 +3364,7 @@ ucs_status_ptr_t uct_cxi_ep_tag_rndv_zcopy(uct_ep_h tl_ep, uct_tag_t tag,
         return UCS_STATUS_PTR(UCS_ERR_INVALID_PARAM);
     }
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->tag.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->tag.fc)) {
         return UCS_STATUS_PTR(UCS_ERR_NO_RESOURCE);
     }
 

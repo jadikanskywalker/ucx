@@ -99,7 +99,7 @@ ucs_status_t uct_cxi_ep_am_short(uct_ep_h tl_ep, uint8_t id,
     UCT_CHECK_LENGTH(length, 0,
                      C_MAX_IDC_PAYLOAD_UNR - sizeof(uint64_t), "am_short");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -231,7 +231,7 @@ ssize_t uct_cxi_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     int                  credited;
     int                  ret;
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->am.fc)) {
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
 
@@ -356,7 +356,7 @@ ucs_status_t uct_cxi_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     UCT_CHECK_LENGTH(header_length + iov_length, 0, iface->am.max_zcopy,
                      "am_zcopy total");
 
-    if (uct_cxi_ep_fc_blocked(ep, iface, &iface->am.fc)) {
+    if (uct_cxi_iface_tx_blocked(iface, &iface->am.fc)) {
         return UCS_ERR_NO_RESOURCE;
     }
 

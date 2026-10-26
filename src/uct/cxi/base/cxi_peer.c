@@ -57,8 +57,6 @@ uct_cxi_peer_ctrl_dfa(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer,
                   idx_ext);
 }
 
-static void uct_cxi_fc_grant_timer(ucs_wtimer_t *timer);
-
 /*
  * Set \a timer on the wheel to go off in \a delay (not less than a slot, and
  * the wheel's own cap is a little over the longest delay used). The wheel is
@@ -131,7 +129,6 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
 
     kh_init_inplace(uct_cxi_peer_hash, &fc->peers);
     ucs_list_head_init(&fc->grants);
-    ucs_wtimer_init(&fc->grant_timer, uct_cxi_fc_grant_timer);
 
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_ctrl_req_t);
@@ -177,7 +174,6 @@ void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface)
     uct_cxi_fc_iface_t *fc = &iface->fc;
     uct_cxi_peer_t     *peer;
 
-    ucs_wtimer_remove(&fc->twheel, &fc->grant_timer);
     kh_foreach_value(&fc->peers, peer, {
         if (peer->conn != NULL) {
             ucs_wtimer_remove(&fc->twheel, &peer->conn->timer);
@@ -685,7 +681,6 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
         unsigned        cls;
 
         if (rc == C_RC_OK) {
-            iface->fc.grant_failures = 0;
             /* Delivered: no need to say it again (a later grant may already
              * have overtaken this one, hence the "only forward" test). */
             if ((int32_t)(req->grant_slots - peer->rx.acked_slots) > 0) {
@@ -698,13 +693,10 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                 }
             }
         } else {
-            /* Lost: say it again, along with whatever has accumulated, but
-             * not at once: the target may be refusing control messages for
-             * a while, and a resend straight away would be refused too. */
+            /* Lost: say it again, along with whatever has accumulated. */
             ucs_debug("cxi GRANT to nid 0x%x pid %u failed: rc=%d, resending",
                       uct_cxi_peer_nid(iface, peer),
                       uct_cxi_peer_pid(iface, peer), rc);
-            iface->fc.grant_failures++;
             uct_cxi_fc_resync(iface, peer);
         }
         ucs_mpool_put(req);
@@ -964,22 +956,13 @@ static ucs_status_t uct_cxi_fc_send_grant(uct_cxi_iface_t *iface,
     return status;
 }
 
-/* Put \a peer on the list of those waiting for a GRANT, and make sure the
- * timer that retries the list is running. */
+/* Put \a peer on the list of those waiting for a GRANT (see
+ * uct_cxi_fc_flush_grants). */
 static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 {
-    unsigned shift;
-
     if (ucs_list_is_empty(&peer->grants)) {
         ucs_list_add_tail(&iface->fc.grants, &peer->grants);
     }
-
-    shift = ucs_min(iface->fc.grant_failures, 10u);
-    uct_cxi_fc_timer_add(iface, &iface->fc.grant_timer,
-                         ucs_time_from_usec(
-                                 ucs_min((uint64_t)UCT_CXI_CTRL_RETRY_BASE_US
-                                                 << shift,
-                                         (uint64_t)UCT_CXI_CTRL_RETRY_MAX_US)));
 }
 
 void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
@@ -995,9 +978,9 @@ void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 
 /*
  * Send the GRANTs that are waiting, oldest first, until one cannot be sent
- * (the TX queue is full: the others could not be either). Called when TX
- * completions have made room, before the sends waiting in pending queues get
- * it, and from the timer in case no completion comes.
+ * (the TX queue is full: the others could not be either). Called from every
+ * progress round while any wait, before the sends waiting in pending queues
+ * get the room.
  */
 void uct_cxi_fc_flush_grants(uct_cxi_iface_t *iface)
 {
@@ -1014,19 +997,6 @@ void uct_cxi_fc_flush_grants(uct_cxi_iface_t *iface)
 
         ucs_list_del(&peer->grants);
         ucs_list_head_init(&peer->grants);
-    }
-}
-
-static void uct_cxi_fc_grant_timer(ucs_wtimer_t *timer)
-{
-    uct_cxi_iface_t *iface = ucs_container_of(timer, uct_cxi_iface_t,
-                                              fc.grant_timer);
-
-    uct_cxi_fc_flush_grants(iface);
-    if (!ucs_list_is_empty(&iface->fc.grants)) {
-        /* Still waiting: again, a little later. */
-        uct_cxi_fc_queue_grant(iface, ucs_list_head(&iface->fc.grants,
-                                                    uct_cxi_peer_t, grants));
     }
 }
 
