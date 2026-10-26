@@ -7,16 +7,18 @@
  * TX_OP_MAX_BUFS is shrunk to a small, deterministic value via
  * modify_config("CXI_TX_OP_MAX_BUFS", ...) so op_pool exhaustion (and the
  * resulting UCS_ERR_NO_RESOURCE) is reachable with a handful of
- * ep_put_short calls instead of needing to flood thousands of operations.
+ * ep_put_zcopy calls instead of needing to flood thousands of operations.
  * The "CXI_" prefix is required: TX_OP_MAX_BUFS lives directly in
  * uct_cxi_iface_config_table (the per-transport table, registered with
  * prefix "CXI_" in UCT_TL_DEFINE_ENTRY), not in the shared generic
  * uct_iface_config_table — only fields in the latter resolve via a bare
  * name through modify_config()'s empty-prefix sub-table recursion.
  *
- * ep_put_short is used because its send_op sits in op_pool until
- * C_EVENT_ACK drains it (data itself is inline/IDC, so no separate
- * registered source buffer is needed — only the receiver-side target).
+ * ep_put_zcopy is used because its send_op sits in op_pool until
+ * C_EVENT_ACK drains it. (A put_short takes no send op: it is tracked by its
+ * ep alone, so the pool does not bound it.) The source is a small buffer
+ * registered on the sender for the whole test, besides the receiver-side
+ * target.
  */
 
 #ifdef HAVE_CONFIG_H
@@ -53,35 +55,59 @@ protected:
          * resolves for fields living in the generic sub-table. */
         modify_config("CXI_TX_OP_MAX_BUFS", std::to_string(POOL_CAP).c_str());
         test_cxi_rma_base::init();
-        check_caps(UCT_IFACE_FLAG_PUT_SHORT | UCT_IFACE_FLAG_PENDING);
+        check_caps(UCT_IFACE_FLAG_PUT_ZCOPY | UCT_IFACE_FLAG_PENDING);
+
+        memset(m_src, 0x5A, sizeof(m_src));
+        m_src_memh = reg(sender(), m_src, sizeof(m_src));
+    }
+
+    void cleanup() override
+    {
+        if (m_src_memh != UCT_MEM_HANDLE_NULL) {
+            dereg(sender(), m_src_memh);
+        }
+        test_cxi_rma_base::cleanup();
+    }
+
+    /** The iov of the registered source buffer. */
+    uct_iov_t src_iov()
+    {
+        uct_iov_t iov;
+
+        iov.buffer = m_src;
+        iov.length = sizeof(m_src);
+        iov.memh   = m_src_memh;
+        iov.stride = 0;
+        iov.count  = 1;
+        return iov;
     }
 
     /**
-     * Flood ep_put_short until op_pool is exhausted.  Returns the number of
+     * Flood ep_put_zcopy until op_pool is exhausted.  Returns the number of
      * successful sends before the first UCS_ERR_NO_RESOURCE.
      */
     size_t exhaust_op_pool(uct_ep_h ep, uint64_t remote_addr,
                            uct_rkey_t rkey)
     {
-        uint8_t      payload[8];
+        uct_iov_t    iov = src_iov();
         ucs_status_t status;
         size_t       sent = 0;
 
-        memset(payload, 0x5A, sizeof(payload));
-
-        /* POOL_CAP + a small margin: if this returns UCS_OK past POOL_CAP
-         * sends, TX_OP_MAX_BUFS did not apply — treat as a test bug, not an
-         * infinite loop. */
+        /* POOL_CAP + a small margin: if this returns UCS_INPROGRESS past
+         * POOL_CAP sends, TX_OP_MAX_BUFS did not apply — treat as a test bug,
+         * not an infinite loop. */
         do {
-            status = uct_ep_put_short(ep, payload, sizeof(payload),
-                                      remote_addr, rkey);
-            if (status == UCS_OK) {
+            status = uct_ep_put_zcopy(ep, &iov, 1, remote_addr, rkey, NULL);
+            if (status == UCS_INPROGRESS) {
                 sent++;
             }
-        } while ((status == UCS_OK) && (sent <= POOL_CAP + 4));
+        } while ((status == UCS_INPROGRESS) && (sent <= POOL_CAP + 4));
 
         return sent;
     }
+
+    uint64_t  m_src[1];
+    uct_mem_h m_src_memh = UCT_MEM_HANDLE_NULL;
 };
 
 const size_t test_cxi_pending::POOL_CAP;
@@ -98,6 +124,7 @@ struct pending_ctx {
     uct_pending_req_t req;
     volatile bool      fired;
     uct_ep_h            ep;
+    uct_iov_t           iov;
     uint64_t            remote_addr;
     uct_rkey_t          rkey;
 };
@@ -105,16 +132,17 @@ struct pending_ctx {
 ucs_status_t pending_retry_cb(uct_pending_req_t *self)
 {
     pending_ctx *ctx = ucs_container_of(self, pending_ctx, req);
-    uint8_t      payload[8];
     ucs_status_t status;
 
-    memset(payload, 0xB7, sizeof(payload));
-    status = uct_ep_put_short(ctx->ep, payload, sizeof(payload),
-                              ctx->remote_addr, ctx->rkey);
-    if (status == UCS_OK) {
-        ctx->fired = true;
+    status = uct_ep_put_zcopy(ctx->ep, &ctx->iov, 1, ctx->remote_addr,
+                              ctx->rkey, NULL);
+    if (status != UCS_INPROGRESS) {
+        return status;
     }
-    return status;
+
+    /* Sent: the arbiter takes UCS_OK as "done, remove". */
+    ctx->fired = true;
+    return UCS_OK;
 }
 
 } // namespace
@@ -148,6 +176,7 @@ UCS_TEST_P(test_cxi_pending, pending_add_retries_after_pool_exhaustion)
     pending_ctx ctx;
     ctx.fired       = false;
     ctx.ep          = ep;
+    ctx.iov         = src_iov();
     ctx.remote_addr = (uint64_t)(uintptr_t)&target;
     ctx.rkey        = rkey_bundle.rkey;
     ctx.req.func    = pending_retry_cb;
@@ -200,6 +229,7 @@ UCS_TEST_P(test_cxi_pending, pending_add_multiple_requests_drain_in_order)
     for (size_t i = 0; i < N; i++) {
         ctx[i].fired       = false;
         ctx[i].ep          = ep;
+        ctx[i].iov         = src_iov();
         ctx[i].remote_addr = (uint64_t)(uintptr_t)&target;
         ctx[i].rkey        = rkey_bundle.rkey;
         ctx[i].req.func    = pending_retry_cb;
@@ -268,6 +298,7 @@ UCS_TEST_P(test_cxi_pending, pending_purge_removes_queued_request)
     pending_ctx ctx;
     ctx.fired       = false;
     ctx.ep          = ep;
+    ctx.iov         = src_iov();
     ctx.remote_addr = (uint64_t)(uintptr_t)&target;
     ctx.rkey        = rkey_bundle.rkey;
     ctx.req.func    = pending_retry_cb;
@@ -318,6 +349,7 @@ UCS_TEST_P(test_cxi_pending, pending_purged_on_ep_destroy)
     pending_ctx ctx;
     ctx.fired       = false;
     ctx.ep          = ep;
+    ctx.iov         = src_iov();
     ctx.remote_addr = (uint64_t)(uintptr_t)&target;
     ctx.rkey        = rkey_bundle.rkey;
     ctx.req.func    = pending_retry_cb;

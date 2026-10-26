@@ -169,7 +169,9 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
  * c_cstate_cmd first: it carries user_ptr, eq, index_ext, and restricted,
  * and the NIC pairs it with the following IDC put to fire C_EVENT_ACK with
  * that user_ptr.  Both cstate and IDC are emitted before the single
- * cxi_cq_ring, so the NIC sees them as one operation.
+ * cxi_cq_ring, so the NIC sees them as one operation.  The user_ptr is the
+ * ep alone (see uct_cxi_ep_restricted_user_ptr): the completion has nothing
+ * to run, so no send op is taken.
  *
  * Returns UCS_OK (not UCS_INPROGRESS): source buffer is reusable on return,
  * but remote visibility is not guaranteed until ep_flush returns UCS_OK.
@@ -181,7 +183,6 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
     uct_cxi_ep_t         *ep     = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t      *iface  = uct_cxi_rma_ep_iface(ep);
     const uct_cxi_rkey_t *rkey_p = (const uct_cxi_rkey_t *)(uintptr_t)rkey;
-    uct_cxi_send_op_t    *op;
     int                   ret;
 
     UCT_CHECK_LENGTH(length, 0, C_MAX_IDC_PAYLOAD_RES, "put_short");
@@ -198,26 +199,17 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
         return UCS_ERR_NO_RESOURCE;
     }
 
-    op = ucs_mpool_get(&iface->tx.op_pool);
-    if (ucs_unlikely(op == NULL)) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-    op->ep      = ep;
-    op->comp    = NULL;
-    op->handler = NULL;
-
     {
         struct c_cstate_cmd cstate = {};
         cstate.event_send_disable  = 1;
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->tx_eq.evtq->eqn;
-        cstate.user_ptr            = (uint64_t)(uintptr_t)op;
+        cstate.user_ptr            = uct_cxi_ep_restricted_user_ptr(ep);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(op);
         ucs_error("cxi ep %p cxi_cq_emit_c_state failed: %d", ep, ret);
         return UCS_ERR_NO_RESOURCE;
     }
@@ -230,7 +222,6 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
         ret = cxi_cq_emit_idc_put(iface->tx.cmdq, &idc, buffer, (size_t)length);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(op);
         ucs_error("cxi ep %p cxi_cq_emit_idc_put failed: %d", ep, ret);
         return UCS_ERR_NO_RESOURCE;
     }

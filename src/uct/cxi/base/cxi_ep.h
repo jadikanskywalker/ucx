@@ -166,9 +166,11 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
  * least 8-byte aligned); its event slots are those of the class's short
  * message: one, for an Active Message or an eager tag message.
  *
- * Tracked shorts exist to make connected-endpoint flow control possible --
- * without a completion there is nothing to refund a lost send's credit
- * from -- so a build without it keeps the untracked fire-and-forget path.
+ * Tracked Active Message shorts exist to make connected-endpoint flow control
+ * possible -- without a completion there is nothing to refund a lost send's
+ * credit from -- so a build without it keeps the untracked fire-and-forget
+ * path for them. Restricted shorts (RMA, atomics) are tracked in every build:
+ * the flush has to wait for them.
  */
 #define UCT_CXI_USER_PTR_SHORT  1ULL
 
@@ -179,6 +181,22 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
 #define UCT_CXI_USER_PTR_UNITS_MASK     0x7fULL
 #define UCT_CXI_USER_PTR_CREDITED       (1ULL << 63)
 #define UCT_CXI_USER_PTR_PTR_MASK       ((1ULL << UCT_CXI_USER_PTR_UNITS_SHIFT) - 1)
+
+/*
+ * The user_ptr of a restricted short (an RMA put_short or a non-fetching
+ * atomic): its ep, and nothing else. Nothing is charged, so it is accounted to
+ * its ep alone, like any other tagged short, and nothing needs a send op: its
+ * completion has no callback and no data to deliver, and a failure is
+ * reported by the ep's flush, as for every other send.
+ */
+static UCS_F_ALWAYS_INLINE uint64_t
+uct_cxi_ep_restricted_user_ptr(const uct_cxi_ep_t *ep)
+{
+    ucs_assert(((uintptr_t)ep & (UCT_CXI_USER_PTR_SHORT |
+                                 UCT_CXI_USER_PTR_TAG)) == 0);
+    ucs_assert(((uint64_t)(uintptr_t)ep & ~UCT_CXI_USER_PTR_PTR_MASK) == 0);
+    return (uint64_t)(uintptr_t)ep | UCT_CXI_USER_PTR_SHORT;
+}
 
 #ifdef UCT_CXI_DISABLE_FC
 

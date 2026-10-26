@@ -81,20 +81,11 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
     uct_cxi_ep_t         *ep     = ucs_derived_of(tl_ep, uct_cxi_ep_t);
     uct_cxi_iface_t      *iface  = uct_cxi_amo_ep_iface(ep);
     const uct_cxi_rkey_t *rkey_p = (const uct_cxi_rkey_t *)(uintptr_t)rkey;
-    uct_cxi_send_op_t    *op;
     int                   ret;
 
     if (uct_cxi_iface_tx_blocked(iface, NULL)) {
         return UCS_ERR_NO_RESOURCE;
     }
-
-    op = ucs_mpool_get(&iface->tx.op_pool);
-    if (ucs_unlikely(op == NULL)) {
-        return UCS_ERR_NO_RESOURCE;
-    }
-    op->ep      = ep;
-    op->comp    = NULL;
-    op->handler = NULL;
 
     {
         struct c_cstate_cmd cstate = {};
@@ -102,12 +93,11 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->tx_eq.evtq->eqn;
-        cstate.user_ptr            = (uint64_t)(uintptr_t)op;
+        cstate.user_ptr            = uct_cxi_ep_restricted_user_ptr(ep);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(op);
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -122,7 +112,6 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         ret = cxi_cq_emit_idc_amo(iface->tx.cmdq, &amo, false);
     }
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(op);
         return UCS_ERR_NO_RESOURCE;
     }
 
