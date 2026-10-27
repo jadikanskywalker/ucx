@@ -206,7 +206,6 @@ typedef struct uct_cxi_pte_fc {
     unsigned   flap_count;        /**< Disable events observed within the window */
     int        gave_up;           /**< Stopped attempting re-enable for this PTE */
     int        exhausted;         /**< Matching-resource exhaustion (AM/TAG only) */
-    void      *onload_cb;         /**< Reserved for TAG; unused today */
 } uct_cxi_pte_fc_t;
 
 
