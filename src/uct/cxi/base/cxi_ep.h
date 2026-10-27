@@ -128,6 +128,23 @@ uct_cxi_ep_tx_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
     iface->tx.outstanding++;
 }
 
+/* Emit and ring a DMA command; UCS_ERR_NO_RESOURCE if the queue is full. */
+static UCS_F_ALWAYS_INLINE ucs_status_t
+uct_cxi_ep_dma_post(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
+                    struct c_full_dma_cmd *cmd, const char *what)
+{
+    int ret = cxi_cq_emit_dma(iface->tx.cmdq, cmd);
+
+    if (ucs_unlikely(ret != 0)) {
+        uct_cxi_tx_emit_error(ep, what, ret);
+        return UCS_ERR_NO_RESOURCE;
+    }
+
+    cxi_cq_ring(iface->tx.cmdq);
+    uct_cxi_ep_tx_commit(ep, iface);
+    return UCS_OK;
+}
+
 /*
  * True if a send must wait on the pending queue (UCS_ERR_NO_RESOURCE):
  *   - the target PTE hit matching-resource exhaustion (\a pte_fc, NULL for
@@ -430,6 +447,13 @@ static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_ep_idc_send(
     uct_cxi_idc_track_commit(ep, iface);
     return UCS_OK;
 }
+
+BEGIN_C_DECLS
+
+/** Completion handler of a send whose desc only needs returning to its pool. */
+void uct_cxi_send_desc_put_comp(uct_cxi_send_op_t *op, ucs_status_t status);
+
+END_C_DECLS
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);
 void uct_cxi_ep_destroy(uct_ep_h tl_ep);

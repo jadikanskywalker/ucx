@@ -31,23 +31,6 @@
 #include <string.h>
 
 
-/* Emit and ring \a cmd; UCS_ERR_NO_RESOURCE if the command queue is full. */
-static UCS_F_ALWAYS_INLINE ucs_status_t
-uct_cxi_rma_dma_post(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
-                     struct c_full_dma_cmd *cmd, const char *what)
-{
-    int ret = cxi_cq_emit_dma(iface->tx.cmdq, cmd);
-
-    if (ucs_unlikely(ret != 0)) {
-        uct_cxi_tx_emit_error(ep, what, ret);
-        return UCS_ERR_NO_RESOURCE;
-    }
-
-    cxi_cq_ring(iface->tx.cmdq);
-    uct_cxi_ep_tx_commit(ep, iface);
-    return UCS_OK;
-}
-
 /*
  * Target of an unexpected-rendezvous pull: unlike RMA, the sender's rendezvous
  * source PTE (rdzv_get_idx), matching on its rdzv op id, with \a remote_addr
@@ -137,7 +120,7 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer, unsigned length,
     cmd.user_ptr           = (uint64_t)(uintptr_t)op;
 
     pre    = ep->outstanding;
-    status = uct_cxi_rma_dma_post(ep, iface, &cmd, "ep_get_short");
+    status = uct_cxi_ep_dma_post(ep, iface, &cmd, "ep_get_short");
     if (ucs_unlikely(status != UCS_OK)) {
         ucs_mpool_put(op);
         return status;
@@ -211,11 +194,6 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
     return UCS_OK;
 }
 
-static void uct_cxi_put_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
-{
-    ucs_mpool_put((uct_cxi_send_desc_t*)op);
-}
-
 /* Unpack the data (only on success), complete and free the desc */
 static void uct_cxi_get_bcopy_comp(uct_cxi_send_op_t *op, ucs_status_t status)
 {
@@ -259,7 +237,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
 
     length = pack_cb(desc + 1, arg);
 
-    uct_cxi_send_op_set(&desc->op, ep, NULL, uct_cxi_put_bcopy_comp);
+    uct_cxi_send_op_set(&desc->op, ep, NULL, uct_cxi_send_desc_put_comp);
 
     cmd.command.opcode     = C_CMD_PUT;
     cmd.index_ext          = ep->dfa_rma_idx_ext[rkey_p->lac];
@@ -273,7 +251,7 @@ ssize_t uct_cxi_ep_put_bcopy(uct_ep_h tl_ep, uct_pack_callback_t pack_cb,
     cmd.request_len        = (uint32_t)length;
     cmd.user_ptr           = (uint64_t)(uintptr_t)desc;
 
-    status = uct_cxi_rma_dma_post(ep, iface, &cmd, "ep_put_bcopy");
+    status = uct_cxi_ep_dma_post(ep, iface, &cmd, "ep_put_bcopy");
     if (ucs_unlikely(status != UCS_OK)) {
         ucs_mpool_put(desc);
         return status;
@@ -322,7 +300,7 @@ ucs_status_t uct_cxi_ep_get_bcopy(uct_ep_h tl_ep,
     cmd.user_ptr           = (uint64_t)(uintptr_t)desc;
     uct_cxi_rma_get_target(ep, iface, rkey_p, remote_addr, &cmd);
 
-    status = uct_cxi_rma_dma_post(ep, iface, &cmd, "ep_get_bcopy");
+    status = uct_cxi_ep_dma_post(ep, iface, &cmd, "ep_get_bcopy");
     if (ucs_unlikely(status != UCS_OK)) {
         ucs_mpool_put(desc);
         return status;
@@ -368,7 +346,7 @@ ucs_status_t uct_cxi_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     cmd.request_len        = (uint32_t)uct_iov_get_length(iov);
     cmd.user_ptr           = (uint64_t)(uintptr_t)op;
 
-    status = uct_cxi_rma_dma_post(ep, iface, &cmd, "ep_put_zcopy");
+    status = uct_cxi_ep_dma_post(ep, iface, &cmd, "ep_put_zcopy");
     if (ucs_unlikely(status != UCS_OK)) {
         ucs_mpool_put(op);
         return status;
@@ -411,7 +389,7 @@ ucs_status_t uct_cxi_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
     cmd.user_ptr           = (uint64_t)(uintptr_t)op;
     uct_cxi_rma_get_target(ep, iface, rkey_p, remote_addr, &cmd);
 
-    status = uct_cxi_rma_dma_post(ep, iface, &cmd, "ep_get_zcopy");
+    status = uct_cxi_ep_dma_post(ep, iface, &cmd, "ep_get_zcopy");
     if (ucs_unlikely(status != UCS_OK)) {
         ucs_mpool_put(op);
         return status;
