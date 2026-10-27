@@ -82,7 +82,7 @@ uct_cxi_ep_atomic_post_common(uct_ep_h tl_ep, uct_atomic_op_t opcode,
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->tx_eq.evtq->eqn;
-        cstate.user_ptr            = uct_cxi_ep_restricted_user_ptr(ep);
+        cstate.user_ptr            = uct_cxi_ep_short_user_ptr(ep);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }

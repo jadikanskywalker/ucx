@@ -13,7 +13,6 @@
 #include <uct/base/uct_iface.h>
 #include <uct/api/uct.h>
 #include <ucs/datastruct/arbiter.h>
-#include <ucs/time/time.h>
 
 #include <cxi_prov_hw.h>
 
@@ -24,20 +23,28 @@
  * handler: NULL for zcopy (invoke comp, free op). Set for bcopy: it completes
  * and frees the desc, and must not unpack data unless status == UCS_OK.
  */
-typedef struct uct_cxi_send_op {
-    struct uct_cxi_ep *ep;      /**< Owning EP — used to decrement outstanding */
-    uct_completion_t  *comp;    /**< Caller completion callback, or NULL       */
-    void (*handler)(struct uct_cxi_send_op *, ucs_status_t); /**< NULL = default zcopy path */
+typedef struct uct_cxi_send_op uct_cxi_send_op_t;
+
+typedef void (*uct_cxi_send_op_func_t)(uct_cxi_send_op_t *op,
+                                       ucs_status_t status);
+
+struct uct_cxi_send_op {
+    /* Owning EP, to decrement outstanding */
+    struct uct_cxi_ep      *ep;
+    /* Caller completion, or NULL */
+    uct_completion_t       *comp;
+    /* NULL = default zcopy path */
+    uct_cxi_send_op_func_t handler;
 #ifndef UCT_CXI_DISABLE_FC
-    uint32_t           fc_units;    /**< flow-control cost of buffer space, in
-                                         units, of class fc_class...          */
-    uint8_t            fc_slots;    /**< ...and in event slots, to take back
-                                         on failure or a priority match; 0 if
-                                         uncharged. Must be 0 when the op is
-                                         unused.                              */
-    uint8_t            fc_class;    /**< uct_cxi_fc_class_t of the charge   */
+    /* Flow-control cost of buffer space, in units, of class fc_class... */
+    uint32_t fc_units;
+    /* ...and in event slots, to take back on failure or a priority match; 0 if
+     * uncharged. Must be 0 when the op is unused. */
+    uint8_t fc_slots;
+    /* uct_cxi_fc_class_t of the charge */
+    uint8_t fc_class;
 #endif
-} uct_cxi_send_op_t;
+};
 
 
 /**
@@ -46,12 +53,16 @@ typedef struct uct_cxi_send_op {
  * follows the struct, iface->tx.max_bcopy bytes.
  */
 typedef struct uct_cxi_send_desc {
-    uct_cxi_send_op_t       op;         /**< Must be first                          */
-    uct_unpack_callback_t   unpack_cb;  /**< get_bcopy: deliver data to caller      */
-    void                   *unpack_arg; /**< get_bcopy: arg passed to unpack_cb     */
-    size_t                  length;     /**< get_bcopy: byte count for unpack_cb    */
-    uint64_t                iova;       /**< Pre-computed IOVA of data area (desc+1)*/
-    uint8_t                 lac;        /**< LAC of the cxil_map covering this chunk*/
+    /* Must be first */
+    uct_cxi_send_op_t     op;
+    /* get_bcopy: deliver data to the caller, with its arg and byte count */
+    uct_unpack_callback_t unpack_cb;
+    void                  *unpack_arg;
+    size_t                length;
+    /* Pre-computed IOVA of the data area (desc + 1) */
+    uint64_t              iova;
+    /* LAC of the cxil_map covering this chunk */
+    uint8_t               lac;
 } uct_cxi_send_desc_t;
 
 
@@ -62,29 +73,37 @@ typedef struct uct_cxi_send_desc {
  *   target buffer's LAC (rkey->lac), which selects the target PTE.
  */
 typedef struct uct_cxi_ep {
-    uct_base_ep_t     super;                              /**< Must be first */
-    uint32_t          rem_nid;                            /**< Remote NID */
-    uint32_t          rem_pid;                            /**< Remote PID */
-    union c_fab_addr  dfa_rma[UCT_CXI_MAX_LACS];         /**< Per-LAC DFAs (pid_offset=lac) */
-    uint8_t           dfa_rma_idx_ext[UCT_CXI_MAX_LACS]; /**< Per-LAC idx_ext */
-    union c_fab_addr  dfa_am;                             /**< AM DFA (pid_offset=UCT_CXI_PTE_AM) */
-    uint8_t           dfa_am_idx_ext;                    /**< AM idx_ext */
-    union c_fab_addr  dfa_tag;                            /**< TAG DFA (pid_offset=UCT_CXI_PTE_TAG) */
-    uint8_t           dfa_tag_idx_ext;                   /**< TAG idx_ext */
-    unsigned          outstanding;     /**< In-flight send ops for this EP */
-    uct_completion_t *flush_comp;     /**< Pending flush completion, or NULL */
-    ucs_arbiter_group_t arb_group;     /**< Pending-request queue for this EP */
+    /* Must be first */
+    uct_base_ep_t       super;
+    uint32_t            rem_nid;
+    uint32_t            rem_pid;
+    /* Per-LAC DFAs (pid_offset=lac) and their idx_ext */
+    union c_fab_addr    dfa_rma[UCT_CXI_MAX_LACS];
+    uint8_t             dfa_rma_idx_ext[UCT_CXI_MAX_LACS];
+    /* AM DFA (pid_offset=UCT_CXI_PTE_AM) and its idx_ext */
+    union c_fab_addr    dfa_am;
+    uint8_t             dfa_am_idx_ext;
+    /* TAG DFA (pid_offset=UCT_CXI_PTE_TAG) and its idx_ext */
+    union c_fab_addr    dfa_tag;
+    uint8_t             dfa_tag_idx_ext;
+    /* In-flight send ops for this EP */
+    unsigned            outstanding;
+    /* Pending flush completion, or NULL */
+    uct_completion_t    *flush_comp;
+    /* Pending-request queue for this EP */
+    ucs_arbiter_group_t arb_group;
 #ifndef UCT_CXI_DISABLE_FC
-    struct uct_cxi_peer *peer;         /**< Remote iface's flow-control state,
-                                             shared by its eps; NULL if off */
-    struct uct_cxi_ep *next_blocked;   /**< Next ep waiting for credits on the
-                                             same peer (uct_cxi_peer_t::blocked) */
-    uint8_t           fc_listed;       /**< Is on peer->blocked */
+    /* Remote iface's flow-control state, shared by its eps; NULL if off */
+    struct uct_cxi_peer *peer;
+    /* Next ep waiting for credits on the same peer (uct_cxi_peer_t::blocked) */
+    struct uct_cxi_ep *next_blocked;
+    /* Is on peer->blocked */
+    uint8_t fc_listed;
 #endif
-    uint8_t           destroyed;       /**< destroyed with sends in flight; the
-                                             last completion frees it */
-    uint8_t           rndv_hdr_announced; /**< the one-time rendezvous-header
-                                               announce has been sent */
+    /* Destroyed with sends in flight; the last completion frees it */
+    uint8_t destroyed;
+    /* The one-time rendezvous-header announce has been sent */
+    uint8_t rndv_hdr_announced;
 } uct_cxi_ep_t;
 
 /*
@@ -99,7 +118,7 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
                          const uct_cxi_pte_fc_t *pte_fc)
 {
     return ucs_unlikely(((pte_fc != NULL) && pte_fc->exhausted) ||
-                         (iface->tx.outstanding >= iface->tx.max_inflight));
+                        (iface->tx.outstanding >= iface->tx.max_inflight));
 }
 
 /*
@@ -112,23 +131,24 @@ uct_cxi_iface_tx_blocked(const uct_cxi_iface_t *iface,
  * Active Message shorts are tracked only with flow control (no refund
  * otherwise); restricted shorts (RMA, atomics) always, for the flush.
  */
-#define UCT_CXI_USER_PTR_SHORT  1ULL
+#define UCT_CXI_USER_PTR_SHORT 1ULL
 
 /* Set in the user_ptr of a tracked short charged to the tag class. */
-#define UCT_CXI_USER_PTR_TAG    4ULL
+#define UCT_CXI_USER_PTR_TAG 4ULL
 
-#define UCT_CXI_USER_PTR_UNITS_SHIFT    56
-#define UCT_CXI_USER_PTR_UNITS_MASK     0x7fULL
-#define UCT_CXI_USER_PTR_CREDITED       (1ULL << 63)
-#define UCT_CXI_USER_PTR_PTR_MASK       ((1ULL << UCT_CXI_USER_PTR_UNITS_SHIFT) - 1)
+#define UCT_CXI_USER_PTR_UNITS_SHIFT 56
+#define UCT_CXI_USER_PTR_UNITS_MASK  0x7fULL
+#define UCT_CXI_USER_PTR_CREDITED    (1ULL << 63)
 
-/* The user_ptr of an uncharged restricted short (put_short, atomic post). */
+#define UCT_CXI_USER_PTR_PTR_MASK ((1ULL << UCT_CXI_USER_PTR_UNITS_SHIFT) - 1)
+
+/* The user_ptr of an uncharged short (put_short, atomic post). */
 static UCS_F_ALWAYS_INLINE uint64_t
-uct_cxi_ep_restricted_user_ptr(const uct_cxi_ep_t *ep)
+uct_cxi_ep_short_user_ptr(const uct_cxi_ep_t *ep)
 {
-    ucs_assert(((uintptr_t)ep & (UCT_CXI_USER_PTR_SHORT |
-                                 UCT_CXI_USER_PTR_TAG)) == 0);
-    ucs_assert(((uint64_t)(uintptr_t)ep & ~UCT_CXI_USER_PTR_PTR_MASK) == 0);
+    ucs_assert(((uintptr_t)ep &
+                (UCT_CXI_USER_PTR_SHORT | UCT_CXI_USER_PTR_TAG)) == 0);
+    ucs_assert(((uintptr_t)ep & ~UCT_CXI_USER_PTR_PTR_MASK) == 0);
     return (uint64_t)(uintptr_t)ep | UCT_CXI_USER_PTR_SHORT;
 }
 
@@ -140,8 +160,8 @@ uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
 }
 
 static UCS_F_ALWAYS_INLINE void
-uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep,
-                      unsigned cls, unsigned units, int credited)
+uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep, unsigned cls,
+                      unsigned units, int credited)
 {
 }
 
@@ -159,14 +179,14 @@ uct_cxi_fc_reserve(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, unsigned cls,
     return UCS_OK;
 }
 
-static UCS_F_ALWAYS_INLINE void
-uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited, unsigned cls, unsigned slots,
-                 unsigned units)
+static UCS_F_ALWAYS_INLINE void uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited,
+                                                 unsigned cls, unsigned slots,
+                                                 unsigned units)
 {
 }
 
-static UCS_F_ALWAYS_INLINE uint64_t
-uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+static UCS_F_ALWAYS_INLINE uint64_t uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep,
+                                                       uct_cxi_iface_t *iface)
 {
     return 0;
 }
@@ -194,14 +214,11 @@ uct_cxi_idc_track_cstate(struct c_cstate_cmd *cstate, uct_cxi_iface_t *iface)
 /** Tag the completion with \a ep and the flow-control cost (in the message
  *  header: an unrestricted IDC ignores the c_state user_ptr). */
 static UCS_F_ALWAYS_INLINE void
-uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep,
-                      unsigned cls, unsigned units, int credited)
+uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep, unsigned cls,
+                      unsigned units, int credited)
 {
-    ucs_assert(((uintptr_t)ep & (UCT_CXI_USER_PTR_SHORT |
-                                 UCT_CXI_USER_PTR_TAG)) == 0);
-    ucs_assert(((uint64_t)(uintptr_t)ep & ~UCT_CXI_USER_PTR_PTR_MASK) == 0);
     ucs_assert(units <= UCT_CXI_USER_PTR_UNITS_MASK);
-    hdr->user_ptr = (uint64_t)(uintptr_t)ep | UCT_CXI_USER_PTR_SHORT |
+    hdr->user_ptr = uct_cxi_ep_short_user_ptr(ep) |
                     ((cls == UCT_CXI_FC_TAG) ? UCT_CXI_USER_PTR_TAG : 0) |
                     ((uint64_t)units << UCT_CXI_USER_PTR_UNITS_SHIFT) |
                     (credited ? UCT_CXI_USER_PTR_CREDITED : 0);
@@ -247,17 +264,18 @@ uct_cxi_fc_reserve(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, unsigned cls,
 }
 
 /** Charge a send that has been rung, if \a credited. */
-static UCS_F_ALWAYS_INLINE void
-uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited, unsigned cls, unsigned slots,
-                 unsigned units)
+static UCS_F_ALWAYS_INLINE void uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited,
+                                                 unsigned cls, unsigned slots,
+                                                 unsigned units)
 {
-    uct_cxi_peer_t *peer = ep->peer;
+    uct_cxi_peer_t *peer;
 
     if (credited) {
-        peer->tx.avail_slots       -= (int32_t)slots;
-        peer->tx.avail_units[cls]  -= (int32_t)units;
-        peer->tx.used_slots        += slots;
-        peer->tx.used_units[cls]   += units;
+        peer                       = ep->peer;
+        peer->tx.avail_slots      -= (int32_t)slots;
+        peer->tx.avail_units[cls] -= (int32_t)units;
+        peer->tx.used_slots       += slots;
+        peer->tx.used_units[cls]  += units;
     }
 }
 
@@ -266,16 +284,16 @@ uct_cxi_fc_debit(uct_cxi_ep_t *ep, int credited, unsigned cls, unsigned slots,
  * we owe it, or 0 if less than a granule is owed (uct_cxi_fc_pb_sent() is the
  * other half).
  */
-static UCS_F_ALWAYS_INLINE uint64_t
-uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+static UCS_F_ALWAYS_INLINE uint64_t uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep,
+                                                       uct_cxi_iface_t *iface)
 {
-    uct_cxi_peer_t     *peer  = ep->peer;
-    const uint8_t      *shift = iface->fc.pb_shift;
-    uint64_t            bits;
-    unsigned            cls;
-    int                 owed;
+    uct_cxi_peer_t *peer = ep->peer;
+    const uint8_t *shift = iface->fc.pb_shift;
+    uint64_t bits;
+    unsigned cls;
+    int owed;
 
-    if (ucs_likely(peer == NULL)) {
+    if (ucs_unlikely(peer == NULL)) {
         return 0;
     }
 
@@ -292,10 +310,10 @@ uct_cxi_fc_pb_bits(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
     bits = UCT_CXI_FC_PB_VALID |
            ((uint64_t)((peer->rx.ret_slots >> shift[0]) &
                        UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_SLOT_BITS))
-                   << UCT_CXI_FC_PB_SLOT_SHIFT) |
+            << UCT_CXI_FC_PB_SLOT_SHIFT) |
            ((uint64_t)(iface->fc.epoch &
                        UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_EPOCH_BITS))
-                   << UCT_CXI_FC_PB_EPOCH_SHIFT);
+            << UCT_CXI_FC_PB_EPOCH_SHIFT);
     for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
         bits |= (uint64_t)((peer->rx.ret_units[cls] >> shift[1 + cls]) &
                            UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_UNIT_BITS))
@@ -319,17 +337,20 @@ uct_cxi_fc_pb_advance(uint32_t *adv, uint32_t ret, unsigned shift)
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_fc_pb_sent(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, uint64_t bits)
 {
-    uct_cxi_peer_t *peer  = ep->peer;
-    const uint8_t  *shift = iface->fc.pb_shift;
-    unsigned        cls;
+    uct_cxi_peer_t *peer;
+    const uint8_t *shift;
+    unsigned cls;
 
-    if (bits != 0) {
-        uct_cxi_fc_pb_advance(&peer->rx.adv_slots, peer->rx.ret_slots,
-                              shift[0]);
-        for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
-            uct_cxi_fc_pb_advance(&peer->rx.adv_units[cls],
-                                  peer->rx.ret_units[cls], shift[1 + cls]);
-        }
+    if (ucs_likely(bits == 0)) {
+        return;
+    }
+
+    peer  = ep->peer;
+    shift = iface->fc.pb_shift;
+    uct_cxi_fc_pb_advance(&peer->rx.adv_slots, peer->rx.ret_slots, shift[0]);
+    for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
+        uct_cxi_fc_pb_advance(&peer->rx.adv_units[cls], peer->rx.ret_units[cls],
+                              shift[1 + cls]);
     }
 }
 
@@ -352,19 +373,17 @@ uct_cxi_op_fc_set(uct_cxi_send_op_t *op, int credited, unsigned cls,
  * \a header_data is 0 except for a tagged software rendezvous request.
  * UCS_ERR_NO_RESOURCE if the command queue is full, with nothing counted.
  */
-static UCS_F_ALWAYS_INLINE ucs_status_t
-uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
-                    union c_fab_addr dfa, uint8_t idx_ext, uint64_t match_bits,
-                    uint64_t header_data, const void *data, size_t length,
-                    unsigned cls,
-                    unsigned units, int credited, const char *what)
+static UCS_F_ALWAYS_INLINE ucs_status_t uct_cxi_ep_idc_send(
+        uct_cxi_ep_t *ep, uct_cxi_iface_t *iface, union c_fab_addr dfa,
+        uint8_t idx_ext, uint64_t match_bits, uint64_t header_data,
+        const void *data, size_t length, unsigned cls, unsigned units,
+        int credited, const char *what)
 {
-    struct c_cstate_cmd  cstate = {};
-    struct c_idc_msg_hdr hdr    = {};
-    int                  ret;
+    struct c_cstate_cmd cstate = {};
+    struct c_idc_msg_hdr hdr   = {};
+    int ret;
 
     cstate.event_send_disable = 1;
-    cstate.restricted         = 0;
     cstate.initiator          = iface->match_id;
     cstate.index_ext          = idx_ext;
     uct_cxi_idc_track_cstate(&cstate, iface);
@@ -375,7 +394,7 @@ uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
         return UCS_ERR_NO_RESOURCE;
     }
 
-    hdr.dfa        = dfa;
+    hdr.dfa         = dfa;
     hdr.match_bits  = match_bits;
     hdr.header_data = header_data;
     uct_cxi_idc_track_hdr(&hdr, ep, cls, units, credited);
@@ -392,21 +411,20 @@ uct_cxi_ep_idc_send(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
 }
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);
-void         uct_cxi_ep_destroy(uct_ep_h tl_ep);
+void uct_cxi_ep_destroy(uct_ep_h tl_ep);
 
-ucs_status_t uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags,
-                               uct_completion_t *comp);
+ucs_status_t
+uct_cxi_ep_flush(uct_ep_h tl_ep, unsigned flags, uct_completion_t *comp);
 ucs_status_t uct_cxi_ep_fence(uct_ep_h tl_ep, unsigned flags);
 
-ucs_status_t uct_cxi_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
-                                     unsigned flags);
+ucs_status_t
+uct_cxi_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n, unsigned flags);
 void uct_cxi_ep_pending_purge(uct_ep_h tl_ep, uct_pending_purge_callback_t cb,
-                               void *arg);
+                              void *arg);
 
-/* Arbiter dispatch callback — called from uct_cxi_iface_progress() via
- * ucs_arbiter_dispatch() to drain queued pending requests. */
+/* Arbiter callback: drains the ep's pending requests on progress. */
 ucs_arbiter_cb_result_t
 uct_cxi_ep_process_pending(ucs_arbiter_t *arbiter, ucs_arbiter_group_t *group,
-                            ucs_arbiter_elem_t *elem, void *arg);
+                           ucs_arbiter_elem_t *elem, void *arg);
 
 #endif /* UCT_CXI_EP_H */

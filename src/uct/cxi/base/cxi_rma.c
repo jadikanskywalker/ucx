@@ -128,7 +128,7 @@ ucs_status_t uct_cxi_ep_get_short(uct_ep_h tl_ep, void *buffer,
 
 /*
  * Inline PUT of up to C_MAX_IDC_PAYLOAD_RES bytes, copied into the command.
- * The completion is tracked by the ep alone (uct_cxi_ep_restricted_user_ptr);
+ * The completion is tracked by the ep alone (uct_cxi_ep_short_user_ptr);
  * remote visibility is only guaranteed once ep_flush returns UCS_OK.
  */
 ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
@@ -160,7 +160,7 @@ ucs_status_t uct_cxi_ep_put_short(uct_ep_h tl_ep, const void *buffer,
         cstate.restricted          = 1;
         cstate.index_ext           = ep->dfa_rma_idx_ext[rkey_p->lac];
         cstate.eq                  = iface->tx_eq.evtq->eqn;
-        cstate.user_ptr            = uct_cxi_ep_restricted_user_ptr(ep);
+        cstate.user_ptr            = uct_cxi_ep_short_user_ptr(ep);
 
         ret = cxi_cq_emit_c_state(iface->tx.cmdq, &cstate);
     }
