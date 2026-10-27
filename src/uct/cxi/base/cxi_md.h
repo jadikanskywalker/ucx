@@ -74,6 +74,13 @@ typedef struct uct_cxi_rcache_region {
  * remote_iova = rkey->iova + remote_addr (IOVAs are private to the target).
  */
 /*
+ * Set in the match_bits of a rendezvous Get that the receiver's UCP issues. The
+ * Get the NIC issues leaves bits 12..47 clear (struct cxi_rdzv_match_bits in
+ * cxi_prov_hw.h), and libfabric marks its software Gets with bit 47 too.
+ */
+#define UCT_CXI_RDZV_MATCH_SW_PULL UCS_BIT(47)
+
+/*
  * is_rndv/rendezvous_id: a synthesized rkey for the unexpected-rendezvous
  * pull, which targets the sender's rendezvous source PTE instead of a
  * registered buffer. iova/lac are unused when set; mkey_pack() clears it.

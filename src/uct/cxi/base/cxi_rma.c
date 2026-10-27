@@ -52,7 +52,7 @@ uct_cxi_rma_rndv_get_target(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
     cmd->dfa           = dfa;
     cmd->index_ext     = idx_ext;
     cmd->remote_offset = remote_addr;
-    cmd->match_bits    = rkey_p->rendezvous_id;
+    cmd->match_bits    = rkey_p->rendezvous_id | UCT_CXI_RDZV_MATCH_SW_PULL;
     ucs_debug("cxi rndv get ep %p nid %u pid %u rdzv_get_idx %u "
               "remote_offset 0x%lx match_bits 0x%lx len %u",
               ep, ep->rem_nid, ep->rem_pid, md->cxi_dev->info.rdzv_get_idx,

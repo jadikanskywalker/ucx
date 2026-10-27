@@ -3078,7 +3078,9 @@ ucs_status_t uct_cxi_ep_tag_rndv_cancel(uct_ep_h tl_ep, void *op)
 /*
  * C_EVENT_GET on iface->rdzv.pte: a peer's Get read our exposed LE. match_bits
  * carries the op's id back (see uct_cxi_rdzv_op_t), for an O(1) lookup in
- * iface->rdzv.ops[]. Fires comp: the buffer is now reusable.
+ * iface->rdzv.ops[]. Fires comp: the buffer is now reusable, unless the
+ * receiver's UCP issued the Get (UCT_CXI_RDZV_MATCH_SW_PULL): its ATS ends that
+ * rendezvous by cancelling the op (uct_ep_tag_rndv_cancel).
  *
  * Only the low 8 bits of match_bits are ours (the rdzv_id_lo width of
  * libfabric's union cxip_match_bits); hardware puts other bits above them, so
@@ -3087,9 +3089,15 @@ ucs_status_t uct_cxi_ep_tag_rndv_cancel(uct_ep_h tl_ep, void *op)
 void uct_cxi_iface_tag_handle_rdzv_get(uct_cxi_iface_t *iface,
                                        const union c_event *event)
 {
-    uint32_t           id = (uint32_t)(event->tgt_long.match_bits & 0xFF);
+    uint64_t           match_bits = event->tgt_long.match_bits;
+    uint32_t           id         = (uint32_t)(match_bits & 0xFF);
     uct_cxi_rdzv_op_t *rop;
     ucs_status_t       status;
+
+    if (match_bits & UCT_CXI_RDZV_MATCH_SW_PULL) {
+        ucs_debug("cxi TAG [RNDV-PULLED] id=%u", id);
+        return;
+    }
 
     if ((id >= iface->rdzv.max_outstanding) || !iface->rdzv.ops[id].valid) {
         ucs_debug("cxi TAG [RNDV-GOT-STALE] id=%u -- no matching outstanding "

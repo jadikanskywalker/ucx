@@ -139,7 +139,10 @@ typedef struct uct_cxi_tag_ctx_priv {
  *   3. The receiver reads it from its RENDEZVOUS event and stamps it into its
  *      Get's match_bits (hardware does the same for an auto-issued Get).
  *   4. The resulting C_EVENT_GET reports match_bits, so
- *      uct_cxi_iface_tag_handle_rdzv_get indexes ops[id] directly.
+ *      uct_cxi_iface_tag_handle_rdzv_get indexes ops[id] directly. It completes
+ *      the op, except for a Get that UCP issued for an unexpected rendezvous
+ *      (UCT_CXI_RDZV_MATCH_SW_PULL): as on InfiniBand, UCP's ATS cancels that
+ *      op instead.
  *
  * `op` must be first: C_CMD_RENDEZVOUS_PUT raises an ACK despite
  * event_send_disable, and the generic dispatch casts its user_ptr to a send

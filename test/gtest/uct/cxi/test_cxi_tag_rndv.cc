@@ -742,6 +742,29 @@ protected:
 
         uct_rkey_release(m_ctx.component, &rec.rkey_bundle);
     }
+
+    /** End the send of a rendezvous like UCP. A posted receive that took it
+     * completes the sender's op when the NIC's Get lands. When the data was
+     * pulled by the receiver's UCP the op stays pending, and the ATS ends it
+     * by cancelling it. */
+    void end_rndv_send(uct_ep_h sep, ucs_status_ptr_t op,
+                       uct_cxi_rndv_send_ctx &sctx, bool pulled)
+    {
+        if (!pulled) {
+            poll_until(sctx.fired);
+            EXPECT_EQ(UCS_OK, sctx.super.status);
+            return;
+        }
+
+        ucs_time_t settle = ucs_get_time() + ucs_time_from_sec(0.05);
+        while (ucs_get_time() < settle) {
+            uct_iface_progress(sender().iface());
+            uct_iface_progress(receiver().iface());
+        }
+        EXPECT_FALSE(sctx.fired) << "a pull by UCP must not complete the "
+                                    "sender's op";
+        ASSERT_UCS_OK(uct_ep_tag_rndv_cancel(sep, op));
+    }
 };
 
 
@@ -799,10 +822,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, cold_start)
     uct_mem_h             dst_memh = reg(receiver(), dst.data(), PAY_LEN);
     pull_and_verify(rep, rec, dst, dst_memh, tx_buf);
 
-    poll_until(sctx.fired);
-    EXPECT_EQ(UCS_OK, sctx.super.status)
-            << "sender's own rndv_zcopy completion must fire once UCP's "
-               "generic pull lands, exactly as for a matched receive";
+    end_rndv_send(sep, sp, sctx, true);
 
     dereg(receiver(), dst_memh);
     dereg(sender(), tx_memh);
@@ -841,6 +861,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
     std::vector<std::vector<uint8_t> > tx_bufs(N);
     std::vector<uct_mem_h>             tx_memh(N);
     std::vector<uct_cxi_rndv_send_ctx> sctx(N);
+    std::vector<ucs_status_ptr_t>      ops(N);
     std::vector<uct_tag_t>             tags(N);
     std::vector<uint64_t>              req_ids(N);
 
@@ -866,6 +887,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
                                                     hdr.size(), &siov, 1, 0,
                                                     &sctx[i].super);
         ASSERT_FALSE(UCS_PTR_IS_ERR(sp)) << "send " << i << " failed";
+        ops[i] = sp;
     }
 
     /* None of these tags ever get a receive posted -- every one is
@@ -906,8 +928,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, multiple_same_ep_id_md_index)
     }
 
     for (size_t i = 0; i < N; i++) {
-        poll_until(sctx[i].fired);
-        EXPECT_EQ(UCS_OK, sctx[i].super.status) << "send " << i;
+        end_rndv_send(sep, ops[i], sctx[i], true);
         dereg(sender(), tx_memh[i]);
     }
 
@@ -927,6 +948,7 @@ struct unexp_rndv_send {
     std::vector<uint8_t>  buf;
     uct_mem_h             memh;
     uct_cxi_rndv_send_ctx ctx;
+    ucs_status_ptr_t      op;
 };
 
 /*
@@ -999,9 +1021,10 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
                 std::vector<uint8_t> hdr = pack_rndv_hdr(0x77,
                                                          0x1000 * (r + 1) + i,
                                                          3);
-                ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
-                        sep, rtag[r], hdr.data(), hdr.size(), &siov, 1, 0,
-                        &rs[r].ctx.super)));
+                rs[r].op = uct_ep_tag_rndv_zcopy(sep, rtag[r], hdr.data(),
+                                                 hdr.size(), &siov, 1, 0,
+                                                 &rs[r].ctx.super);
+                ASSERT_FALSE(UCS_PTR_IS_ERR(rs[r].op));
             }
 
             poll_until_count_arrivals(before + 3);
@@ -1052,7 +1075,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_is_not_reported_before_rendezvous)
                 uct_mem_h dmemh = reg(receiver(), dst.data(), PAY_LEN);
 
                 pull_and_verify(rep, *rec, dst, dmemh, rs[r].buf);
-                poll_until(rs[r].ctx.fired);
+                end_rndv_send(sep, rs[r].op, rs[r].ctx, true);
                 dereg(receiver(), dmemh);
                 dereg(sender(), rs[r].memh);
             }
@@ -1200,9 +1223,10 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_rendezvous_reported_in_send_order)
         siov.count  = 1;
         std::vector<uint8_t> hdr = pack_rndv_hdr(0x88, i, 5);
 
-        ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
-                sep, 0xC0DE000000000000ULL, hdr.data(), hdr.size(), &siov,
-                1, 0, &rs->ctx.super)));
+        rs->op = uct_ep_tag_rndv_zcopy(sep, 0xC0DE000000000000ULL, hdr.data(),
+                                       hdr.size(), &siov, 1, 0,
+                                       &rs->ctx.super);
+        ASSERT_FALSE(UCS_PTR_IS_ERR(rs->op));
         sends.push_back(rs);
     }
 
@@ -1217,7 +1241,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_rendezvous_reported_in_send_order)
         std::vector<uint8_t> dst(PAY_LEN, 0);
         uct_mem_h            dmemh = reg(receiver(), dst.data(), PAY_LEN);
         pull_and_verify(rep, m_ctx.records[i], dst, dmemh, sends[i]->buf);
-        poll_until(sends[i]->ctx.fired);
+        end_rndv_send(sep, sends[i]->op, sends[i]->ctx, true);
         dereg(receiver(), dmemh);
     }
     for (unsigned i = 0; i < N; i++) {
@@ -1278,8 +1302,10 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, rendezvous_vs_posted_receive)
         siov.stride = 0;
         siov.count  = 1;
         std::vector<uint8_t> hdr = pack_rndv_hdr(0x99, i, 2);
-        ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
-                sep, tag, hdr.data(), hdr.size(), &siov, 1, 0, &sctx.super)));
+        ucs_status_ptr_t op = uct_ep_tag_rndv_zcopy(sep, tag, hdr.data(),
+                                                    hdr.size(), &siov, 1, 0,
+                                                    &sctx.super);
+        ASSERT_FALSE(UCS_PTR_IS_ERR(op));
 
         for (unsigned lag = 0; lag < (i % MAX_LAG); lag++) {
             uct_iface_progress(sender().iface());
@@ -1355,7 +1381,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, rendezvous_vs_posted_receive)
             dereg(receiver(), dmemh);
         }
 
-        poll_until(sctx.fired);
+        end_rndv_send(sep, op, sctx, !rctx.completed);
         dereg(receiver(), rx_memh);
         dereg(sender(), tx_memh);
     }
@@ -1406,8 +1432,10 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_behind_rendezvous_taken_by_receive)
         siov.stride = 0;
         siov.count  = 1;
         std::vector<uint8_t> hdr = pack_rndv_hdr(0x99, i, 2);
-        ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
-                sep, tag, hdr.data(), hdr.size(), &siov, 1, 0, &sctx.super)));
+        ucs_status_ptr_t op = uct_ep_tag_rndv_zcopy(sep, tag, hdr.data(),
+                                                    hdr.size(), &siov, 1, 0,
+                                                    &sctx.super);
+        ASSERT_FALSE(UCS_PTR_IS_ERR(op));
         uint64_t marker = 0xE000 + i;
         ASSERT_UCS_OK(uct_ep_tag_eager_short(sep, tag, &marker,
                                              sizeof(marker)));
@@ -1480,7 +1508,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, eager_behind_rendezvous_taken_by_receive)
             EXPECT_EQ(tx_buf, rx_buf) << "iteration " << i;
         }
 
-        poll_until(sctx.fired);
+        end_rndv_send(sep, op, sctx, m_ctx.records.size() > rbefore);
         dereg(receiver(), rx_memh);
         dereg(sender(), tx_memh);
     }
@@ -1538,14 +1566,16 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, search_delete_finds_the_other_kind)
             siov.count  = 1;
             std::vector<uint8_t> hdr = pack_rndv_hdr(0x99, i, 2);
 
+            ucs_status_ptr_t op = NULL;
             for (unsigned k = 0; k < 2; k++) {
                 if (k == rndv_first) {
                     ASSERT_UCS_OK(uct_ep_tag_eager_short(sep, tag, &marker,
                                                          sizeof(marker)));
                 } else {
-                    ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
-                            sep, tag, hdr.data(), hdr.size(), &siov, 1, 0,
-                            &sctx.super)));
+                    op = uct_ep_tag_rndv_zcopy(sep, tag, hdr.data(),
+                                               hdr.size(), &siov, 1, 0,
+                                               &sctx.super);
+                    ASSERT_FALSE(UCS_PTR_IS_ERR(op));
                 }
             }
 
@@ -1618,7 +1648,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, search_delete_finds_the_other_kind)
                 EXPECT_EQ(tx_buf, rx_buf) << what << " round " << i;
             }
 
-            poll_until(sctx.fired);
+            end_rndv_send(sep, op, sctx, a.rndv);
             dereg(receiver(), rx_memh);
             dereg(sender(), tx_memh);
         }
@@ -1663,9 +1693,9 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_streams_each_in_order)
             siov.count  = 1;
             /* req_id: the tag and the position in its stream */
             std::vector<uint8_t> hdr = pack_rndv_hdr(0x66, t * 1000 + n, 4);
-            ASSERT_FALSE(UCS_PTR_IS_ERR(uct_ep_tag_rndv_zcopy(
-                    sep, tag, hdr.data(), hdr.size(), &siov, 1, 0,
-                    &rs->ctx.super)));
+            rs->op = uct_ep_tag_rndv_zcopy(sep, tag, hdr.data(), hdr.size(),
+                                           &siov, 1, 0, &rs->ctx.super);
+            ASSERT_FALSE(UCS_PTR_IS_ERR(rs->op));
             sends.push_back(rs);
         }
     }
@@ -1692,7 +1722,7 @@ UCS_TEST_P(test_cxi_tag_rndv_unexp, many_streams_each_in_order)
         dereg(receiver(), dmemh);
     }
     for (size_t i = 0; i < sends.size(); i++) {
-        poll_until(sends[i]->ctx.fired);
+        end_rndv_send(sep, sends[i]->op, sends[i]->ctx, true);
         dereg(sender(), sends[i]->memh);
         delete sends[i];
     }
