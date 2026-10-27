@@ -106,6 +106,28 @@ typedef struct uct_cxi_ep {
     uint8_t rndv_hdr_announced;
 } uct_cxi_ep_t;
 
+static UCS_F_ALWAYS_INLINE uct_cxi_iface_t *uct_cxi_ep_iface(uct_cxi_ep_t *ep)
+{
+    return ucs_derived_of(ep->super.super.iface, uct_cxi_iface_t);
+}
+
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_send_op_set(uct_cxi_send_op_t *op, uct_cxi_ep_t *ep,
+                    uct_completion_t *comp, uct_cxi_send_op_func_t handler)
+{
+    op->ep      = ep;
+    op->comp    = comp;
+    op->handler = handler;
+}
+
+/* Account a send that has been rung (undone by its completion). */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_ep_tx_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
+{
+    ep->outstanding++;
+    iface->tx.outstanding++;
+}
+
 /*
  * True if a send must wait on the pending queue (UCS_ERR_NO_RESOURCE):
  *   - the target PTE hit matching-resource exhaustion (\a pte_fc, NULL for
@@ -228,8 +250,7 @@ uct_cxi_idc_track_hdr(struct c_idc_msg_hdr *hdr, uct_cxi_ep_t *ep, unsigned cls,
 static UCS_F_ALWAYS_INLINE void
 uct_cxi_idc_track_commit(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface)
 {
-    ep->outstanding++;
-    iface->tx.outstanding++;
+    uct_cxi_ep_tx_commit(ep, iface);
 }
 
 /** Slow path of uct_cxi_fc_reserve(): the peer is not (yet) up. */

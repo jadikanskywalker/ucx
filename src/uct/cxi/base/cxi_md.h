@@ -50,6 +50,13 @@ typedef struct uct_cxi_mem_handle {
     uint64_t       iova_offset; /**< cxi_md->iova - cxi_md->va */
 } uct_cxi_mem_handle_t;
 
+/* NIC address of \a addr within the buffer registered as \a mh. */
+static UCS_F_ALWAYS_INLINE uint64_t
+uct_cxi_mem_iova(const uct_cxi_mem_handle_t *mh, const void *addr)
+{
+    return mh->iova_offset + (uint64_t)(uintptr_t)addr;
+}
+
 
 /** Registration cache region; the embedded memh is handed out as uct_mem_h. */
 typedef struct uct_cxi_rcache_region {

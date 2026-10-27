@@ -21,12 +21,6 @@
 #include <cxi_prov_hw.h>
 
 
-static UCS_F_ALWAYS_INLINE uct_cxi_iface_t *
-uct_cxi_ep_iface(uct_cxi_ep_t *ep)
-{
-    return ucs_derived_of(ep->super.super.iface, uct_cxi_iface_t);
-}
-
 static UCS_F_ALWAYS_INLINE uct_cxi_md_t *
 uct_cxi_ep_md(uct_cxi_ep_t *ep)
 {
