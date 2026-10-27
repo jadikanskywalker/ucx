@@ -335,7 +335,7 @@ static ucs_status_t
 uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                             uint8_t lac)
 {
-    const union c_event      *ev;
+    ucs_status_t              status;
     int                       ret;
 
     {
@@ -358,32 +358,9 @@ uct_cxi_iface_open_rma_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         goto err_destroy_pte;
     }
 
-    /* Transition PTE DISABLED → ENABLED; spin for STATE_CHANGE event. */
-    {
-        struct c_set_state_cmd ss = {};
-        bool                   enabled = false;
-
-        ss.command.opcode = C_CMD_TGT_SETSTATE;
-        ss.ptlte_index    = self->rma.pte[lac]->ptn;
-        ss.ptlte_state    = C_PTLTE_ENABLED;
-
-        ret = cxi_cq_emit_target(self->tgt.cmdq, &ss);
-        if (ret != 0) {
-            ucs_error("cxi SETSTATE lac %u: %d", lac, ret);
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(self->tgt.cmdq);
-
-        while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
-                if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
-                    ev->tgt_long.initiator.state_change.ptlte_state
-                            == C_PTLTE_ENABLED) {
-                    enabled = true;
-                }
-            }
-            cxi_eq_ack_events(self->rx_eq.evtq);
-        }
+    status = uct_cxi_iface_pte_enable(self, self->rma.pte[lac], &self->rx_eq);
+    if (status != UCS_OK) {
+        goto err_unmap_pte;
     }
 
     /* Post catch-all LE so the NIC can resolve IOVAs via this LAC. */
@@ -458,6 +435,53 @@ ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
 }
 
 /*
+ * Enable \a pte (SETSTATE) and wait on \a eq for its STATE_CHANGE, up to
+ * UCT_CXI_PTE_ENABLE_TIMEOUT_SEC. Other events read meanwhile are discarded:
+ * this runs at open, before any traffic.
+ */
+ucs_status_t uct_cxi_iface_pte_enable(uct_cxi_iface_t *iface,
+                                      struct cxil_pte *pte, uct_cxi_eq_t *eq)
+{
+    struct c_set_state_cmd ss       = {};
+    ucs_time_t             deadline = ucs_get_time() +
+                                      ucs_time_from_sec(
+                                              UCT_CXI_PTE_ENABLE_TIMEOUT_SEC);
+    const union c_event   *ev;
+    int                    enabled  = 0;
+    ucs_status_t           status;
+
+    ss.command.opcode = C_CMD_TGT_SETSTATE;
+    ss.ptlte_index    = pte->ptn;
+    ss.ptlte_state    = C_PTLTE_ENABLED;
+
+    status = uct_cxi_iface_tgt_post(iface, &ss);
+    if (status != UCS_OK) {
+        ucs_error("cxi PTE ptn=%u SETSTATE: %s", (unsigned)pte->ptn,
+                  ucs_status_string(status));
+        return status;
+    }
+
+    while (!enabled) {
+        while ((ev = cxi_eq_get_event(eq->evtq)) != NULL) {
+            if ((ev->hdr.event_type == C_EVENT_STATE_CHANGE) &&
+                (ev->tgt_long.initiator.state_change.ptlte_state ==
+                 C_PTLTE_ENABLED)) {
+                enabled = 1;
+            }
+        }
+        cxi_eq_ack_events(eq->evtq);
+
+        if (!enabled && (ucs_get_time() > deadline)) {
+            ucs_error("cxi PTE ptn=%u was not enabled within %.1f s",
+                      (unsigned)pte->ptn, UCT_CXI_PTE_ENABLE_TIMEOUT_SEC);
+            return UCS_ERR_TIMED_OUT;
+        }
+    }
+
+    return UCS_OK;
+}
+
+/*
  * Append one PRIORITY LE for AM receive buffer \a buf_idx. buffer_id echoes in
  * every PUT, identifying the buffer. min_free auto-unlinks the buffer when less
  * than the largest message is left, so a linked buffer always fits the next
@@ -516,9 +540,8 @@ uct_cxi_iface_post_am_le(uct_cxi_iface_t *self, int buf_idx, int restart_seq)
 static ucs_status_t
 uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
-    const union c_event *ev;
-    ucs_status_t         status;
-    int                  ret;
+    ucs_status_t status;
+    int          ret;
 
     {
         /* en_flowctrl: a full EQ disables the PTE gracefully (accountable via
@@ -543,32 +566,9 @@ uct_cxi_iface_open_am_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
         goto err_destroy_pte;
     }
 
-    /* Transition PTE DISABLED → ENABLED; spin for STATE_CHANGE event. */
-    {
-        struct c_set_state_cmd ss = {};
-        bool                   enabled = false;
-
-        ss.command.opcode = C_CMD_TGT_SETSTATE;
-        ss.ptlte_index    = self->am.pte->ptn;
-        ss.ptlte_state    = C_PTLTE_ENABLED;
-
-        ret = cxi_cq_emit_target(self->tgt.cmdq, &ss);
-        if (ret != 0) {
-            ucs_error("cxi AM SETSTATE: %d", ret);
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(self->tgt.cmdq);
-
-        while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
-                if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
-                    ev->tgt_long.initiator.state_change.ptlte_state
-                            == C_PTLTE_ENABLED) {
-                    enabled = true;
-                }
-            }
-            cxi_eq_ack_events(self->rx_eq.evtq);
-        }
+    status = uct_cxi_iface_pte_enable(self, self->am.pte, &self->rx_eq);
+    if (status != UCS_OK) {
+        goto err_unmap_pte;
     }
 
     self->am.rx_total = 0;

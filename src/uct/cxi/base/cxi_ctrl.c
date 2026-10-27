@@ -37,49 +37,6 @@ static ucs_mpool_ops_t uct_cxi_ctrl_mpool_ops = {
 };
 
 
-/* Enable the control PTE and wait for its STATE_CHANGE event. */
-static ucs_status_t uct_cxi_ctrl_enable_pte(uct_cxi_iface_t *iface)
-{
-    uct_cxi_ctrl_t         *ctrl     = &iface->ctrl;
-    struct c_set_state_cmd  ss       = {};
-    ucs_time_t              deadline = ucs_get_time() +
-                                       ucs_time_from_sec(
-                                               UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
-    const union c_event    *ev;
-    int                     enabled  = 0;
-    int                     ret;
-
-    ss.command.opcode = C_CMD_TGT_SETSTATE;
-    ss.ptlte_index    = ctrl->pte->ptn;
-    ss.ptlte_state    = C_PTLTE_ENABLED;
-
-    ret = cxi_cq_emit_target(iface->tgt.cmdq, &ss);
-    if (ret != 0) {
-        ucs_error("cxi CTRL SETSTATE: %d", ret);
-        return UCS_ERR_IO_ERROR;
-    }
-    cxi_cq_ring(iface->tgt.cmdq);
-
-    while (!enabled) {
-        while ((ev = cxi_eq_get_event(ctrl->eq.evtq)) != NULL) {
-            if ((ev->hdr.event_type == C_EVENT_STATE_CHANGE) &&
-                (ev->tgt_long.initiator.state_change.ptlte_state ==
-                 C_PTLTE_ENABLED)) {
-                enabled = 1;
-            }
-        }
-        cxi_eq_ack_events(ctrl->eq.evtq);
-
-        if (!enabled && (ucs_get_time() > deadline)) {
-            ucs_error("cxi CTRL PTE was not enabled within %.1f s",
-                      UCT_CXI_TGT_CMDQ_TIMEOUT_SEC);
-            return UCS_ERR_TIMED_OUT;
-        }
-    }
-
-    return UCS_OK;
-}
-
 /* Allocate and enable the control PTE, and post its one list entry. */
 static ucs_status_t uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface,
                                           struct cxil_lni *lni)
@@ -111,7 +68,7 @@ static ucs_status_t uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface,
         goto err_destroy_pte;
     }
 
-    status = uct_cxi_ctrl_enable_pte(iface);
+    status = uct_cxi_iface_pte_enable(iface, ctrl->pte, &ctrl->eq);
     if (status != UCS_OK) {
         goto err_unmap_pte;
     }

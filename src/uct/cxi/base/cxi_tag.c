@@ -353,10 +353,9 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                            const uct_iface_params_t *params,
                            size_t slot_credits, size_t byte_credits)
 {
-    const union c_event *ev;
-    ucs_status_t         status;
-    int                  ret;
-    unsigned             i;
+    ucs_status_t status;
+    int          ret;
+    unsigned     i;
 
     memset(&self->tag, 0, sizeof(self->tag));
     self->tag.ptn = -1;
@@ -542,33 +541,9 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         goto err_destroy_pte;
     }
 
-    /* Transition PTE DISABLED -> ENABLED; spin for STATE_CHANGE event. */
-    {
-        struct c_set_state_cmd ss = {};
-        bool                   enabled = false;
-
-        ss.command.opcode = C_CMD_TGT_SETSTATE;
-        ss.ptlte_index    = self->tag.pte->ptn;
-        ss.ptlte_state    = C_PTLTE_ENABLED;
-
-        ret = cxi_cq_emit_target(self->tgt.cmdq, &ss);
-        if (ret != 0) {
-            ucs_error("cxi TAG SETSTATE: %d", ret);
-            status = UCS_ERR_IO_ERROR;
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(self->tgt.cmdq);
-
-        while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
-                if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
-                    ev->tgt_long.initiator.state_change.ptlte_state
-                            == C_PTLTE_ENABLED) {
-                    enabled = true;
-                }
-            }
-            cxi_eq_ack_events(self->rx_eq.evtq);
-        }
+    status = uct_cxi_iface_pte_enable(self, self->tag.pte, &self->rx_eq);
+    if (status != UCS_OK) {
+        goto err_unmap_pte;
     }
 
     /* Post all overflow-ring buffers -- priority LEs are posted purely
@@ -738,7 +713,6 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
                                          struct cxil_lni *lni)
 {
     uct_cxi_md_t              *md = uct_cxi_iface_md(self);
-    const union c_event       *ev;
     ucs_status_t               status;
     int                        ret;
     uint32_t                   i;
@@ -797,33 +771,9 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         goto err_destroy_pte;
     }
 
-    /* Transition PTE DISABLED -> ENABLED; spin for STATE_CHANGE event. */
-    {
-        struct c_set_state_cmd ss = {};
-        bool                   enabled = false;
-
-        ss.command.opcode = C_CMD_TGT_SETSTATE;
-        ss.ptlte_index    = self->rdzv.pte->ptn;
-        ss.ptlte_state    = C_PTLTE_ENABLED;
-
-        ret = cxi_cq_emit_target(self->tgt.cmdq, &ss);
-        if (ret != 0) {
-            ucs_error("cxi RDZV SETSTATE: %d", ret);
-            status = UCS_ERR_IO_ERROR;
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(self->tgt.cmdq);
-
-        while (!enabled) {
-            while ((ev = cxi_eq_get_event(self->rx_eq.evtq)) != NULL) {
-                if (ev->hdr.event_type == C_EVENT_STATE_CHANGE &&
-                    ev->tgt_long.initiator.state_change.ptlte_state
-                            == C_PTLTE_ENABLED) {
-                    enabled = true;
-                }
-            }
-            cxi_eq_ack_events(self->rx_eq.evtq);
-        }
+    status = uct_cxi_iface_pte_enable(self, self->rdzv.pte, &self->rx_eq);
+    if (status != UCS_OK) {
+        goto err_unmap_pte;
     }
 
     /* The whole-LAC catch-all LE: fully wildcarded and unrestricted-flavored

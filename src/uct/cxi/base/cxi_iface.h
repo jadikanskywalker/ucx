@@ -67,6 +67,9 @@ typedef enum {
  * queue. */
 #define UCT_CXI_TGT_CMDQ_TIMEOUT_SEC  1.0
 
+/* How long opening a PTE waits for its STATE_CHANGE after enabling it. */
+#define UCT_CXI_PTE_ENABLE_TIMEOUT_SEC  5.0
+
 
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH     512U
@@ -650,6 +653,10 @@ void uct_cxi_tx_emit_failed(const void *obj, const char *what, int ret);
 /** Slow path of uct_cxi_iface_tgt_post(); \a ret is the failed emit's result. */
 ucs_status_t uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface,
                                          const void *cmd, int ret);
+
+/** Enable \a pte and wait for its STATE_CHANGE on \a eq; fails on a timeout. */
+ucs_status_t uct_cxi_iface_pte_enable(uct_cxi_iface_t *iface,
+                                      struct cxil_pte *pte, uct_cxi_eq_t *eq);
 
 END_C_DECLS
 
