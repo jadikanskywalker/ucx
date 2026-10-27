@@ -453,6 +453,9 @@ BEGIN_C_DECLS
 /** Completion handler of a send whose desc only needs returning to its pool. */
 void uct_cxi_send_desc_put_comp(uct_cxi_send_op_t *op, ucs_status_t status);
 
+/** Clean up the base ep and free \a ep. */
+void uct_cxi_ep_free(uct_cxi_ep_t *ep);
+
 END_C_DECLS
 
 ucs_status_t uct_cxi_ep_create(const uct_ep_params_t *params, uct_ep_h *ep_p);

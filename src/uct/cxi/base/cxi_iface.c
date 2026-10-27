@@ -1769,7 +1769,7 @@ uct_cxi_iface_ep_release(uct_cxi_iface_t *iface, uct_cxi_ep_t *ep)
                       (uintptr_t)ep);
         ucs_assert(iter != kh_end(&iface->tx.zombie_eps));
         kh_del(uct_cxi_zombie_ep_hash, &iface->tx.zombie_eps, iter);
-        ucs_free(ep);
+        uct_cxi_ep_free(ep);
     }
 }
 
