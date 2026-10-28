@@ -13,19 +13,18 @@
  */
 
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#include "config.h"
 #endif
 
 #include "cxi_iface.h"
-
-/* Built with the flow control, its only client (see Makefile.am). */
-#ifndef UCT_CXI_DISABLE_FC
 
 #include <ucs/debug/log.h>
 #include <ucs/sys/sys.h>
 
 #include <string.h>
 
+/* Built with the flow control, its only client (see Makefile.am). */
+#ifndef UCT_CXI_DISABLE_FC
 
 /* Plain host memory: control requests are only ever read by software. */
 static ucs_mpool_ops_t uct_cxi_ctrl_mpool_ops = {
@@ -38,24 +37,21 @@ static ucs_mpool_ops_t uct_cxi_ctrl_mpool_ops = {
 
 
 /* Allocate and enable the control PTE, and post its one list entry. */
-static ucs_status_t uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface,
-                                          struct cxil_lni *lni)
+static ucs_status_t
+uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface, struct cxil_lni *lni)
 {
-    uct_cxi_ctrl_t      *ctrl = &iface->ctrl;
-    struct c_target_cmd  le   = {};
-    ucs_status_t         status;
-    int                  ret;
+    uct_cxi_ctrl_t *ctrl             = &iface->ctrl;
+    struct c_target_cmd le           = {};
+    struct cxi_pt_alloc_opts pt_opts = {
+        .is_matching    = 1,
+        .use_long_event = 1
+    };
+    ucs_status_t status;
+    int ret;
 
-    {
-        /* No flow control: a full EQ refuses the message and the sender
-         * resends, so the PTE is never disabled. */
-        struct cxi_pt_alloc_opts pt_opts = {
-            .is_matching    = 1,
-            .use_long_event = 1,
-            .en_flowctrl    = 0
-        };
-        ret = cxil_alloc_pte(lni, ctrl->eq.evtq, &pt_opts, &ctrl->pte);
-    }
+    /* en_flowctrl stays off: a full EQ refuses the message and the sender
+     * resends, so the PTE is never disabled. */
+    ret = cxil_alloc_pte(lni, ctrl->eq.evtq, &pt_opts, &ctrl->pte);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte CTRL: %s", strerror(-ret));
         return UCS_ERR_IO_ERROR;
@@ -74,21 +70,16 @@ static ucs_status_t uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface,
     }
 
     /* One persistent, zero-length list entry that accepts everything. */
-    le.command.opcode          = C_CMD_TGT_APPEND;
-    le.ptl_list                = C_PTL_LIST_PRIORITY;
-    le.ptlte_index             = ctrl->pte->ptn;
-    le.op_put                  = 1;
-    le.use_once                = 0;
-    le.manage_local            = 0;
-    le.event_link_disable      = 1;
-    le.event_unlink_disable    = 1;
-    le.unexpected_hdr_disable  = 1;
-    le.match_id                = CXI_MATCH_ID_ANY;
-    le.ignore_bits             = UINT64_MAX;
-    le.match_bits              = 0;
-    le.start                   = 0;
-    le.length                  = 0;
-    status = uct_cxi_iface_tgt_post(iface, &le);
+    le.command.opcode         = C_CMD_TGT_APPEND;
+    le.ptl_list               = C_PTL_LIST_PRIORITY;
+    le.ptlte_index            = ctrl->pte->ptn;
+    le.op_put                 = 1;
+    le.event_link_disable     = 1;
+    le.event_unlink_disable   = 1;
+    le.unexpected_hdr_disable = 1;
+    le.match_id               = CXI_MATCH_ID_ANY;
+    le.ignore_bits            = UINT64_MAX;
+    status                    = uct_cxi_iface_tgt_post(iface, &le);
     if (status != UCS_OK) {
         ucs_error("cxi CTRL LE APPEND: %s", ucs_status_string(status));
         goto err_unmap_pte;
@@ -110,11 +101,11 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
                                const uct_cxi_iface_config_t *config,
                                struct cxil_lni *lni)
 {
-    uct_cxi_ctrl_t           *ctrl = &iface->ctrl;
-    struct cxi_cq_alloc_opts  cq_opts;
-    ucs_mpool_params_t        mp_params;
-    ucs_status_t              status;
-    int                       ret;
+    uct_cxi_ctrl_t *ctrl = &iface->ctrl;
+    struct cxi_cq_alloc_opts cq_opts;
+    ucs_mpool_params_t mp_params;
+    ucs_status_t status;
+    int ret;
 
     memset(ctrl, 0, sizeof(*ctrl));
 
@@ -142,7 +133,7 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
     cq_opts.count = UCT_CXI_CTRL_CMDQ_DEPTH;
     cq_opts.flags = CXI_CQ_IS_TX;
     cq_opts.lcid  = iface->tx.cp->lcid;
-    ret = cxil_alloc_cmdq(lni, ctrl->eq.evtq, &cq_opts, &ctrl->cmdq);
+    ret           = cxil_alloc_cmdq(lni, ctrl->eq.evtq, &cq_opts, &ctrl->cmdq);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_cmdq ctrl failed: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -155,7 +146,7 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
     mp_params.max_elems       = ctrl->max_inflight;
     mp_params.ops             = &uct_cxi_ctrl_mpool_ops;
     mp_params.name            = "cxi-ctrl-req";
-    status = ucs_mpool_init(&mp_params, &ctrl->req_pool);
+    status                    = ucs_mpool_init(&mp_params, &ctrl->req_pool);
     if (status != UCS_OK) {
         goto err_destroy_cmdq;
     }
@@ -181,7 +172,7 @@ err_cleanup_eq:
 void uct_cxi_ctrl_close(uct_cxi_iface_t *iface)
 {
     uct_cxi_ctrl_t *ctrl = &iface->ctrl;
-    int             ret;
+    int ret;
 
     ctrl->enabled = 0;
     if (ctrl->eq.evtq == NULL) {
@@ -223,12 +214,14 @@ ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                uint64_t header_data, uint32_t grant_slots,
                                const uint32_t *grant_units)
 {
-    uct_cxi_ctrl_t     *ctrl    = &iface->ctrl;
-    unsigned            pid_bits = uct_cxi_iface_md(iface)->pid_bits;
+    uct_cxi_ctrl_t *ctrl       = &iface->ctrl;
+    struct c_cstate_cmd cstate = {};
+    struct c_idc_msg_hdr hdr   = {};
     uct_cxi_ctrl_req_t *req;
-    union c_fab_addr    dfa;
-    uint8_t             idx_ext;
-    int                 ret;
+    union c_fab_addr dfa;
+    unsigned pid_bits;
+    uint8_t idx_ext;
+    int ret;
 
     if (ctrl->outstanding >= ctrl->max_inflight) {
         return UCS_ERR_NO_RESOURCE;
@@ -246,42 +239,36 @@ ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
     } else {
         memset(req->grant_units, 0, sizeof(req->grant_units));
     }
+    pid_bits = uct_cxi_iface_md(iface)->pid_bits;
     cxi_build_dfa(CXI_MATCH_ID_EP(pid_bits, peer->key),
                   CXI_MATCH_ID_PID(pid_bits, peer->key), pid_bits,
                   UCT_CXI_PTE_CTRL, &dfa, &idx_ext);
 
-    {
-        struct c_cstate_cmd cstate = {};
-        cstate.event_send_disable  = 1;
-        cstate.restricted          = 0;
-        cstate.initiator           = iface->match_id;
-        cstate.index_ext           = idx_ext;
-        cstate.eq                  = ctrl->eq.evtq->eqn;
-
-        ret = cxi_cq_emit_c_state(ctrl->cmdq, &cstate);
-    }
+    cstate.event_send_disable = 1;
+    cstate.initiator          = iface->match_id;
+    cstate.index_ext          = idx_ext;
+    cstate.eq                 = ctrl->eq.evtq->eqn;
+    ret                       = cxi_cq_emit_c_state(ctrl->cmdq, &cstate);
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(req);
-        return UCS_ERR_NO_RESOURCE;
+        goto err_put_req;
     }
 
-    {
-        struct c_idc_msg_hdr hdr = {};
-        hdr.dfa         = dfa;
-        hdr.match_bits  = match_bits;
-        hdr.header_data = header_data;
-        hdr.user_ptr    = (uint64_t)(uintptr_t)req;
-
-        ret = cxi_cq_emit_idc_msg(ctrl->cmdq, &hdr, hdr.data, 0);
-    }
+    hdr.dfa         = dfa;
+    hdr.match_bits  = match_bits;
+    hdr.header_data = header_data;
+    hdr.user_ptr    = (uint64_t)(uintptr_t)req;
+    ret             = cxi_cq_emit_idc_msg(ctrl->cmdq, &hdr, hdr.data, 0);
     if (ucs_unlikely(ret != 0)) {
-        ucs_mpool_put(req);
-        return UCS_ERR_NO_RESOURCE;
+        goto err_put_req;
     }
 
     cxi_cq_ring(ctrl->cmdq);
     ctrl->outstanding++;
     return UCS_OK;
+
+err_put_req:
+    ucs_mpool_put(req);
+    return UCS_ERR_NO_RESOURCE;
 }
 
 #endif /* UCT_CXI_DISABLE_FC */
