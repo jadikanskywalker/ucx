@@ -27,12 +27,8 @@
 
 #define UCT_CXI_NAME "cxi"
 
-/* Default EQ depth (UCX_CXI_EQ_SIZE=-1) and the hardware event size. */
-#define UCT_CXI_EQ_NUM_EVENTS 1024U
-#define UCT_CXI_EQ_ENTRY_SIZE 64U /* sizeof(union c_event) */
-/* RX EQ slots beyond the credit windows: processed events hold their slots
- * until acknowledged to the NIC in a batch. */
-#define UCT_CXI_EQ_SLACK 128U
+typedef struct uct_cxi_iface uct_cxi_iface_t;
+
 /* Largest CREP windows: 24 bits of slots, 20 bits per class in
  * UCT_CXI_FC_WINDOW_GRAIN units. */
 #define UCT_CXI_FC_WINDOW_GRAIN    64u
@@ -71,11 +67,6 @@ typedef enum {
 /* Command queue depth. */
 #define UCT_CXI_CMDQ_DEPTH 512U
 
-/* Control channel: messages in flight, command queue depth (two commands per
- * message) and default EQ depth. */
-#define UCT_CXI_CTRL_MAX_INFLIGHT  64U
-#define UCT_CXI_CTRL_CMDQ_DEPTH    256U
-#define UCT_CXI_CTRL_EQ_NUM_EVENTS 256U
 
 /* AM ring, auto-sized from the credit windows (uct_cxi_iface_size_am_ring). */
 #define UCT_CXI_AM_RX_NUM_BUFS_MAX 64
@@ -204,8 +195,11 @@ typedef struct uct_cxi_pte_fc {
 } uct_cxi_pte_fc_t;
 
 
+#include "cxi_eq.h"
+
 #ifndef UCT_CXI_DISABLE_FC
 #include "cxi_fc.h"
+#include "cxi_ctrl.h"
 #endif
 
 /* TX EQ slots kept out of tx.max_inflight for events not in tx.outstanding
@@ -290,60 +284,6 @@ KHASH_INIT(uct_cxi_unexp_stream_hash, uct_cxi_unexp_key_t,
            uct_cxi_unexp_stream_t*, 1, uct_cxi_unexp_key_hash,
            uct_cxi_unexp_key_equal)
 
-/** An event queue: the hardware EQ and its buffer, with sizing, PTE recovery
- *  and growth state. */
-typedef struct uct_cxi_eq {
-    /* "rx" / "tx" / "ctrl", for log messages */
-    const char    *name;
-    struct cxi_eq *evtq;
-    /* mmap backing buffer of evtq, and its cxil_map registration */
-    void          *buf;
-    struct cxi_md *md;
-    unsigned      num_events;
-    /* Max events drained per progress call */
-    unsigned      max_poll;
-
-    /* >0 while draining before PTEs are re-enabled; one per event processed */
-    unsigned      need_to_drain;
-    unsigned      drain_pct;
-    /* Configured reserved slots, to restore after a resize */
-    unsigned      reserved_slots_cfg;
-    /* Current reserved slots, as cxil_evtq_adjust_reserved_fc() reports */
-    unsigned      reserved_slots;
-
-    /* Preemptive growth: a hardware fill-threshold update triggers a resize
-     * before any disable; reactive recovery stays the backstop. */
-    struct {
-        int           enabled;
-        unsigned      thresh_pct;
-        unsigned      max_len_events;
-        /* From cxil_evtq_resize() to cxil_evtq_resize_complete() */
-        int           resizing;
-        /* New buffer awaiting C_EVENT_EQ_SWITCH, its registration, length */
-        void          *pending_buf;
-        struct cxi_md *pending_md;
-        size_t        pending_len;
-    } grow;
-} uct_cxi_eq_t;
-
-#ifndef UCT_CXI_DISABLE_FC
-/**
- * The control channel (cxi_ctrl.c): its own PTE, event queue and command queue.
- */
-typedef struct uct_cxi_ctrl {
-    /* Opened (FC_ENABLE) */
-    int                 enabled;
-    uct_cxi_eq_t        eq;
-    struct cxi_cq       *cmdq;
-    struct cxil_pte     *pte;
-    struct cxil_pte_map *pte_map;
-    /* uct_cxi_ctrl_req_t */
-    ucs_mpool_t         req_pool;
-    unsigned            outstanding;
-    /* One reserved EQ slot per message */
-    unsigned            max_inflight;
-} uct_cxi_ctrl_t;
-#endif
 
 /* Endpoints destroyed with sends in flight, keyed by address: the last
  * completion frees each, the iface frees any left at close. */
@@ -353,7 +293,7 @@ KHASH_SET_INIT_INT64(uct_cxi_zombie_ep_hash)
  * CXI interface instance. Resources are allocated in UCS_CLASS_INIT_FUNC order
  * and destroyed in reverse.
  */
-typedef struct uct_cxi_iface {
+struct uct_cxi_iface {
     /* Must be first */
     uct_base_iface_t super;
 
@@ -571,7 +511,7 @@ typedef struct uct_cxi_iface {
     /* The "initiator" of every unrestricted command; targets key per-peer state
      * on it (tag.rndv_peer_cache). Restricted RMA/AMO commands have none. */
     uint32_t match_id;
-} uct_cxi_iface_t;
+};
 
 
 static UCS_F_ALWAYS_INLINE uct_cxi_md_t *
@@ -607,18 +547,6 @@ uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface, const void *cmd, int ret);
 /** Enable \a pte and wait for its STATE_CHANGE on \a eq; fails on a timeout. */
 ucs_status_t uct_cxi_iface_pte_enable(uct_cxi_iface_t *iface,
                                       struct cxil_pte *pte, uct_cxi_eq_t *eq);
-
-/* cxi_eq.c */
-void uct_cxi_eq_configure(uct_cxi_eq_t *eq, const char *name,
-                          unsigned num_events, unsigned reserved_slots,
-                          int grow_enabled,
-                          const uct_cxi_iface_config_t *config);
-ucs_status_t uct_cxi_eq_init(uct_cxi_eq_t *eq, struct cxil_lni *lni,
-                             struct cxil_wait_obj *wait_obj);
-void uct_cxi_eq_cleanup(uct_cxi_eq_t *eq);
-void uct_cxi_eq_abort_resize(uct_cxi_eq_t *eq);
-void uct_cxi_iface_eq_grow_start(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq);
-void uct_cxi_iface_eq_grow_complete(uct_cxi_iface_t *iface, uct_cxi_eq_t *eq);
 
 /* cxi_iface.c */
 ucs_status_t
@@ -668,128 +596,7 @@ UCS_CLASS_DECLARE(uct_cxi_iface_t, uct_md_h, uct_worker_h,
                   const uct_iface_params_t*, const uct_iface_config_t*)
 
 #ifndef UCT_CXI_DISABLE_FC
-
-BEGIN_C_DECLS
-
-/* cxi_ctrl.c */
-ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
-                               const uct_cxi_iface_config_t *config,
-                               struct cxil_lni *lni);
-void uct_cxi_ctrl_close(uct_cxi_iface_t *iface);
-
-/** Pool ops for objects only software reads (control requests, handshakes). */
-extern ucs_mpool_ops_t uct_cxi_host_mpool_ops;
-
-/**
- * Send a control message to \a peer; UCS_ERR_NO_RESOURCE if the channel is
- * full. \a grant_slots and \a grant_units are what a GRANT carries.
- */
-ucs_status_t uct_cxi_ctrl_send(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
-                               unsigned type, uint64_t match_bits,
-                               uint64_t header_data, uint32_t grant_slots,
-                               const uint32_t *grant_units);
-
-/* cxi_peer.c */
-ucs_status_t
-uct_cxi_fc_init(uct_cxi_iface_t *iface, const uct_cxi_iface_config_t *config,
-                uint32_t slot_window,
-                const uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES]);
-void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface);
-
-/** Find or create the record of remote iface (\a nid, \a pid); NULL on no
- *  memory. */
-uct_cxi_peer_t *
-uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid, uint32_t pid);
-
-/** Start \a peer's handshake, unless one has been started or finished. */
-void uct_cxi_peer_connect(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
-
-/** A C_EVENT_PUT on the control PTE. */
-void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
-                                   const union c_event *event);
-
-/** The TX completion of a control request, \a req from the user_ptr. */
-void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
-                                const union c_event *event);
-
-/** Send the GRANTs that are waiting, as far as there is room. */
-void uct_cxi_fc_flush_grants(uct_cxi_iface_t *iface);
-
-/** The peer record for initiator \a process, or NULL (a sender without flow
- *  control). Refills the one-entry cache. */
-uct_cxi_peer_t *
-uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface, uint32_t process);
-
-/** Credits piggybacked on an Active Message from \a peer (\a match_bits). */
-void uct_cxi_fc_apply_piggyback(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
-                                uint64_t match_bits);
-
-/** We owe \a peer many credits: send a GRANT now, or when we can. */
-void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
-
-/** Make runnable the endpoints of \a peer that were waiting for credits. */
-void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
-
-/** Take back credits the target will never return (send lost or untracked). */
-static UCS_F_ALWAYS_INLINE void
-uct_cxi_fc_reclaim(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer, unsigned cls,
-                   unsigned slots, unsigned units)
-{
-    peer->tx.avail_slots      += (int32_t)slots;
-    peer->tx.avail_units[cls] += (int32_t)units;
-    peer->tx.used_slots       -= slots;
-    peer->tx.used_units[cls]  -= units;
-
-    if (ucs_unlikely(peer->blocked != NULL)) {
-        uct_cxi_peer_resume(iface, peer);
-    }
-}
-
-/** Give back the credits of a send to \a ep's peer that never arrived. */
-void uct_cxi_fc_refund(uct_cxi_iface_t *iface, struct uct_cxi_ep *ep,
-                       unsigned cls, unsigned slots, unsigned units);
-
-/** Forget what we told \a peer that it may not have received. */
-void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
-
-/** Park \a ep, whose pending queue waits for credits, on its peer. */
-void uct_cxi_fc_block_ep(struct uct_cxi_ep *ep);
-
-/** Forget \a ep (being destroyed) wherever it is parked. */
-void uct_cxi_fc_unblock_ep(struct uct_cxi_ep *ep);
-
-END_C_DECLS
-
-/** The record of the sender of the AM just received, or NULL (uncharged). */
-static UCS_F_ALWAYS_INLINE uct_cxi_peer_t *
-uct_cxi_fc_rx_peer(uct_cxi_iface_t *iface, uint32_t process)
-{
-    if (ucs_likely((iface->fc.rx_cache_peer != NULL) &&
-                   (iface->fc.rx_cache_key == process))) {
-        return iface->fc.rx_cache_peer;
-    }
-
-    return uct_cxi_fc_rx_peer_slow(iface, process);
-}
-
-/** A message from \a peer was processed: its credits are ours to return. */
-static UCS_F_ALWAYS_INLINE void
-uct_cxi_fc_rx_done(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer, unsigned cls,
-                   unsigned slots, uint32_t mlength)
-{
-    uct_cxi_fc_rx_t *rx = &peer->rx;
-
-    rx->ret_slots      += slots;
-    rx->ret_units[cls] += UCT_CXI_FC_UNITS(mlength);
-
-    if (ucs_unlikely(((uint32_t)(rx->ret_slots - rx->adv_slots) >=
-                      iface->fc.grant_slots) ||
-                     ((uint32_t)(rx->ret_units[cls] - rx->adv_units[cls]) >=
-                      iface->fc.grant_units[cls]))) {
-        uct_cxi_fc_grant_wanted(iface, peer);
-    }
-}
-
-#endif /* UCT_CXI_DISABLE_FC */
+#include "cxi_peer.h"
+#endif
 
 #endif /* UCT_CXI_IFACE_H */

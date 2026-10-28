@@ -17,6 +17,7 @@ noinst_HEADERS = \
     base/cxi_am.h \
     base/cxi_amo.h \
     base/cxi_ep.h \
+    base/cxi_eq.h \
     base/cxi_iface.h \
     base/cxi_rma.h \
     base/cxi_device.h \
@@ -38,7 +39,9 @@ libuct_cxi_la_SOURCES = \
 # control channel it runs on; see --disable-cxi-fc.
 if CXI_FC
 noinst_HEADERS += \
-    base/cxi_fc.h
+    base/cxi_ctrl.h \
+    base/cxi_fc.h \
+    base/cxi_peer.h
 
 libuct_cxi_la_SOURCES += \
     base/cxi_ctrl.c \

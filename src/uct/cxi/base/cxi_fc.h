@@ -44,39 +44,11 @@
 #include <cxi_prov_hw.h>
 
 
-/* Messages with another version are ignored (the handshake then times out). */
-#define UCT_CXI_CTRL_VERSION 2u
-
 /* CREQ resend delay, doubling per attempt up to the cap. The timer wheel's
  * resolution is the base delay. */
 #define UCT_CXI_CTRL_RETRY_BASE_US 50
 #define UCT_CXI_CTRL_RETRY_MAX_US  50000
 
-/*
- * Control message layout, in the match_bits and header_data of a zero-payload
- * send:
- *
- *   match_bits  [63:60] type   [59:56] version
- *               [55:32] sender's own epoch, low 24 bits
- *               [31:0]  CREQ: 0    CREP: the requester's epoch, echoed
- *                       GRANT: tag matching buffer space processed
- *   header_data CREQ: the requester's epoch (32 bits)
- *               CREP: what the responder grants: [63:40] event slots,
- *                     [39:20] Active Message buffer space, [19:0] tag
- *                     matching buffer space, the latter two in multiples of
- *                     UCT_CXI_FC_WINDOW_GRAIN units
- *               GRANT: [63:32] event slots processed, [31:0] Active Message
- *                     buffer space processed (the whole counters)
- *
- * The epoch is random per interface instance; the echo lets a requester
- * discard a CREP meant for a previous incarnation of itself.
- */
-enum {
-    UCT_CXI_CTRL_CREQ  = 1,
-    UCT_CXI_CTRL_CREP  = 2,
-    /* Cumulative credits processed so far */
-    UCT_CXI_CTRL_GRANT = 3
-};
 
 /*
  * Credit return piggybacked on an Active Message's match_bits (bits 0-6 are
@@ -121,25 +93,6 @@ uct_cxi_fc_pb_shift(uint32_t window, unsigned bits)
     }
     return shift;
 }
-
-/* The CREP's grant, in header_data (see the layout above). */
-#define UCT_CXI_CREP_PACK(_slots, _am_units, _tag_units) \
-    (((uint64_t)(_slots) << 40) | \
-     ((uint64_t)((_am_units) / UCT_CXI_FC_WINDOW_GRAIN) << 20) | \
-     (uint64_t)((_tag_units) / UCT_CXI_FC_WINDOW_GRAIN))
-#define UCT_CXI_CREP_SLOTS(_hd) ((uint32_t)((_hd) >> 40))
-#define UCT_CXI_CREP_UNITS(_hd, _cls) \
-    ((uint32_t)((((_hd) >> ((_cls) == UCT_CXI_FC_AM ? 20 : 0)) & \
-                 UCT_CXI_FC_PB_MASK(20)) * \
-                UCT_CXI_FC_WINDOW_GRAIN))
-
-#define UCT_CXI_CTRL_TYPE(_mb)    ((unsigned)((_mb) >> 60))
-#define UCT_CXI_CTRL_VER(_mb)     ((unsigned)(((_mb) >> 56) & 0xf))
-#define UCT_CXI_CTRL_EPOCH24(_mb) ((uint32_t)(((_mb) >> 32) & 0xffffff))
-#define UCT_CXI_CTRL_ECHO(_mb)    ((uint32_t)((_mb)&0xffffffffu))
-#define UCT_CXI_CTRL_MATCH(_type, _epoch24, _echo) \
-    (((uint64_t)(_type) << 60) | ((uint64_t)UCT_CXI_CTRL_VERSION << 56) | \
-     ((uint64_t)((_epoch24)&0xffffff) << 32) | (uint64_t)(_echo))
 
 
 /* State of a peer's handshake. */
@@ -234,20 +187,6 @@ typedef struct uct_cxi_peer_conn {
 } uct_cxi_peer_conn_t;
 
 KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
-
-
-/**
- * A control message in flight. Fire-and-forget: its completion only matters
- * for PTLTE_NOT_FOUND on a CREQ (peer has no control channel) and for a GRANT.
- */
-typedef struct uct_cxi_ctrl_req {
-    uct_cxi_peer_t *peer;
-    /* UCT_CXI_CTRL_CREQ, _CREP or _GRANT */
-    unsigned       type;
-    /* GRANT: cumulative values sent, recorded as delivered on its ACK */
-    uint32_t       grant_slots;
-    uint32_t       grant_units[UCT_CXI_FC_NUM_CLASSES];
-} uct_cxi_ctrl_req_t;
 
 
 /**
