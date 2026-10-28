@@ -45,12 +45,12 @@
 
 
 /* Messages with another version are ignored (the handshake then times out). */
-#define UCT_CXI_CTRL_VERSION  2u
+#define UCT_CXI_CTRL_VERSION 2u
 
 /* CREQ resend delay, doubling per attempt up to the cap. The timer wheel's
  * resolution is the base delay. */
-#define UCT_CXI_CTRL_RETRY_BASE_US  50
-#define UCT_CXI_CTRL_RETRY_MAX_US   50000
+#define UCT_CXI_CTRL_RETRY_BASE_US 50
+#define UCT_CXI_CTRL_RETRY_MAX_US  50000
 
 /*
  * Control message layout, in the match_bits and header_data of a zero-payload
@@ -74,7 +74,8 @@
 enum {
     UCT_CXI_CTRL_CREQ  = 1,
     UCT_CXI_CTRL_CREP  = 2,
-    UCT_CXI_CTRL_GRANT = 3   /**< cumulative credits processed so far */
+    /* Cumulative credits processed so far */
+    UCT_CXI_CTRL_GRANT = 3
 };
 
 /*
@@ -88,19 +89,19 @@ enum {
  *   [55:39]  tag matching buffer space processed, 17 bits
  *   [63:56]  sender's epoch, low 8 bits (rejects a stale incarnation)
  */
-#define UCT_CXI_FC_PB_VALID        (1ULL << 7)
-#define UCT_CXI_FC_PB_SLOT_SHIFT   8
-#define UCT_CXI_FC_PB_SLOT_BITS    14
-#define UCT_CXI_FC_PB_UNIT_BITS    17
+#define UCT_CXI_FC_PB_VALID      (1ULL << 7)
+#define UCT_CXI_FC_PB_SLOT_SHIFT 8
+#define UCT_CXI_FC_PB_SLOT_BITS  14
+#define UCT_CXI_FC_PB_UNIT_BITS  17
 #define UCT_CXI_FC_PB_UNIT_SHIFT(_cls) \
     (UCT_CXI_FC_PB_SLOT_SHIFT + UCT_CXI_FC_PB_SLOT_BITS + \
      UCT_CXI_FC_PB_UNIT_BITS * (_cls))
-#define UCT_CXI_FC_PB_EPOCH_SHIFT  56
-#define UCT_CXI_FC_PB_EPOCH_BITS   8
-#define UCT_CXI_FC_PB_MASK(_bits)  ((1ULL << (_bits)) - 1)
+#define UCT_CXI_FC_PB_EPOCH_SHIFT 56
+#define UCT_CXI_FC_PB_EPOCH_BITS  8
+#define UCT_CXI_FC_PB_MASK(_bits) ((1ULL << (_bits)) - 1)
 
 /* Pools whose counters travel: event slots (0), then each class's space. */
-#define UCT_CXI_FC_NUM_POOLS       (1 + UCT_CXI_FC_NUM_CLASSES)
+#define UCT_CXI_FC_NUM_POOLS (1 + UCT_CXI_FC_NUM_CLASSES)
 
 /*
  * The least s such that \a window, in granules of 2^s, is below half of what
@@ -126,51 +127,62 @@ uct_cxi_fc_pb_shift(uint32_t window, unsigned bits)
     (((uint64_t)(_slots) << 40) | \
      ((uint64_t)((_am_units) / UCT_CXI_FC_WINDOW_GRAIN) << 20) | \
      (uint64_t)((_tag_units) / UCT_CXI_FC_WINDOW_GRAIN))
-#define UCT_CXI_CREP_SLOTS(_hd)      ((uint32_t)((_hd) >> 40))
+#define UCT_CXI_CREP_SLOTS(_hd) ((uint32_t)((_hd) >> 40))
 #define UCT_CXI_CREP_UNITS(_hd, _cls) \
     ((uint32_t)((((_hd) >> ((_cls) == UCT_CXI_FC_AM ? 20 : 0)) & \
-                 UCT_CXI_FC_PB_MASK(20)) * UCT_CXI_FC_WINDOW_GRAIN))
+                 UCT_CXI_FC_PB_MASK(20)) * \
+                UCT_CXI_FC_WINDOW_GRAIN))
 
-#define UCT_CXI_CTRL_TYPE(_mb)       ((unsigned)((_mb) >> 60))
-#define UCT_CXI_CTRL_VER(_mb)        ((unsigned)(((_mb) >> 56) & 0xf))
-#define UCT_CXI_CTRL_EPOCH24(_mb)    ((uint32_t)(((_mb) >> 32) & 0xffffff))
-#define UCT_CXI_CTRL_ECHO(_mb)       ((uint32_t)((_mb) & 0xffffffffu))
+#define UCT_CXI_CTRL_TYPE(_mb)    ((unsigned)((_mb) >> 60))
+#define UCT_CXI_CTRL_VER(_mb)     ((unsigned)(((_mb) >> 56) & 0xf))
+#define UCT_CXI_CTRL_EPOCH24(_mb) ((uint32_t)(((_mb) >> 32) & 0xffffff))
+#define UCT_CXI_CTRL_ECHO(_mb)    ((uint32_t)((_mb)&0xffffffffu))
 #define UCT_CXI_CTRL_MATCH(_type, _epoch24, _echo) \
     (((uint64_t)(_type) << 60) | ((uint64_t)UCT_CXI_CTRL_VERSION << 56) | \
-     ((uint64_t)((_epoch24) & 0xffffff) << 32) | (uint64_t)(_echo))
+     ((uint64_t)((_epoch24)&0xffffff) << 32) | (uint64_t)(_echo))
 
 
-/* tx_state of a peer. */
+/* State of a peer's handshake. */
 typedef enum {
-    UCT_CXI_PEER_DOWN,       /**< no CREQ answered yet, none in flight */
-    UCT_CXI_PEER_CREQ_SENT,  /**< CREQ sent, waiting for the CREP */
-    UCT_CXI_PEER_UP,         /**< CREP received: the peer's windows are known */
-    UCT_CXI_PEER_LEGACY,     /**< peer has no control channel: uncredited */
-    UCT_CXI_PEER_FAILED      /**< handshake timed out */
+    /* No CREQ answered yet, none in flight */
+    UCT_CXI_PEER_DOWN,
+    /* CREQ sent, waiting for the CREP */
+    UCT_CXI_PEER_CREQ_SENT,
+    /* CREP received: the peer's windows are known */
+    UCT_CXI_PEER_UP,
+    /* Peer has no control channel: uncredited */
+    UCT_CXI_PEER_LEGACY,
+    /* Handshake timed out */
+    UCT_CXI_PEER_FAILED
 } uct_cxi_peer_state_t;
 
 
 /** Credits this interface HOLDS toward a peer: what it may still send. */
 typedef struct uct_cxi_fc_tx {
-    int32_t   avail_slots;  /**< receive event queue slots, all classes */
-    int32_t   avail_units[UCT_CXI_FC_NUM_CLASSES];
-                            /**< receive buffer space of each class; may dip
-                                 below zero by up to one bcopy: its length is
-                                 only known after it is packed */
-    uint32_t  ret_slots;    /**< last cumulative grant applied */
-    uint32_t  ret_units[UCT_CXI_FC_NUM_CLASSES];
-    uint32_t  used_slots;   /**< net slots / units spent, cumulative */
-    uint32_t  used_units[UCT_CXI_FC_NUM_CLASSES];
+    /* Receive event queue slots, all classes */
+    int32_t  avail_slots;
+    /* Receive buffer space of each class; may dip below zero by up to one
+     * bcopy: its length is only known after it is packed */
+    int32_t  avail_units[UCT_CXI_FC_NUM_CLASSES];
+    /* Last cumulative grant applied */
+    uint32_t ret_slots;
+    uint32_t ret_units[UCT_CXI_FC_NUM_CLASSES];
+    /* Net slots / units spent, cumulative */
+    uint32_t used_slots;
+    uint32_t used_units[UCT_CXI_FC_NUM_CLASSES];
 } uct_cxi_fc_tx_t;
 
 /** Credits this interface OWES a peer: what it has processed from it. */
 typedef struct uct_cxi_fc_rx {
-    uint32_t  ret_slots;    /**< slots processed, cumulative */
-    uint32_t  ret_units[UCT_CXI_FC_NUM_CLASSES];
-    uint32_t  adv_slots;    /**< last put on the wire (piggyback or GRANT) */
-    uint32_t  adv_units[UCT_CXI_FC_NUM_CLASSES];
-    uint32_t  acked_slots;  /**< last confirmed delivered, by a GRANT's ACK */
-    uint32_t  acked_units[UCT_CXI_FC_NUM_CLASSES];
+    /* Slots and units processed, cumulative */
+    uint32_t ret_slots;
+    uint32_t ret_units[UCT_CXI_FC_NUM_CLASSES];
+    /* Last put on the wire (piggyback or GRANT) */
+    uint32_t adv_slots;
+    uint32_t adv_units[UCT_CXI_FC_NUM_CLASSES];
+    /* Last confirmed delivered, by a GRANT's ACK */
+    uint32_t acked_slots;
+    uint32_t acked_units[UCT_CXI_FC_NUM_CLASSES];
 } uct_cxi_fc_rx_t;
 
 
@@ -183,39 +195,42 @@ struct uct_cxi_peer_conn;
  * pooled uct_cxi_peer_conn_t, and the NID and PID are derived from \a key.
  */
 typedef struct uct_cxi_peer {
-    uint32_t          key;          /**< CXI_MATCH_ID(pid_bits, pid, nid): the
-                                         initiator hardware reports */
-    uint8_t           state;        /**< uct_cxi_peer_state_t */
-    uint8_t           pb_shift[UCT_CXI_FC_NUM_POOLS];
-                                    /**< granule of this peer's piggybacked
-                                         counters */
+    /* CXI_MATCH_ID(pid_bits, pid, nid): the initiator hardware reports */
+    uint32_t                 key;
+    /* uct_cxi_peer_state_t */
+    uint8_t                  state;
+    /* Granule of this peer's piggybacked counters */
+    uint8_t                  pb_shift[UCT_CXI_FC_NUM_POOLS];
 
-    /* Learned from the peer */
-    uint32_t          remote_epoch; /**< CREP: the peer's epoch, low 24 bits */
-    uint32_t          rx_epoch;     /**< CREQ: the peer's own epoch */
+    /* Learned from the peer: CREP's epoch (low 24 bits), CREQ's own epoch */
+    uint32_t                 remote_epoch;
+    uint32_t                 rx_epoch;
 
-    uct_cxi_fc_tx_t   tx;           /**< what we may send to the peer */
-    uct_cxi_fc_rx_t   rx;           /**< what we owe the peer */
+    /* What we may send to the peer, and what we owe it */
+    uct_cxi_fc_tx_t          tx;
+    uct_cxi_fc_rx_t          rx;
 
     /* Handshake in progress (state DOWN or CREQ_SENT), NULL otherwise */
     struct uct_cxi_peer_conn *conn;
 
-    ucs_list_link_t   grants;       /**< link in fc.grants: a GRANT waits for
-                                         control channel room */
+    /* Link in fc.grants: a GRANT waits for control channel room */
+    ucs_list_link_t          grants;
 
     /* Endpoints waiting for credits, descheduled from the arbiter until a
      * grant, the CREP or a refund (uct_cxi_peer_resume). Linked through
      * uct_cxi_ep_t::next_blocked. */
-    struct uct_cxi_ep *blocked;
+    struct uct_cxi_ep        *blocked;
 } uct_cxi_peer_t;
 
 /** A peer's handshake, from the first CREQ until the CREP or a verdict. */
 typedef struct uct_cxi_peer_conn {
-    ucs_wtimer_t      timer;        /**< next CREQ (re)send, or the deadline */
+    /* Next CREQ (re)send, or the deadline */
+    ucs_wtimer_t         timer;
     struct uct_cxi_iface *iface;
-    uct_cxi_peer_t   *peer;
-    ucs_time_t        deadline;     /**< give up (FAILED) after this */
-    unsigned          attempts;
+    uct_cxi_peer_t       *peer;
+    /* Give up (FAILED) after this */
+    ucs_time_t           deadline;
+    unsigned             attempts;
 } uct_cxi_peer_conn_t;
 
 KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
@@ -226,11 +241,12 @@ KHASH_MAP_INIT_INT(uct_cxi_peer_hash, uct_cxi_peer_t*)
  * for PTLTE_NOT_FOUND on a CREQ (peer has no control channel) and for a GRANT.
  */
 typedef struct uct_cxi_ctrl_req {
-    uct_cxi_peer_t   *peer;
-    unsigned          type;         /**< UCT_CXI_CTRL_CREQ, _CREP or _GRANT */
-    uint32_t          grant_slots;  /**< GRANT: cumulative values sent, */
-    uint32_t          grant_units[UCT_CXI_FC_NUM_CLASSES];
-                                    /**<   recorded as delivered on its ACK */
+    uct_cxi_peer_t *peer;
+    /* UCT_CXI_CTRL_CREQ, _CREP or _GRANT */
+    unsigned       type;
+    /* GRANT: cumulative values sent, recorded as delivered on its ACK */
+    uint32_t       grant_slots;
+    uint32_t       grant_units[UCT_CXI_FC_NUM_CLASSES];
 } uct_cxi_ctrl_req_t;
 
 
@@ -238,31 +254,34 @@ typedef struct uct_cxi_ctrl_req {
  * Per-interface flow-control state.
  */
 typedef struct uct_cxi_fc_iface {
-    int               enabled;      /**< FC_ENABLE; off: no control PTE, all
-                                         peers LEGACY */
-    uint32_t          epoch;        /**< random, identifies this incarnation */
-    uint32_t          slot_window;  /**< what we grant each peer: event slots, */
-    uint32_t          unit_window[UCT_CXI_FC_NUM_CLASSES];
-                                    /**<   and buffer space of each class (0:
-                                         the class is not in use) */
-    uint8_t           pb_shift[UCT_CXI_FC_NUM_POOLS];
-                                    /**< granule of our piggybacked counters */
-    uint32_t          grant_slots;  /**< owe this many slots to a peer, or */
-    uint32_t          grant_units[UCT_CXI_FC_NUM_CLASSES];
-                                    /**<   this many units of a class: send a
-                                         GRANT */
-    ucs_time_t        connect_timeout;
+    /* FC_ENABLE; off: no control PTE, all peers LEGACY */
+    int                        enabled;
+    /* Random, identifies this incarnation */
+    uint32_t                   epoch;
+    /* What we grant each peer: event slots, and buffer space of each class
+     * (0: the class is not in use) */
+    uint32_t                   slot_window;
+    uint32_t                   unit_window[UCT_CXI_FC_NUM_CLASSES];
+    /* Granule of our piggybacked counters */
+    uint8_t                    pb_shift[UCT_CXI_FC_NUM_POOLS];
+    /* Owe this many slots to a peer, or this many units of a class: send a
+     * GRANT */
+    uint32_t                   grant_slots;
+    uint32_t                   grant_units[UCT_CXI_FC_NUM_CLASSES];
+    ucs_time_t                 connect_timeout;
     khash_t(uct_cxi_peer_hash) peers;
-    ucs_twheel_t      twheel;       /**< CREQ resends and handshake deadlines */
-    unsigned          num_connecting; /**< handshakes in progress: the wheel is
-                                         only swept while there are any */
-    ucs_mpool_t       conn_pool;    /**< uct_cxi_peer_conn_t */
-    ucs_list_link_t   grants;       /**< peers with a GRANT to send, oldest
-                                         first (uct_cxi_fc_flush_grants) */
+    /* CREQ resends and handshake deadlines */
+    ucs_twheel_t               twheel;
+    /* Handshakes in progress: the wheel is only swept while there are any */
+    unsigned                   num_connecting;
+    /* uct_cxi_peer_conn_t */
+    ucs_mpool_t                conn_pool;
+    /* Peers with a GRANT to send, oldest first (uct_cxi_fc_flush_grants) */
+    ucs_list_link_t            grants;
 
     /* Peer of the last Active Message received, to skip the hash lookup. */
-    uint32_t          rx_cache_key;
-    uct_cxi_peer_t   *rx_cache_peer;
+    uint32_t                   rx_cache_key;
+    uct_cxi_peer_t             *rx_cache_peer;
 } uct_cxi_fc_iface_t;
 
 #endif /* UCT_CXI_FC_H */
