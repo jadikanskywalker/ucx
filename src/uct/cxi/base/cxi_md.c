@@ -399,7 +399,6 @@ static void uct_cxi_md_close(uct_md_h mdh)
     }
 
     cxil_close_device(md->cxi_dev);
-    uct_cxi_device_cleanup(&md->device);
     ucs_free(md);
 }
 
@@ -955,11 +954,7 @@ uct_cxi_md_open(uct_component_h component, const char *md_name,
     }
 
     /* Fill UCT MD fields. */
-    status = uct_cxi_device_init(&md->device, md_name, dev_id,
-                                 md->cxi_dev->info.nid);
-    if (status != UCS_OK) {
-        goto err_destroy_lni;
-    }
+    uct_cxi_device_init(&md->device, md_name, dev_id, md->cxi_dev->info.nid);
 
     md->super.ops       = &uct_cxi_md_ops;
     md->super.component = component;
