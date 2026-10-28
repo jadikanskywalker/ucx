@@ -852,9 +852,10 @@ static uint32_t uct_cxi_fc_unit_window(size_t byte_window, size_t max_msg,
  * byte window holds at least its class's largest message; \a tag_max_msg is 0
  * without tag offload.
  */
-void uct_cxi_fc_windows(const uct_cxi_iface_config_t *config, size_t am_max_msg,
-                        size_t tag_max_msg, uint32_t *slot_window_p,
-                        uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES])
+static void
+uct_cxi_fc_windows(const uct_cxi_iface_config_t *config, size_t am_max_msg,
+                   size_t tag_max_msg, uint32_t *slot_window_p,
+                   uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES])
 {
     /* At least what the costliest message charges, or it could never be
      * sent. */
