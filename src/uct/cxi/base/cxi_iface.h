@@ -751,6 +751,9 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
                                struct cxil_lni *lni);
 void         uct_cxi_ctrl_close(uct_cxi_iface_t *iface);
 
+/** Pool ops for objects only software reads (control requests, handshakes). */
+extern ucs_mpool_ops_t uct_cxi_host_mpool_ops;
+
 /**
  * Send a control message to \a peer; UCS_ERR_NO_RESOURCE if the channel is
  * full. \a grant_slots and \a grant_units are what a GRANT carries.

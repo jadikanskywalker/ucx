@@ -26,8 +26,9 @@
 /* Built with the flow control, its only client (see Makefile.am). */
 #ifndef UCT_CXI_DISABLE_FC
 
-/* Plain host memory: control requests are only ever read by software. */
-static ucs_mpool_ops_t uct_cxi_ctrl_mpool_ops = {
+/* Plain host memory: control requests and handshake records are only ever read
+ * by software. */
+ucs_mpool_ops_t uct_cxi_host_mpool_ops = {
     .chunk_alloc   = ucs_mpool_chunk_malloc,
     .chunk_release = ucs_mpool_chunk_free,
     .obj_init      = NULL,
@@ -144,7 +145,7 @@ ucs_status_t uct_cxi_ctrl_open(uct_cxi_iface_t *iface,
     mp_params.elem_size       = sizeof(uct_cxi_ctrl_req_t);
     mp_params.elems_per_chunk = ucs_min(32u, ctrl->max_inflight);
     mp_params.max_elems       = ctrl->max_inflight;
-    mp_params.ops             = &uct_cxi_ctrl_mpool_ops;
+    mp_params.ops             = &uct_cxi_host_mpool_ops;
     mp_params.name            = "cxi-ctrl-req";
     status                    = ucs_mpool_init(&mp_params, &ctrl->req_pool);
     if (status != UCS_OK) {

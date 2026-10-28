@@ -7,40 +7,29 @@
  */
 
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#include "config.h"
 #endif
 
 #include "cxi_iface.h"
 #include "cxi_ep.h"
-
-/* Only built with flow control (see Makefile.am). */
-#ifndef UCT_CXI_DISABLE_FC
 
 #include <ucs/debug/log.h>
 #include <ucs/sys/sys.h>
 
 #include <string.h>
 
-
-/* Plain host memory: control requests are only ever read by software. */
-static ucs_mpool_ops_t uct_cxi_fc_mpool_ops = {
-    .chunk_alloc   = ucs_mpool_chunk_malloc,
-    .chunk_release = ucs_mpool_chunk_free,
-    .obj_init      = NULL,
-    .obj_cleanup   = NULL,
-    .obj_str       = NULL
-};
-
+/* Only built with flow control (see Makefile.am). */
+#ifndef UCT_CXI_DISABLE_FC
 
 /* NID and PID of \a peer, derived from its key. */
-static UCS_F_ALWAYS_INLINE uint32_t
-uct_cxi_peer_nid(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer)
+static UCS_F_ALWAYS_INLINE uint32_t uct_cxi_peer_nid(uct_cxi_iface_t *iface,
+                                                     const uct_cxi_peer_t *peer)
 {
     return CXI_MATCH_ID_EP(uct_cxi_iface_md(iface)->pid_bits, peer->key);
 }
 
-static UCS_F_ALWAYS_INLINE uint32_t
-uct_cxi_peer_pid(uct_cxi_iface_t *iface, const uct_cxi_peer_t *peer)
+static UCS_F_ALWAYS_INLINE uint32_t uct_cxi_peer_pid(uct_cxi_iface_t *iface,
+                                                     const uct_cxi_peer_t *peer)
 {
     return CXI_MATCH_ID_PID(uct_cxi_iface_md(iface)->pid_bits, peer->key);
 }
@@ -59,48 +48,50 @@ static void uct_cxi_fc_timer_add(uct_cxi_iface_t *iface, ucs_wtimer_t *timer,
     }
     ucs_wtimer_add(twheel, timer, ucs_max(delay, twheel->res));
 }
-static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer);
 
-/* -------------------------------------------------------------------------
- * Interface-level state
- * -------------------------------------------------------------------------
- */
+/* Queue \a peer for a GRANT (uct_cxi_fc_flush_grants). */
+static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
+{
+    if (ucs_list_is_empty(&peer->grants)) {
+        ucs_list_add_tail(&iface->fc.grants, &peer->grants);
+    }
+}
 
 ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
                              const uct_cxi_iface_config_t *config,
                              uint32_t slot_window,
                              const uint32_t unit_window[UCT_CXI_FC_NUM_CLASSES])
 {
-    uct_cxi_fc_iface_t *fc = &iface->fc;
-    ucs_mpool_params_t  mp_params;
-    ucs_status_t        status;
-
-    unsigned            max_units[UCT_CXI_FC_NUM_CLASSES] = {
+    uct_cxi_fc_iface_t *fc                     = &iface->fc;
+    unsigned max_units[UCT_CXI_FC_NUM_CLASSES] = {
         [UCT_CXI_FC_AM]  = UCT_CXI_FC_UNITS(iface->am.max_msg),
         [UCT_CXI_FC_TAG] = UCT_CXI_FC_UNITS(iface->tag.max_msg)
     };
-    double              thresh    = ucs_max(0.01, ucs_min(1.0,
-                                                config->fc_grant_thresh));
-    unsigned            cls;
+    double thresh = ucs_max(0.01, ucs_min(1.0, config->fc_grant_thresh));
+    ucs_mpool_params_t mp_params;
+    ucs_status_t status;
+    unsigned cls;
 
     memset(fc, 0, sizeof(*fc));
     fc->enabled         = config->fc_enable;
     fc->connect_timeout = ucs_time_from_sec(config->fc_connect_timeout);
     fc->slot_window     = slot_window;
-    fc->pb_shift[0]     = uct_cxi_fc_pb_shift(slot_window,
-                                              UCT_CXI_FC_PB_SLOT_BITS);
+    fc->pb_shift[0] = uct_cxi_fc_pb_shift(slot_window, UCT_CXI_FC_PB_SLOT_BITS);
 
     /* Grant once this much is owed. The byte threshold leaves room for one
      * maximum-size message, so a sender blocked on units always has a grant
      * on its way. A class with no pool never asks for one. */
     fc->grant_slots = ucs_max(1u, (uint32_t)(fc->slot_window * thresh));
     for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
-        fc->unit_window[cls] = unit_window[cls];
+        fc->unit_window[cls]  = unit_window[cls];
         fc->pb_shift[1 + cls] = uct_cxi_fc_pb_shift(unit_window[cls],
                                                     UCT_CXI_FC_PB_UNIT_BITS);
-        fc->grant_units[cls] = (unit_window[cls] == 0) ? UINT32_MAX :
-                ucs_max(1u, ucs_min((uint32_t)(unit_window[cls] * thresh),
-                                    unit_window[cls] - max_units[cls]));
+        fc->grant_units[cls] =
+                (unit_window[cls] == 0) ?
+                        UINT32_MAX :
+                        ucs_max(1u,
+                                ucs_min((uint32_t)(unit_window[cls] * thresh),
+                                        unit_window[cls] - max_units[cls]));
     }
 
     /* Random per instance, to tell a restarted process from the one before.
@@ -116,9 +107,9 @@ ucs_status_t uct_cxi_fc_init(uct_cxi_iface_t *iface,
     ucs_mpool_params_reset(&mp_params);
     mp_params.elem_size       = sizeof(uct_cxi_peer_conn_t);
     mp_params.elems_per_chunk = 32;
-    mp_params.ops             = &uct_cxi_fc_mpool_ops;
+    mp_params.ops             = &uct_cxi_host_mpool_ops;
     mp_params.name            = "cxi-peer-conn";
-    status = ucs_mpool_init(&mp_params, &fc->conn_pool);
+    status                    = ucs_mpool_init(&mp_params, &fc->conn_pool);
     if (status != UCS_OK) {
         goto err_peers;
     }
@@ -142,14 +133,15 @@ err_peers:
 void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface)
 {
     uct_cxi_fc_iface_t *fc = &iface->fc;
-    uct_cxi_peer_t     *peer;
+    uct_cxi_peer_t *peer;
 
     kh_foreach_value(&fc->peers, peer, {
         if (peer->conn != NULL) {
             ucs_wtimer_remove(&fc->twheel, &peer->conn->timer);
         }
         ucs_free(peer);
-    });
+    })
+        ;
     kh_destroy_inplace(uct_cxi_peer_hash, &fc->peers);
 
     /* Handshakes still going at close are not leaks. */
@@ -157,24 +149,26 @@ void uct_cxi_fc_cleanup(uct_cxi_iface_t *iface)
     ucs_twheel_cleanup(&fc->twheel);
 }
 
-
-/* -------------------------------------------------------------------------
- * Peers
- * -------------------------------------------------------------------------
- */
-
-uct_cxi_peer_t *uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid,
-                                 uint32_t pid)
+static uct_cxi_peer_t *uct_cxi_peer_lookup(uct_cxi_iface_t *iface, uint32_t key)
 {
-    uct_cxi_md_t   *md  = uct_cxi_iface_md(iface);
-    uint32_t        key = CXI_MATCH_ID(md->pid_bits, pid, nid);
-    uct_cxi_peer_t *peer;
-    khiter_t        iter;
-    int             ret;
+    khiter_t iter = kh_get(uct_cxi_peer_hash, &iface->fc.peers, key);
 
-    iter = kh_get(uct_cxi_peer_hash, &iface->fc.peers, key);
-    if (iter != kh_end(&iface->fc.peers)) {
-        return kh_value(&iface->fc.peers, iter);
+    return (iter == kh_end(&iface->fc.peers)) ?
+                   NULL :
+                   kh_value(&iface->fc.peers, iter);
+}
+
+uct_cxi_peer_t *
+uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid, uint32_t pid)
+{
+    uint32_t key = CXI_MATCH_ID(uct_cxi_iface_md(iface)->pid_bits, pid, nid);
+    uct_cxi_peer_t *peer;
+    khiter_t iter;
+    int ret;
+
+    peer = uct_cxi_peer_lookup(iface, key);
+    if (peer != NULL) {
+        return peer;
     }
 
     peer = ucs_calloc(1, sizeof(*peer), "cxi peer");
@@ -182,8 +176,8 @@ uct_cxi_peer_t *uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid,
         return NULL;
     }
 
-    peer->key   = key;
-    peer->state = UCT_CXI_PEER_DOWN;
+    /* The state is UCT_CXI_PEER_DOWN, which is 0. */
+    peer->key = key;
     ucs_list_head_init(&peer->grants);
 
     iter = kh_put(uct_cxi_peer_hash, &iface->fc.peers, key, &ret);
@@ -193,15 +187,6 @@ uct_cxi_peer_t *uct_cxi_peer_get(uct_cxi_iface_t *iface, uint32_t nid,
     }
     kh_value(&iface->fc.peers, iter) = peer;
     return peer;
-}
-
-static uct_cxi_peer_t *uct_cxi_peer_lookup(uct_cxi_iface_t *iface,
-                                           uint32_t key)
-{
-    khiter_t iter = kh_get(uct_cxi_peer_hash, &iface->fc.peers, key);
-
-    return (iter == kh_end(&iface->fc.peers)) ?
-           NULL : kh_value(&iface->fc.peers, iter);
 }
 
 /* A handshake is over: stop resending and resume the sends waiting on it. */
@@ -219,12 +204,6 @@ static void uct_cxi_peer_connected(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
     }
     uct_cxi_peer_resume(iface, peer);
 }
-
-
-/* -------------------------------------------------------------------------
- * Credits
- * -------------------------------------------------------------------------
- */
 
 ucs_status_t uct_cxi_fc_reserve_slow(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
                                      int *credited_p)
@@ -252,9 +231,9 @@ ucs_status_t uct_cxi_fc_reserve_slow(uct_cxi_ep_t *ep, uct_cxi_iface_t *iface,
 void uct_cxi_fc_block_ep(uct_cxi_ep_t *ep)
 {
     if (!ep->fc_listed) {
-        ep->next_blocked   = ep->peer->blocked;
-        ep->peer->blocked  = ep;
-        ep->fc_listed      = 1;
+        ep->next_blocked  = ep->peer->blocked;
+        ep->peer->blocked = ep;
+        ep->fc_listed     = 1;
     }
 }
 
@@ -283,15 +262,16 @@ void uct_cxi_peer_resume(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 
     peer->blocked = NULL;
     for (; ep != NULL; ep = next) {
-        next           = ep->next_blocked;
-        ep->fc_listed  = 0;
+        next          = ep->next_blocked;
+        ep->fc_listed = 0;
         ucs_arbiter_group_schedule(&iface->tx.arbiter, &ep->arb_group);
     }
 }
 
 /* Signed distance of the \a bits-bit wire counter from \a last. */
-static UCS_F_ALWAYS_INLINE int32_t
-uct_cxi_fc_grant_delta(uint32_t wire, uint32_t last, unsigned bits)
+static UCS_F_ALWAYS_INLINE int32_t uct_cxi_fc_grant_delta(uint32_t wire,
+                                                          uint32_t last,
+                                                          unsigned bits)
 {
     unsigned shift = 32 - bits;
 
@@ -310,7 +290,7 @@ uct_cxi_fc_apply_counter(uint32_t *last, int32_t *avail, uint32_t wire,
                          unsigned bits, unsigned shift)
 {
     uint32_t last_granules = *last >> shift;
-    int32_t  d             = uct_cxi_fc_grant_delta(wire, last_granules, bits);
+    int32_t d              = uct_cxi_fc_grant_delta(wire, last_granules, bits);
     uint32_t counter;
 
     if (d <= 0) {
@@ -331,7 +311,7 @@ static void uct_cxi_fc_apply_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                    unsigned slot_bits, unsigned unit_bits,
                                    const uint8_t *shift)
 {
-    int      granted;
+    int granted;
     unsigned cls;
 
     granted = uct_cxi_fc_apply_counter(&peer->tx.ret_slots,
@@ -370,12 +350,12 @@ void uct_cxi_fc_apply_piggyback(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer,
                                 UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_UNIT_BITS));
     }
 
-    uct_cxi_fc_apply_grant(
-            iface, peer,
-            (uint32_t)((match_bits >> UCT_CXI_FC_PB_SLOT_SHIFT) &
-                       UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_SLOT_BITS)),
-            units, UCT_CXI_FC_PB_SLOT_BITS, UCT_CXI_FC_PB_UNIT_BITS,
-            peer->pb_shift);
+    uct_cxi_fc_apply_grant(iface, peer,
+                           (uint32_t)(
+                                   (match_bits >> UCT_CXI_FC_PB_SLOT_SHIFT) &
+                                   UCT_CXI_FC_PB_MASK(UCT_CXI_FC_PB_SLOT_BITS)),
+                           units, UCT_CXI_FC_PB_SLOT_BITS,
+                           UCT_CXI_FC_PB_UNIT_BITS, peer->pb_shift);
 }
 
 void uct_cxi_fc_refund(uct_cxi_iface_t *iface, uct_cxi_ep_t *ep, unsigned cls,
@@ -403,8 +383,7 @@ void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 
     for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
         peer->rx.adv_units[cls] = peer->rx.acked_units[cls];
-        due |= ((uint32_t)(peer->rx.ret_units[cls] -
-                           peer->rx.adv_units[cls]) >=
+        due |= ((uint32_t)(peer->rx.ret_units[cls] - peer->rx.adv_units[cls]) >=
                 iface->fc.grant_units[cls]);
     }
 
@@ -413,25 +392,29 @@ void uct_cxi_fc_resync(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
     }
 }
 
-uct_cxi_peer_t *uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface,
-                                        uint32_t process)
+uct_cxi_peer_t *
+uct_cxi_fc_rx_peer_slow(uct_cxi_iface_t *iface, uint32_t process)
 {
-    khiter_t iter = kh_get(uct_cxi_peer_hash, &iface->fc.peers, process);
+    uct_cxi_peer_t *peer = uct_cxi_peer_lookup(iface, process);
 
-    if (iter == kh_end(&iface->fc.peers)) {
+    if (peer == NULL) {
         return NULL;
     }
 
     iface->fc.rx_cache_key  = process;
-    iface->fc.rx_cache_peer = kh_value(&iface->fc.peers, iter);
-    return iface->fc.rx_cache_peer;
+    iface->fc.rx_cache_peer = peer;
+    return peer;
 }
 
-
-/* -------------------------------------------------------------------------
- * Control messages
- * -------------------------------------------------------------------------
- */
+/* Record that \a value reached the peer; only forward, a later grant may have
+ * overtaken it. */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_fc_ack_forward(uint32_t *acked, uint32_t value)
+{
+    if ((int32_t)(value - *acked) > 0) {
+        *acked = value;
+    }
+}
 
 void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
                                 const union c_event *event)
@@ -441,19 +424,13 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
     iface->ctrl.outstanding--;
     if (req->type == UCT_CXI_CTRL_GRANT) {
         uct_cxi_peer_t *peer = req->peer;
-        unsigned        cls;
+        unsigned cls;
 
         if (rc == C_RC_OK) {
-            /* Delivered (only move forward: a later grant may have
-             * overtaken). */
-            if ((int32_t)(req->grant_slots - peer->rx.acked_slots) > 0) {
-                peer->rx.acked_slots = req->grant_slots;
-            }
+            uct_cxi_fc_ack_forward(&peer->rx.acked_slots, req->grant_slots);
             for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
-                if ((int32_t)(req->grant_units[cls] -
-                              peer->rx.acked_units[cls]) > 0) {
-                    peer->rx.acked_units[cls] = req->grant_units[cls];
-                }
+                uct_cxi_fc_ack_forward(&peer->rx.acked_units[cls],
+                                       req->grant_units[cls]);
             }
         } else {
             /* Lost: say it again, along with whatever has accumulated. */
@@ -487,16 +464,105 @@ void uct_cxi_iface_ctrl_tx_done(uct_cxi_iface_t *iface, uct_cxi_ctrl_req_t *req,
     ucs_mpool_put(req);
 }
 
+/* A CREQ: the requester is the event's initiator. Create its record without
+ * starting a handshake of our own. */
+static void
+uct_cxi_peer_handle_creq(uct_cxi_iface_t *iface, uint32_t process, uint64_t hd)
+{
+    unsigned pid_bits = uct_cxi_iface_md(iface)->pid_bits;
+    uct_cxi_peer_t *peer;
+
+    peer = uct_cxi_peer_get(iface, CXI_MATCH_ID_EP(pid_bits, process),
+                            CXI_MATCH_ID_PID(pid_bits, process));
+    if (peer == NULL) {
+        ucs_error("cxi no memory for a peer record, dropping CREQ");
+        return;
+    }
+
+    if ((peer->rx_epoch != 0) && (peer->rx_epoch != (uint32_t)hd)) {
+        /* The requester restarted: drop what we owed its previous
+         * incarnation. */
+        memset(&peer->rx, 0, sizeof(peer->rx));
+    }
+    peer->rx_epoch = (uint32_t)hd;
+
+    /* Fire and forget: a lost reply makes the requester resend. */
+    (void)uct_cxi_ctrl_send(
+            iface, peer, UCT_CXI_CTRL_CREP,
+            UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREP, iface->fc.epoch,
+                               (uint32_t)hd),
+            UCT_CXI_CREP_PACK(iface->fc.slot_window,
+                              iface->fc.unit_window[UCT_CXI_FC_AM],
+                              iface->fc.unit_window[UCT_CXI_FC_TAG]),
+            0, NULL);
+}
+
+/* A CREP: the peer's windows are the whole grant. */
+static void uct_cxi_peer_handle_crep(uct_cxi_iface_t *iface, uint32_t process,
+                                     uint64_t mb, uint64_t hd)
+{
+    uct_cxi_peer_t *peer = uct_cxi_peer_lookup(iface, process);
+    uint32_t window;
+    unsigned cls;
+
+    if ((peer == NULL) || ((peer->state != UCT_CXI_PEER_DOWN) &&
+                           (peer->state != UCT_CXI_PEER_CREQ_SENT))) {
+        ucs_debug("cxi ignoring unexpected CREP from initiator 0x%x", process);
+        return;
+    }
+
+    if (UCT_CXI_CTRL_ECHO(mb) != iface->fc.epoch) {
+        ucs_debug("cxi ignoring CREP answering another incarnation");
+        return;
+    }
+
+    peer->remote_epoch = UCT_CXI_CTRL_EPOCH24(mb);
+
+    /* The piggyback granule follows from the window. */
+    memset(&peer->tx, 0, sizeof(peer->tx));
+    peer->tx.avail_slots = UCT_CXI_CREP_SLOTS(hd);
+    peer->pb_shift[0]    = uct_cxi_fc_pb_shift(UCT_CXI_CREP_SLOTS(hd),
+                                               UCT_CXI_FC_PB_SLOT_BITS);
+    for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
+        window                    = UCT_CXI_CREP_UNITS(hd, cls);
+        peer->tx.avail_units[cls] = window;
+
+        peer->pb_shift[1 + cls] = uct_cxi_fc_pb_shift(window,
+                                                      UCT_CXI_FC_PB_UNIT_BITS);
+    }
+
+    uct_cxi_peer_connected(iface, peer, UCT_CXI_PEER_UP);
+    ucs_debug("cxi peer nid 0x%x pid %u is up: %d slots, %d AM units, "
+              "%d tag units",
+              uct_cxi_peer_nid(iface, peer), uct_cxi_peer_pid(iface, peer),
+              peer->tx.avail_slots, peer->tx.avail_units[UCT_CXI_FC_AM],
+              peer->tx.avail_units[UCT_CXI_FC_TAG]);
+}
+
+static void uct_cxi_peer_handle_grant(uct_cxi_iface_t *iface, uint32_t process,
+                                      uint64_t mb, uint64_t hd)
+{
+    uct_cxi_peer_t *peer = uct_cxi_peer_lookup(iface, process);
+    uint32_t units[UCT_CXI_FC_NUM_CLASSES];
+
+    if ((peer == NULL) || (peer->state != UCT_CXI_PEER_UP) ||
+        (UCT_CXI_CTRL_EPOCH24(mb) != peer->remote_epoch)) {
+        ucs_debug("cxi ignoring GRANT from initiator 0x%x", process);
+        return;
+    }
+
+    units[UCT_CXI_FC_AM]  = (uint32_t)hd;
+    units[UCT_CXI_FC_TAG] = UCT_CXI_CTRL_ECHO(mb);
+    uct_cxi_fc_apply_grant(iface, peer, (uint32_t)(hd >> 32), units, 32, 32,
+                           NULL);
+}
+
 void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
                                    const union c_event *event)
 {
-    uct_cxi_md_t   *md      = uct_cxi_iface_md(iface);
-    uint64_t        mb      = event->tgt_long.match_bits;
-    uint64_t        hd      = event->tgt_long.header_data;
-    uint32_t        process = event->tgt_long.initiator.initiator.process;
-    uint32_t        units[UCT_CXI_FC_NUM_CLASSES];
-    uct_cxi_peer_t *peer;
-    unsigned        cls;
+    uint64_t mb      = event->tgt_long.match_bits;
+    uint64_t hd      = event->tgt_long.header_data;
+    uint32_t process = event->tgt_long.initiator.initiator.process;
 
     if (ucs_unlikely(UCT_CXI_CTRL_VER(mb) != UCT_CXI_CTRL_VERSION)) {
         ucs_debug("cxi ignoring control message with version %u",
@@ -506,91 +572,20 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
 
     switch (UCT_CXI_CTRL_TYPE(mb)) {
     case UCT_CXI_CTRL_CREQ:
-        /* The requester is the event's initiator. Create its record without
-         * starting a handshake of our own. */
-        peer = uct_cxi_peer_get(iface, CXI_MATCH_ID_EP(md->pid_bits, process),
-                                CXI_MATCH_ID_PID(md->pid_bits, process));
-        if (peer == NULL) {
-            ucs_error("cxi no memory for a peer record, dropping CREQ");
-            return;
-        }
-        if ((peer->rx_epoch != 0) && (peer->rx_epoch != (uint32_t)hd)) {
-            /* The requester restarted: drop what we owed its previous
-             * incarnation. */
-            memset(&peer->rx, 0, sizeof(peer->rx));
-        }
-        peer->rx_epoch = (uint32_t)hd;
-
-        /* Fire and forget: a lost reply makes the requester resend. */
-        (void)uct_cxi_ctrl_send(
-                iface, peer, UCT_CXI_CTRL_CREP,
-                UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREP, iface->fc.epoch,
-                                   (uint32_t)hd),
-                UCT_CXI_CREP_PACK(iface->fc.slot_window,
-                                  iface->fc.unit_window[UCT_CXI_FC_AM],
-                                  iface->fc.unit_window[UCT_CXI_FC_TAG]),
-                0, NULL);
+        uct_cxi_peer_handle_creq(iface, process, hd);
         break;
-
     case UCT_CXI_CTRL_CREP:
-        peer = uct_cxi_peer_lookup(iface, process);
-        if ((peer == NULL) ||
-            ((peer->state != UCT_CXI_PEER_DOWN) &&
-             (peer->state != UCT_CXI_PEER_CREQ_SENT))) {
-            ucs_debug("cxi ignoring unexpected CREP from initiator 0x%x",
-                      process);
-            return;
-        }
-        if (UCT_CXI_CTRL_ECHO(mb) != iface->fc.epoch) {
-            ucs_debug("cxi ignoring CREP answering another incarnation");
-            return;
-        }
-        peer->remote_epoch = UCT_CXI_CTRL_EPOCH24(mb);
-
-        /* The grant is the whole window; the piggyback granule follows. */
-        memset(&peer->tx, 0, sizeof(peer->tx));
-        peer->tx.avail_slots = UCT_CXI_CREP_SLOTS(hd);
-        peer->pb_shift[0]    = uct_cxi_fc_pb_shift(UCT_CXI_CREP_SLOTS(hd),
-                                                   UCT_CXI_FC_PB_SLOT_BITS);
-        for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
-            peer->tx.avail_units[cls] = UCT_CXI_CREP_UNITS(hd, cls);
-            peer->pb_shift[1 + cls]   = uct_cxi_fc_pb_shift(
-                    UCT_CXI_CREP_UNITS(hd, cls), UCT_CXI_FC_PB_UNIT_BITS);
-        }
-
-        uct_cxi_peer_connected(iface, peer, UCT_CXI_PEER_UP);
-        ucs_debug("cxi peer nid 0x%x pid %u is up: %d slots, %d AM units, "
-                  "%d tag units", uct_cxi_peer_nid(iface, peer),
-                  uct_cxi_peer_pid(iface, peer), peer->tx.avail_slots,
-                  peer->tx.avail_units[UCT_CXI_FC_AM],
-                  peer->tx.avail_units[UCT_CXI_FC_TAG]);
+        uct_cxi_peer_handle_crep(iface, process, mb, hd);
         break;
-
     case UCT_CXI_CTRL_GRANT:
-        peer = uct_cxi_peer_lookup(iface, process);
-        if ((peer == NULL) || (peer->state != UCT_CXI_PEER_UP) ||
-            (UCT_CXI_CTRL_EPOCH24(mb) != peer->remote_epoch)) {
-            ucs_debug("cxi ignoring GRANT from initiator 0x%x", process);
-            return;
-        }
-        units[UCT_CXI_FC_AM]  = (uint32_t)hd;
-        units[UCT_CXI_FC_TAG] = UCT_CXI_CTRL_ECHO(mb);
-        uct_cxi_fc_apply_grant(iface, peer, (uint32_t)(hd >> 32), units, 32, 32,
-                               NULL);
+        uct_cxi_peer_handle_grant(iface, process, mb, hd);
         break;
-
     default:
         ucs_debug("cxi ignoring control message of unknown type %u",
                   UCT_CXI_CTRL_TYPE(mb));
         break;
     }
 }
-
-
-/* -------------------------------------------------------------------------
- * Handshake driver
- * -------------------------------------------------------------------------
- */
 
 /*
  * Send \a conn's peer a CREQ and arm the timer for the next one. A CREQ that
@@ -599,22 +594,21 @@ void uct_cxi_iface_handle_ctrl_msg(uct_cxi_iface_t *iface,
 static void uct_cxi_peer_conn_attempt(uct_cxi_peer_conn_t *conn)
 {
     uct_cxi_iface_t *iface = conn->iface;
-    uct_cxi_peer_t  *peer  = conn->peer;
-    ucs_time_t       delay;
-    unsigned         shift;
+    uct_cxi_peer_t *peer   = conn->peer;
+    ucs_time_t delay;
+    unsigned shift;
 
     if (uct_cxi_ctrl_send(iface, peer, UCT_CXI_CTRL_CREQ,
-                          UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREQ,
-                                             iface->fc.epoch, 0),
+                          UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_CREQ, iface->fc.epoch,
+                                             0),
                           iface->fc.epoch, 0, NULL) != UCS_OK) {
         delay = 0;
     } else {
         peer->state = UCT_CXI_PEER_CREQ_SENT;
         shift       = ucs_min(conn->attempts, 10u);
         delay       = ucs_time_from_usec(
-                              ucs_min((uint64_t)UCT_CXI_CTRL_RETRY_BASE_US
-                                              << shift,
-                                      (uint64_t)UCT_CXI_CTRL_RETRY_MAX_US));
+                ucs_min((uint64_t)UCT_CXI_CTRL_RETRY_BASE_US << shift,
+                              (uint64_t)UCT_CXI_CTRL_RETRY_MAX_US));
         conn->attempts++;
     }
 
@@ -624,16 +618,18 @@ static void uct_cxi_peer_conn_attempt(uct_cxi_peer_conn_t *conn)
 /* The timer of a handshake: give up if its time is up, else resend. */
 static void uct_cxi_peer_conn_timer(ucs_wtimer_t *timer)
 {
-    uct_cxi_peer_conn_t *conn  = ucs_container_of(timer, uct_cxi_peer_conn_t,
-                                                  timer);
-    uct_cxi_iface_t     *iface = conn->iface;
-    uct_cxi_peer_t      *peer  = conn->peer;
+    uct_cxi_peer_conn_t *conn = ucs_container_of(timer, uct_cxi_peer_conn_t,
+                                                 timer);
+    uct_cxi_iface_t *iface    = conn->iface;
+    uct_cxi_peer_t *peer      = conn->peer;
 
     if (ucs_get_time() > conn->deadline) {
         ucs_warn("cxi handshake with nid 0x%x pid %u timed out after %u "
-                 "attempts", uct_cxi_peer_nid(iface, peer),
-                 uct_cxi_peer_pid(iface, peer), conn->attempts);
-        uct_cxi_peer_connected(iface, peer, UCT_CXI_PEER_FAILED); /* frees conn */
+                 "attempts",
+                 uct_cxi_peer_nid(iface, peer), uct_cxi_peer_pid(iface, peer),
+                 conn->attempts);
+        /* Frees conn. */
+        uct_cxi_peer_connected(iface, peer, UCT_CXI_PEER_FAILED);
         return;
     }
 
@@ -643,7 +639,6 @@ static void uct_cxi_peer_conn_timer(ucs_wtimer_t *timer)
 void uct_cxi_peer_connect(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 {
     uct_cxi_peer_conn_t *conn;
-    ucs_time_t           now = ucs_get_time();
 
     if ((peer->state != UCT_CXI_PEER_DOWN) || (peer->conn != NULL)) {
         return;
@@ -659,7 +654,7 @@ void uct_cxi_peer_connect(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
     ucs_wtimer_init(&conn->timer, uct_cxi_peer_conn_timer);
     conn->iface    = iface;
     conn->peer     = peer;
-    conn->deadline = now + iface->fc.connect_timeout;
+    conn->deadline = ucs_get_time() + iface->fc.connect_timeout;
     conn->attempts = 0;
     peer->conn     = conn;
 
@@ -687,36 +682,26 @@ static int uct_cxi_fc_owed(const uct_cxi_peer_t *peer)
  * Tell \a peer how much of its traffic we have processed (cumulative).
  * UCS_ERR_NO_RESOURCE if the control channel is full.
  */
-static ucs_status_t uct_cxi_fc_send_grant(uct_cxi_iface_t *iface,
-                                          uct_cxi_peer_t *peer)
+static ucs_status_t
+uct_cxi_fc_send_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
 {
-    uint32_t     slots = peer->rx.ret_slots;
-    uint32_t     units[UCT_CXI_FC_NUM_CLASSES];
+    uint32_t slots = peer->rx.ret_slots;
+    uint32_t units[UCT_CXI_FC_NUM_CLASSES];
     ucs_status_t status;
-    unsigned     cls;
 
     memcpy(units, peer->rx.ret_units, sizeof(units));
 
-    status = uct_cxi_ctrl_send(
-            iface, peer, UCT_CXI_CTRL_GRANT,
-            UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_GRANT, iface->fc.epoch,
-                               units[UCT_CXI_FC_TAG]),
-            ((uint64_t)slots << 32) | units[UCT_CXI_FC_AM], slots, units);
+    status = uct_cxi_ctrl_send(iface, peer, UCT_CXI_CTRL_GRANT,
+                               UCT_CXI_CTRL_MATCH(UCT_CXI_CTRL_GRANT,
+                                                  iface->fc.epoch,
+                                                  units[UCT_CXI_FC_TAG]),
+                               ((uint64_t)slots << 32) | units[UCT_CXI_FC_AM],
+                               slots, units);
     if (status == UCS_OK) {
         peer->rx.adv_slots = slots;
-        for (cls = 0; cls < UCT_CXI_FC_NUM_CLASSES; cls++) {
-            peer->rx.adv_units[cls] = units[cls];
-        }
+        memcpy(peer->rx.adv_units, units, sizeof(units));
     }
     return status;
-}
-
-/* Queue \a peer for a GRANT (uct_cxi_fc_flush_grants). */
-static void uct_cxi_fc_queue_grant(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
-{
-    if (ucs_list_is_empty(&peer->grants)) {
-        ucs_list_add_tail(&iface->fc.grants, &peer->grants);
-    }
 }
 
 void uct_cxi_fc_grant_wanted(uct_cxi_iface_t *iface, uct_cxi_peer_t *peer)
