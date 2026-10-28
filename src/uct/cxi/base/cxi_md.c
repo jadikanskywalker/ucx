@@ -1,10 +1,13 @@
 /**
+ * Copyright (c) 2026. ALL RIGHTS RESERVED.
+ * See file LICENSE for terms.
+ *
  * CXI memory domain: query_md_resources, md_open, mem_reg/dereg (pinned, rcache
  * or ATS) and mkey_pack.
  */
 
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#include "config.h"
 #endif
 
 #include "cxi_md.h"
@@ -27,8 +30,7 @@
 
 
 static ucs_config_field_t uct_cxi_md_config_table[] = {
-    {"", "", NULL,
-     ucs_offsetof(uct_cxi_md_config_t, super),
+    {"", "", NULL, ucs_offsetof(uct_cxi_md_config_t, super),
      UCS_CONFIG_TYPE_TABLE(uct_md_config_table)},
 
     {"ATS", "no",
@@ -37,19 +39,16 @@ static ucs_config_field_t uct_cxi_md_config_table[] = {
      "  no:  disable ATS (use pinned registration)\n"
      "  try: use ATS if hardware supports it, fall back silently otherwise\n"
      "Requires AMD IOMMU enabled in the kernel; defaults to no on COSMOS.",
-     ucs_offsetof(uct_cxi_md_config_t, enable_ats),
-     UCS_CONFIG_TYPE_TERNARY},
+     ucs_offsetof(uct_cxi_md_config_t, enable_ats), UCS_CONFIG_TYPE_TERNARY},
 
     {"RCACHE", "try",
      "Enable memory registration cache.\n"
      "  yes: require cache (fail md_open if unavailable)\n"
      "  no:  disable cache (every mem_reg calls cxil_map directly)\n"
      "  try: enable if possible, fall back silently otherwise",
-     ucs_offsetof(uct_cxi_md_config_t, enable_rcache),
-     UCS_CONFIG_TYPE_TERNARY},
+     ucs_offsetof(uct_cxi_md_config_t, enable_rcache), UCS_CONFIG_TYPE_TERNARY},
 
-    {"", "", NULL,
-     ucs_offsetof(uct_cxi_md_config_t, rcache),
+    {"", "", NULL, ucs_offsetof(uct_cxi_md_config_t, rcache),
      UCS_CONFIG_TYPE_TABLE(ucs_config_rcache_table)},
 
     {"DMABUF", "try",
@@ -57,20 +56,14 @@ static ucs_config_field_t uct_cxi_md_config_table[] = {
      "  yes: require a dmabuf fd for device memory (fail mem_reg without one)\n"
      "  no:  never request a dmabuf fd; use CXI_MAP_DEVICE with no hints\n"
      "  try: use a dmabuf fd when UCP provides one, else CXI_MAP_DEVICE alone",
-     ucs_offsetof(uct_cxi_md_config_t, enable_dmabuf),
-     UCS_CONFIG_TYPE_TERNARY},
+     ucs_offsetof(uct_cxi_md_config_t, enable_dmabuf), UCS_CONFIG_TYPE_TERNARY},
 
     {NULL}
 };
 
 
-/* -------------------------------------------------------------------------
- * Credential helpers — mirror cxip_nic.c logic from libfabric CXI provider
- * -------------------------------------------------------------------------
- */
-
 /*
- * Service ID of device index \a dev from SLINGSHOT_SVC_IDS (one entry per
+ * Service ID of device index \a dev_id from SLINGSHOT_SVC_IDS (one entry per
  * NIC), or -1 if absent or out of range.
  */
 static int uct_cxi_get_svc_id(unsigned dev_id)
@@ -78,7 +71,7 @@ static int uct_cxi_get_svc_id(unsigned dev_id)
     char *env = getenv("SLINGSHOT_SVC_IDS");
     char *dup;
     char *token;
-    int   svc_id = -1;
+    int svc_id   = -1;
     unsigned idx = 0;
 
     if (env == NULL) {
@@ -102,7 +95,8 @@ static int uct_cxi_get_svc_id(unsigned dev_id)
 
     if (svc_id < 0) {
         ucs_warn("SLINGSHOT_SVC_IDS has no entry for device index %u "
-                 "(value: %s)", dev_id, env);
+                 "(value: %s)",
+                 dev_id, env);
     }
 
     return svc_id;
@@ -138,7 +132,7 @@ static uint16_t uct_cxi_get_vni(void)
 static void uct_cxi_log_svc_desc(int idx, const struct cxi_svc_desc *desc)
 {
     unsigned k;
-    int      j;
+    int j;
 
     ucs_trace("cxi svc[%d] id %u enable %d system %d restricted_members %d "
               "restricted_vnis %d num_vld_vnis %d",
@@ -175,14 +169,14 @@ static void uct_cxi_log_svc_desc(int idx, const struct cxi_svc_desc *desc)
 static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
 {
     struct cxil_svc_list *svc_list;
-    struct cxi_svc_desc  *desc;
-    uid_t                 uid = geteuid();
-    gid_t                 gid = getegid();
-    int                   found_uid = -1;
-    int                   found_gid = -1;
-    int                   found_unrestricted = -1;
-    int                   i, j;
-    int                   ret;
+    struct cxi_svc_desc *desc;
+    uid_t uid              = geteuid();
+    gid_t gid              = getegid();
+    int found_uid          = -1;
+    int found_gid          = -1;
+    int found_unrestricted = -1;
+    int i, j;
+    int ret;
 
     ret = cxil_get_svc_list(dev, &svc_list);
     if (ret != 0) {
@@ -215,8 +209,7 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
 
         for (j = 0; j < CXI_SVC_MAX_MEMBERS; j++) {
             if ((desc->members[j].type == CXI_SVC_MEMBER_UID) &&
-                (desc->members[j].svc_member.uid == uid) &&
-                (found_uid == -1)) {
+                (desc->members[j].svc_member.uid == uid) && (found_uid == -1)) {
                 found_uid = i;
             } else if ((desc->members[j].type == CXI_SVC_MEMBER_GID) &&
                        (desc->members[j].svc_member.gid == gid) &&
@@ -234,7 +227,8 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
         i = found_unrestricted;
     } else {
         ucs_debug("cxi no service matches uid %d gid %d and no unrestricted "
-                  "service is available", (int)uid, (int)gid);
+                  "service is available",
+                  (int)uid, (int)gid);
         cxil_free_svc_list(svc_list);
         return -1;
     }
@@ -250,7 +244,8 @@ static int uct_cxi_find_svc_by_membership(struct cxil_dev *dev, uint16_t *vni_p)
     i = (int)desc->svc_id;
 
     ucs_debug("cxi found svc_id %d vni %u via service membership "
-              "(uid %d gid %d)", i, (unsigned)*vni_p, (int)uid, (int)gid);
+              "(uid %d gid %d)",
+              i, (unsigned)*vni_p, (int)uid, (int)gid);
 
     cxil_free_svc_list(svc_list);
     return i;
@@ -265,21 +260,22 @@ static ucs_status_t uct_cxi_get_rgroup_vni(struct cxil_dev *dev,
                                            unsigned dev_id, int *svc_id_p,
                                            uint16_t *vni_p)
 {
-    int      svc_id;
+    int svc_id;
     uint16_t vni;
 
     svc_id = uct_cxi_get_svc_id(dev_id);
     vni    = uct_cxi_get_vni();
     if ((svc_id >= 0) && (vni != 0)) {
-        ucs_debug("cxi resolved svc_id %d vni %u from SLINGSHOT_* env",
-                  svc_id, (unsigned)vni);
+        ucs_debug("cxi resolved svc_id %d vni %u from SLINGSHOT_* env", svc_id,
+                  (unsigned)vni);
         *svc_id_p = svc_id;
         *vni_p    = vni;
         return UCS_OK;
     }
 
     ucs_debug("cxi SLINGSHOT_* env incomplete (svc_id %d vni %u), falling "
-              "back to service membership lookup", svc_id, (unsigned)vni);
+              "back to service membership lookup",
+              svc_id, (unsigned)vni);
 
     svc_id = uct_cxi_find_svc_by_membership(dev, &vni);
     if (svc_id < 0) {
@@ -304,23 +300,19 @@ static int uct_cxi_devname_to_id(const char *name)
 }
 
 
-/* -------------------------------------------------------------------------
- * query_md_resources
- * -------------------------------------------------------------------------
- */
-
 /*
  * One MD resource per CXI device, with no credential check: a device without
  * a usable service fails md_open and is skipped.
  */
-ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
-                                        uct_md_resource_desc_t **resources_p,
-                                        unsigned *num_resources_p)
+static ucs_status_t
+uct_cxi_query_md_resources(uct_component_h component,
+                           uct_md_resource_desc_t **resources_p,
+                           unsigned *num_resources_p)
 {
     struct cxil_device_list *dev_list = NULL;
-    uct_md_resource_desc_t  *resources;
-    unsigned int             i;
-    int                      ret;
+    uct_md_resource_desc_t *resources;
+    unsigned int i;
+    int ret;
 
     ret = cxil_get_device_list(&dev_list);
     if (ret != 0) {
@@ -334,7 +326,8 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
         return uct_md_query_empty_md_resource(resources_p, num_resources_p);
     }
 
-    resources = ucs_calloc(dev_list->count, sizeof(*resources), "cxi md resources");
+    resources = ucs_calloc(dev_list->count, sizeof(*resources),
+                           "cxi md resources");
     if (resources == NULL) {
         cxil_free_device_list(dev_list);
         return UCS_ERR_NO_MEMORY;
@@ -343,12 +336,10 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
     ucs_debug("cxi found %u CXI device(s)", dev_list->count);
 
     for (i = 0; i < dev_list->count; i++) {
-        ucs_strncpy_safe(resources[i].md_name,
-                         dev_list->info[i].device_name,
+        ucs_strncpy_safe(resources[i].md_name, dev_list->info[i].device_name,
                          sizeof(resources[i].md_name));
-        ucs_debug("cxi device %u name %s nid 0x%x",
-                  i, dev_list->info[i].device_name,
-                  dev_list->info[i].nid);
+        ucs_debug("cxi device %u name %s nid 0x%x", i,
+                  dev_list->info[i].device_name, dev_list->info[i].nid);
     }
 
     cxil_free_device_list(dev_list);
@@ -359,18 +350,13 @@ ucs_status_t uct_cxi_query_md_resources(uct_component_h component,
 }
 
 
-/* -------------------------------------------------------------------------
- * md_query — advertise memory domain capabilities
- * -------------------------------------------------------------------------
- */
-
-ucs_status_t uct_cxi_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
+static ucs_status_t uct_cxi_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
 {
     uct_cxi_md_t *cxi_md = ucs_derived_of(md, uct_cxi_md_t);
 
     uct_md_base_md_query(md_attr);
-    md_attr->flags            = UCT_MD_FLAG_REG | UCT_MD_FLAG_NEED_MEMH |
-                                UCT_MD_FLAG_NEED_RKEY;
+    md_attr->flags = UCT_MD_FLAG_REG | UCT_MD_FLAG_NEED_MEMH |
+                     UCT_MD_FLAG_NEED_RKEY;
     if (cxi_md->dmabuf_enabled) {
         md_attr->flags |= UCT_MD_FLAG_REG_DMABUF;
     }
@@ -379,23 +365,21 @@ ucs_status_t uct_cxi_md_query(uct_md_h md, uct_md_attr_v2_t *md_attr)
                                 UCS_BIT(UCS_MEMORY_TYPE_ROCM);
     md_attr->access_mem_types = UCS_BIT(UCS_MEMORY_TYPE_HOST);
     md_attr->cache_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_HOST);
-    md_attr->detect_mem_types = 0;
-    md_attr->dmabuf_mem_types = 0; /* consumer only, never a dmabuf producer */
     md_attr->rkey_packed_size = sizeof(uct_cxi_rkey_t);
     md_attr->reg_cost         = ucs_linear_func_make(1000.0e-9, 0.007e-9);
     return UCS_OK;
 }
 
 
-void uct_cxi_md_close(uct_md_h mdh)
+static void uct_cxi_md_close(uct_md_h mdh)
 {
     uct_cxi_md_t *md = ucs_derived_of(mdh, uct_cxi_md_t);
-    int           ret;
+    int ret;
 
-    ucs_debug("cxi md close device %s lni_id %u",
-              md->device.name, md->cxi_lni->id);
+    ucs_debug("cxi md close device %s lni_id %u", md->device.name,
+              md->cxi_lni->id);
 
-    /* Release ATS scalable mapping before the LNI (cxil_unmap needs live LNI). */
+    /* Release the ATS mapping before the LNI: cxil_unmap needs it live. */
     if (md->ats_md != NULL) {
         ret = cxil_unmap(md->ats_md);
         if (ret != 0) {
@@ -420,22 +404,16 @@ void uct_cxi_md_close(uct_md_h mdh)
 }
 
 
-/* -------------------------------------------------------------------------
- * mem_reg / mem_dereg — host memory registration via cxil_map
- * -------------------------------------------------------------------------
- */
-
 /*
  * cxil_map (pinned, read/write; CXI_MAP_DEVICE for device memory) and fill
  * \a mh. Shared by the direct and rcache registration paths.
  */
-ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
-                                   size_t length, int dmabuf_fd,
-                                   size_t dmabuf_offset,
-                                   ucs_memory_type_t mem_type,
-                                   uct_cxi_mem_handle_t *mh)
+ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address, size_t length,
+                            int dmabuf_fd, size_t dmabuf_offset,
+                            ucs_memory_type_t mem_type,
+                            uct_cxi_mem_handle_t *mh)
 {
-    int flags = CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE;
+    int flags                 = CXI_MAP_PIN | CXI_MAP_READ | CXI_MAP_WRITE;
     struct cxi_md_hints hints = {};
     int ret;
 
@@ -450,22 +428,23 @@ ucs_status_t uct_cxi_do_map(struct cxil_lni *lni, void *address,
 
     ret = cxil_map(lni, address, length, flags, &hints, &mh->cxi_md);
     if (ret != 0) {
-        ucs_error("cxi cxil_map lni_id %u addr %p len %zu failed: %s",
-                  lni->id, address, length, strerror(-ret));
+        ucs_error("cxi cxil_map lni_id %u addr %p len %zu failed: %s", lni->id,
+                  address, length, strerror(-ret));
         return UCS_ERR_IO_ERROR;
     }
 
     /* iova_offset = page_IOVA - page_VA, from the page-aligned cxi_md->va (not
-         * \a address, which may be unaligned). */
+     * \a address, which may be unaligned). */
     mh->iova_offset = mh->cxi_md->iova - mh->cxi_md->va;
 
-    ucs_debug("cxi map addr %p len %zu iova 0x%"PRIx64" lac %u offset 0x%"PRIx64,
+    ucs_debug("cxi map addr %p len %zu iova 0x%" PRIx64
+              " lac %u offset 0x%" PRIx64,
               address, length, (uint64_t)mh->cxi_md->iova,
               (unsigned)mh->cxi_md->lac, mh->iova_offset);
     return UCS_OK;
 }
 
-/* Counterpart to uct_cxi_do_map — shared by direct, rcache, and iface paths. */
+/* Counterpart to uct_cxi_do_map, shared by all the paths that map. */
 void uct_cxi_do_unmap(uct_cxi_mem_handle_t *mh)
 {
     int ret = cxil_unmap(mh->cxi_md);
@@ -482,32 +461,49 @@ static ucs_status_t uct_cxi_check_lac(uct_cxi_mem_handle_t *mh)
     if (mh->cxi_md->lac != 0) {
         ucs_error("cxi registration landed on lac %u; only lac 0 is "
                   "supported (non-dmabuf GPU registration and huge-page "
-                  "host registration are not)", (unsigned)mh->cxi_md->lac);
+                  "host registration are not)",
+                  (unsigned)mh->cxi_md->lac);
         uct_cxi_do_unmap(mh);
         return UCS_ERR_UNSUPPORTED;
     }
     return UCS_OK;
 }
 
-/* Direct (non-cached) path: allocate a handle, call cxil_map. */
-static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
-                                       size_t length,
-                                       const uct_md_mem_reg_params_t *params,
-                                       uct_mem_h *memh_p)
+/* Memory type and dmabuf of a registration; host memory without a dmabuf if
+ * \a params is NULL or leaves them out. */
+static void uct_cxi_mem_reg_params(const uct_md_mem_reg_params_t *params,
+                                   ucs_memory_type_t *mem_type_p,
+                                   int *dmabuf_fd_p, size_t *dmabuf_offset_p)
 {
-    uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
-    ucs_memory_type_t     mem_type;
-    int                   dmabuf_fd;
-    size_t                dmabuf_offset;
-    uct_cxi_mem_handle_t *mh;
-    ucs_status_t          status;
+    if (params == NULL) {
+        *mem_type_p      = UCS_MEMORY_TYPE_HOST;
+        *dmabuf_fd_p     = UCT_DMABUF_FD_INVALID;
+        *dmabuf_offset_p = 0;
+        return;
+    }
 
-    mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, FIELD_MEM_TYPE,
-                                          UCS_MEMORY_TYPE_HOST);
-    dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_fd, FIELD_DMABUF_FD,
-                                           UCT_DMABUF_FD_INVALID);
-    dmabuf_offset = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_offset,
-                                               FIELD_DMABUF_OFFSET, 0);
+    *mem_type_p  = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, FIELD_MEM_TYPE,
+                                              UCS_MEMORY_TYPE_HOST);
+    *dmabuf_fd_p = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_fd,
+                                              FIELD_DMABUF_FD,
+                                              UCT_DMABUF_FD_INVALID);
+    *dmabuf_offset_p = UCT_MD_MEM_REG_FIELD_VALUE(params, dmabuf_offset,
+                                                  FIELD_DMABUF_OFFSET, 0);
+}
+
+/* Direct (non-cached) path: allocate a handle, call cxil_map. */
+static ucs_status_t
+uct_cxi_md_mem_reg(uct_md_h mdh, void *address, size_t length,
+                   const uct_md_mem_reg_params_t *params, uct_mem_h *memh_p)
+{
+    uct_cxi_md_t *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    ucs_memory_type_t mem_type;
+    int dmabuf_fd;
+    size_t dmabuf_offset;
+    uct_cxi_mem_handle_t *mh;
+    ucs_status_t status;
+
+    uct_cxi_mem_reg_params(params, &mem_type, &dmabuf_fd, &dmabuf_offset);
 
     mh = ucs_malloc(sizeof(*mh), "uct_cxi_mem_handle");
     if (mh == NULL) {
@@ -517,18 +513,20 @@ static ucs_status_t uct_cxi_md_mem_reg(uct_md_h mdh, void *address,
     status = uct_cxi_do_map(md->cxi_lni, address, length, dmabuf_fd,
                             dmabuf_offset, mem_type, mh);
     if (status != UCS_OK) {
-        ucs_free(mh);
-        return status;
+        goto err_free;
     }
 
     status = uct_cxi_check_lac(mh);
     if (status != UCS_OK) {
-        ucs_free(mh);
-        return status;
+        goto err_free;
     }
 
     *memh_p = mh;
     return UCS_OK;
+
+err_free:
+    ucs_free(mh);
+    return status;
 }
 
 /* Direct (non-cached) path: call cxil_unmap and free the handle. */
@@ -544,52 +542,39 @@ uct_cxi_md_mem_dereg(uct_md_h mdh, const uct_md_mem_dereg_params_t *params)
 }
 
 
-/* -------------------------------------------------------------------------
- * Registration cache — callbacks, ops table, user-facing wrappers
- * -------------------------------------------------------------------------
- */
-
 /* Carries mem_reg params + the caller's pre-page-alignment address through
  * ucs_rcache_get() to the miss callback. */
 typedef struct uct_cxi_rcache_reg_arg {
     const uct_md_mem_reg_params_t *params;
-    void                           *address;
+    void                          *address;
 } uct_cxi_rcache_reg_arg_t;
 
 /* rcache miss: map the page-aligned range into region->memh. */
-static ucs_status_t
-uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
-                          void *arg, ucs_rcache_region_t *rregion,
-                          uint16_t rcache_mem_reg_flags)
+static ucs_status_t uct_cxi_rcache_mem_reg_cb(void *context,
+                                              ucs_rcache_t *rcache, void *arg,
+                                              ucs_rcache_region_t *rregion,
+                                              uint16_t rcache_mem_reg_flags)
 {
-    uct_cxi_md_t                   *md      = context;
+    uct_cxi_md_t *md                        = context;
     const uct_cxi_rcache_reg_arg_t *reg_arg = arg;
-    uct_cxi_rcache_region_t        *region  = ucs_derived_of(rregion,
-                                                              uct_cxi_rcache_region_t);
-    ucs_memory_type_t mem_type     = UCS_MEMORY_TYPE_HOST;
-    int                dmabuf_fd    = UCT_DMABUF_FD_INVALID;
-    size_t             dmabuf_offset = 0;
-    ucs_status_t       status;
+    uct_cxi_rcache_region_t *region;
+    ucs_memory_type_t mem_type;
+    int dmabuf_fd;
+    size_t dmabuf_offset;
+    ucs_status_t status;
 
-    if (reg_arg != NULL) {
-        mem_type = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, mem_type,
-                                              FIELD_MEM_TYPE, UCS_MEMORY_TYPE_HOST);
-        dmabuf_fd = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params, dmabuf_fd,
-                                               FIELD_DMABUF_FD, UCT_DMABUF_FD_INVALID);
-        dmabuf_offset = UCT_MD_MEM_REG_FIELD_VALUE(reg_arg->params,
-                                                   dmabuf_offset,
-                                                   FIELD_DMABUF_OFFSET, 0);
+    region = ucs_derived_of(rregion, uct_cxi_rcache_region_t);
+    uct_cxi_mem_reg_params((reg_arg != NULL) ? reg_arg->params : NULL,
+                           &mem_type, &dmabuf_fd, &dmabuf_offset);
 
-        /* dmabuf_offset was computed relative to reg_arg->address; shift it
-         * by the same delta the rcache's page-aligned start moved by (see
-         * shs-libcxi tests/map.c device_map_offset for this pattern). */
-        if (dmabuf_fd != UCT_DMABUF_FD_INVALID) {
-            dmabuf_offset -= (uintptr_t)reg_arg->address - rregion->super.start;
-        }
+    /* dmabuf_offset was computed relative to reg_arg->address; shift it by the
+     * same delta the rcache's page-aligned start moved by (see shs-libcxi
+     * tests/map.c device_map_offset for this pattern). */
+    if (dmabuf_fd != UCT_DMABUF_FD_INVALID) {
+        dmabuf_offset -= (uintptr_t)reg_arg->address - rregion->super.start;
     }
 
-    status = uct_cxi_do_map(md->cxi_lni,
-                            (void *)rregion->super.start,
+    status = uct_cxi_do_map(md->cxi_lni, (void*)rregion->super.start,
                             rregion->super.end - rregion->super.start,
                             dmabuf_fd, dmabuf_offset, mem_type, &region->memh);
     if (status != UCS_OK) {
@@ -600,23 +585,21 @@ uct_cxi_rcache_mem_reg_cb(void *context, ucs_rcache_t *rcache,
 }
 
 /* rcache eviction: release the mapping before the rcache frees the region. */
-static void
-uct_cxi_rcache_mem_dereg_cb(void *context, ucs_rcache_t *rcache,
-                            ucs_rcache_region_t *rregion)
+static void uct_cxi_rcache_mem_dereg_cb(void *context, ucs_rcache_t *rcache,
+                                        ucs_rcache_region_t *rregion)
 {
     uct_cxi_rcache_region_t *region = ucs_derived_of(rregion,
                                                      uct_cxi_rcache_region_t);
     uct_cxi_do_unmap(&region->memh);
 }
 
-static void
-uct_cxi_rcache_dump_region_cb(void *context, ucs_rcache_t *rcache,
-                              ucs_rcache_region_t *rregion, char *buf,
-                              size_t max)
+static void uct_cxi_rcache_dump_region_cb(void *context, ucs_rcache_t *rcache,
+                                          ucs_rcache_region_t *rregion,
+                                          char *buf, size_t max)
 {
     uct_cxi_rcache_region_t *region = ucs_derived_of(rregion,
                                                      uct_cxi_rcache_region_t);
-    snprintf(buf, max, "iova 0x%"PRIx64" lac %u",
+    snprintf(buf, max, "iova 0x%" PRIx64 " lac %u",
              (uint64_t)region->memh.cxi_md->iova,
              (unsigned)region->memh.cxi_md->lac);
 }
@@ -624,7 +607,7 @@ uct_cxi_rcache_dump_region_cb(void *context, ucs_rcache_t *rcache,
 static ucs_rcache_ops_t uct_cxi_rcache_ops = {
     .mem_reg     = uct_cxi_rcache_mem_reg_cb,
     .mem_dereg   = uct_cxi_rcache_mem_dereg_cb,
-    .merge       = (void *)ucs_empty_function,
+    .merge       = (void*)ucs_empty_function,
     .dump_region = uct_cxi_rcache_dump_region_cb
 };
 
@@ -634,14 +617,16 @@ uct_cxi_md_mem_rcache_reg(uct_md_h uct_md, void *address, size_t length,
                           const uct_md_mem_reg_params_t *params,
                           uct_mem_h *memh_p)
 {
-    uct_cxi_md_t             *md = ucs_derived_of(uct_md, uct_cxi_md_t);
-    uct_cxi_rcache_reg_arg_t  reg_arg = {.params = params, .address = address};
-    ucs_rcache_region_t      *rregion;
-    ucs_status_t              status;
+    uct_cxi_md_t *md                 = ucs_derived_of(uct_md, uct_cxi_md_t);
+    uct_cxi_rcache_reg_arg_t reg_arg = {
+        .params  = params,
+        .address = address
+    };
+    ucs_rcache_region_t *rregion;
+    ucs_status_t status;
 
-    status = ucs_rcache_get(md->rcache, address, length,
-                            ucs_get_page_size(), PROT_READ | PROT_WRITE,
-                            &reg_arg, &rregion);
+    status = ucs_rcache_get(md->rcache, address, length, ucs_get_page_size(),
+                            PROT_READ | PROT_WRITE, &reg_arg, &rregion);
     if (status != UCS_OK) {
         return status;
     }
@@ -656,8 +641,8 @@ static ucs_status_t
 uct_cxi_md_mem_rcache_dereg(uct_md_h uct_md,
                             const uct_md_mem_dereg_params_t *params)
 {
-    uct_cxi_md_t            *md     = ucs_derived_of(uct_md, uct_cxi_md_t);
-    uct_cxi_mem_handle_t    *mh     = params->memh;
+    uct_cxi_md_t *md         = ucs_derived_of(uct_md, uct_cxi_md_t);
+    uct_cxi_mem_handle_t *mh = params->memh;
     uct_cxi_rcache_region_t *region;
 
     UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
@@ -668,28 +653,22 @@ uct_cxi_md_mem_rcache_dereg(uct_md_h uct_md,
 }
 
 
-/* -------------------------------------------------------------------------
- * mkey_pack / rkey_unpack — remote key serialization
- * -------------------------------------------------------------------------
- */
-
 /* Pack {iova_offset, lac}; the EP already has the peer's addresses. */
 static ucs_status_t
-uct_cxi_md_mkey_pack(uct_md_h mdh, uct_mem_h memh, void *address,
-                     size_t length, const uct_md_mkey_pack_params_t *params,
-                     void *mkey_buffer)
+uct_cxi_md_mkey_pack(uct_md_h mdh, uct_mem_h memh, void *address, size_t length,
+                     const uct_md_mkey_pack_params_t *params, void *mkey_buffer)
 {
-    uct_cxi_mem_handle_t  *mh   = memh;
-    uct_cxi_rkey_t        *rkey = mkey_buffer;
+    uct_cxi_mem_handle_t *mh = memh;
+    uct_cxi_rkey_t *rkey     = mkey_buffer;
 
-    rkey->iova          = mh->iova_offset;  /* = cxi_md->iova - base_VA */
+    /* mkey_buffer is not necessarily zeroed */
+    rkey->iova          = mh->iova_offset;
     rkey->lac           = mh->cxi_md->lac;
-    rkey->is_rndv       = 0; /* mkey_buffer is caller-supplied, not
-                                 necessarily zeroed -- must set explicitly */
+    rkey->is_rndv       = 0;
     rkey->rendezvous_id = 0;
 
-    ucs_debug("cxi mkey pack iova_offset 0x%"PRIx64" lac %u",
-              rkey->iova, (unsigned)rkey->lac);
+    ucs_debug("cxi mkey pack iova_offset 0x%" PRIx64 " lac %u", rkey->iova,
+              (unsigned)rkey->lac);
     return UCS_OK;
 }
 
@@ -698,26 +677,26 @@ static ucs_status_t uct_cxi_rkey_unpack(uct_component_h component,
                                         const uct_rkey_unpack_params_t *params,
                                         uct_rkey_t *rkey_p, void **handle_p)
 {
-    uct_cxi_rkey_t *src  = (uct_cxi_rkey_t *)rkey_buffer;
-    uct_cxi_rkey_t *rkey = ucs_malloc(sizeof(*rkey), "uct_cxi_rkey");
+    const uct_cxi_rkey_t *src = rkey_buffer;
+    uct_cxi_rkey_t *rkey      = ucs_malloc(sizeof(*rkey), "uct_cxi_rkey");
 
     if (rkey == NULL) {
         return UCS_ERR_NO_MEMORY;
     }
 
-    *rkey    = *src;
-    *rkey_p  = (uct_rkey_t)(uintptr_t)rkey;
+    *rkey     = *src;
+    *rkey_p   = (uct_rkey_t)(uintptr_t)rkey;
     *handle_p = NULL;
 
-    ucs_debug("cxi rkey unpack iova 0x%"PRIx64" lac %u",
-              rkey->iova, (unsigned)rkey->lac);
+    ucs_debug("cxi rkey unpack iova 0x%" PRIx64 " lac %u", rkey->iova,
+              (unsigned)rkey->lac);
     return UCS_OK;
 }
 
-static ucs_status_t uct_cxi_rkey_release(uct_component_h component,
-                                         uct_rkey_t rkey, void *handle)
+static ucs_status_t
+uct_cxi_rkey_release(uct_component_h component, uct_rkey_t rkey, void *handle)
 {
-    ucs_free((void *)(uintptr_t)rkey);
+    ucs_free((void*)(uintptr_t)rkey);
     return UCS_OK;
 }
 
@@ -736,25 +715,19 @@ uct_cxi_md_detect_memory_type(uct_md_h md, const void *address, size_t length,
 }
 
 
-/* -------------------------------------------------------------------------
- * ATS (PCIe Address Translation Services) — capability probe, scalable
- * init, and ops callbacks.
- *
- * ATS mode uses a single cxil_map over the full 48-bit VA space
- * (CXI_MAP_ATS, no CXI_MAP_PIN).  The NIC translates VAs on-demand via
- * the host IOMMU rather than pinning pages at registration time.
- *
- * Modeled on cxip_ats_check() and cxip_scalable_iomm_init() in
- * libfabric's cxip_iomm.c.
- * -------------------------------------------------------------------------
+/*
+ * ATS (PCIe Address Translation Services) mode is one cxil_map over the whole
+ * 48-bit VA space (CXI_MAP_ATS, no CXI_MAP_PIN): the NIC translates addresses
+ * through the host IOMMU instead of pinning pages at registration. Modeled on
+ * cxip_ats_check() and cxip_scalable_iomm_init() in libfabric's cxip_iomm.c.
  */
 
 /* Probe ATS support by mapping and unmapping a small variable. */
 static int uct_cxi_ats_check(struct cxil_lni *lni)
 {
-    int            stack_var;
+    int stack_var;
     struct cxi_md *md;
-    int            ret;
+    int ret;
 
     ret = cxil_map(lni, &stack_var, sizeof(stack_var),
                    CXI_MAP_READ | CXI_MAP_WRITE | CXI_MAP_ATS | CXI_MAP_PIN,
@@ -778,15 +751,15 @@ static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
     int ret;
 
     ret = cxil_map(md->cxi_lni, 0, 0xfffffffffffff000,
-                   CXI_MAP_READ | CXI_MAP_WRITE | CXI_MAP_ATS,
-                   NULL, &md->ats_md);
+                   CXI_MAP_READ | CXI_MAP_WRITE | CXI_MAP_ATS, NULL,
+                   &md->ats_md);
     if (ret != 0) {
         ucs_error("cxi ATS scalable map failed: %s", strerror(-ret));
         md->ats_md = NULL;
         return UCS_ERR_IO_ERROR;
     }
 
-    ucs_debug("cxi ATS scalable map iova 0x%"PRIx64" lac %u",
+    ucs_debug("cxi ATS scalable map iova 0x%" PRIx64 " lac %u",
               (uint64_t)md->ats_md->iova, (unsigned)md->ats_md->lac);
 
     /* Only lac 0 is supported (see UCT_CXI_MAX_LACS in cxi_iface.h). ATS's
@@ -794,7 +767,8 @@ static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
      * checked once here rather than per mem_reg call. */
     if (md->ats_md->lac != 0) {
         ucs_error("cxi ATS scalable map landed on lac %u; only lac 0 is "
-                  "supported", (unsigned)md->ats_md->lac);
+                  "supported",
+                  (unsigned)md->ats_md->lac);
         cxil_unmap(md->ats_md);
         md->ats_md = NULL;
         return UCS_ERR_UNSUPPORTED;
@@ -806,11 +780,10 @@ static ucs_status_t uct_cxi_ats_init(uct_cxi_md_t *md)
 /* ATS mem_reg: a handle with iova_offset = ats_md->iova. */
 static ucs_status_t
 uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
-                       const uct_md_mem_reg_params_t *params,
-                       uct_mem_h *memh_p)
+                       const uct_md_mem_reg_params_t *params, uct_mem_h *memh_p)
 {
-    uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
-    ucs_memory_type_t     mem_type;
+    uct_cxi_md_t *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    ucs_memory_type_t mem_type;
     uct_cxi_mem_handle_t *mh;
 
     mem_type = UCT_MD_MEM_REG_FIELD_VALUE(params, mem_type, FIELD_MEM_TYPE,
@@ -838,10 +811,9 @@ uct_cxi_md_mem_ats_reg(uct_md_h mdh, void *address, size_t length,
 
 /* ATS mem_dereg: free the per-registration handle (no cxil_unmap needed). */
 static ucs_status_t
-uct_cxi_md_mem_ats_dereg(uct_md_h mdh,
-                         const uct_md_mem_dereg_params_t *params)
+uct_cxi_md_mem_ats_dereg(uct_md_h mdh, const uct_md_mem_dereg_params_t *params)
 {
-    uct_cxi_md_t         *md = ucs_derived_of(mdh, uct_cxi_md_t);
+    uct_cxi_md_t *md = ucs_derived_of(mdh, uct_cxi_md_t);
     uct_cxi_mem_handle_t *mh;
 
     UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
@@ -857,90 +829,67 @@ uct_cxi_md_mem_ats_dereg(uct_md_h mdh,
     return UCS_OK;
 }
 
-/* ATS mkey_pack: same formula as pinned, with iova_offset = ats_md->iova. */
-static ucs_status_t
-uct_cxi_md_mkey_pack_ats(uct_md_h mdh, uct_mem_h memh, void *address,
-                         size_t length,
-                         const uct_md_mkey_pack_params_t *params,
-                         void *mkey_buffer)
-{
-    uct_cxi_mem_handle_t *mh   = memh;
-    uct_cxi_rkey_t       *rkey = mkey_buffer;
-
-    rkey->iova          = mh->iova_offset;  /* = ats_md->iova */
-    rkey->lac           = mh->cxi_md->lac;
-    rkey->is_rndv       = 0; /* see uct_cxi_md_mkey_pack()'s own comment */
-    rkey->rendezvous_id = 0;
-
-    ucs_debug("cxi ATS mkey pack iova_offset 0x%"PRIx64" lac %u",
-              rkey->iova, (unsigned)rkey->lac);
-    return UCS_OK;
-}
-
-
-/* -------------------------------------------------------------------------
- * ops table and md_open — after all static functions they reference
- * -------------------------------------------------------------------------
- */
+#define UCT_CXI_MD_UNSUPPORTED(_type) \
+    ((_type)ucs_empty_function_return_unsupported)
 
 static uct_md_ops_t uct_cxi_md_ops = {
     .close              = uct_cxi_md_close,
     .query              = uct_cxi_md_query,
-    .mem_alloc          = (uct_md_mem_alloc_func_t)ucs_empty_function_return_unsupported,
-    .mem_free           = (uct_md_mem_free_func_t)ucs_empty_function_return_unsupported,
-    .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+    .mem_alloc          = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_alloc_func_t),
+    .mem_free           = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_free_func_t),
+    .mem_advise         = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_advise_func_t),
     .mem_reg            = uct_cxi_md_mem_reg,
     .mem_dereg          = uct_cxi_md_mem_dereg,
     .mem_query          = uct_cxi_md_mem_query,
     .mkey_pack          = uct_cxi_md_mkey_pack,
-    .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+    .mem_attach         = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_attach_func_t),
     .detect_memory_type = uct_cxi_md_detect_memory_type
 };
 
-/* ATS variant — mem_reg/mem_dereg are no-ops; mkey_pack uses VA arithmetic. */
+/* ATS variant: mem_reg/mem_dereg only wrap the shared mapping. */
 static uct_md_ops_t uct_cxi_md_ats_ops = {
     .close              = uct_cxi_md_close,
     .query              = uct_cxi_md_query,
-    .mem_alloc          = (uct_md_mem_alloc_func_t)ucs_empty_function_return_unsupported,
-    .mem_free           = (uct_md_mem_free_func_t)ucs_empty_function_return_unsupported,
-    .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+    .mem_alloc          = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_alloc_func_t),
+    .mem_free           = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_free_func_t),
+    .mem_advise         = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_advise_func_t),
     .mem_reg            = uct_cxi_md_mem_ats_reg,
     .mem_dereg          = uct_cxi_md_mem_ats_dereg,
     .mem_query          = uct_cxi_md_mem_query,
-    .mkey_pack          = uct_cxi_md_mkey_pack_ats,
-    .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+    .mkey_pack          = uct_cxi_md_mkey_pack,
+    .mem_attach         = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_attach_func_t),
     .detect_memory_type = uct_cxi_md_detect_memory_type
 };
 
-/* Registration-cached variant — identical except for mem_reg / mem_dereg. */
+/* Registration-cached variant, identical except for mem_reg/mem_dereg. */
 static uct_md_ops_t uct_cxi_md_rcache_ops = {
     .close              = uct_cxi_md_close,
     .query              = uct_cxi_md_query,
-    .mem_alloc          = (uct_md_mem_alloc_func_t)ucs_empty_function_return_unsupported,
-    .mem_free           = (uct_md_mem_free_func_t)ucs_empty_function_return_unsupported,
-    .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+    .mem_alloc          = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_alloc_func_t),
+    .mem_free           = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_free_func_t),
+    .mem_advise         = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_advise_func_t),
     .mem_reg            = uct_cxi_md_mem_rcache_reg,
     .mem_dereg          = uct_cxi_md_mem_rcache_dereg,
     .mem_query          = uct_cxi_md_mem_query,
     .mkey_pack          = uct_cxi_md_mkey_pack,
-    .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+    .mem_attach         = UCT_CXI_MD_UNSUPPORTED(uct_md_mem_attach_func_t),
     .detect_memory_type = uct_cxi_md_detect_memory_type
 };
 
-ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
-                             const uct_md_config_t *md_config, uct_md_h *md_p)
+static ucs_status_t
+uct_cxi_md_open(uct_component_h component, const char *md_name,
+                const uct_md_config_t *md_config, uct_md_h *md_p)
 {
     const uct_cxi_md_config_t *cfg = ucs_derived_of(md_config,
                                                     uct_cxi_md_config_t);
-    struct cxi_svc_desc  svc_desc = {};
-    ucs_rcache_params_t  rcache_params;
-    uct_cxi_md_t        *md;
-    uint32_t             nid    = 0;
-    uint32_t             dev_id = 0;
-    int                  svc_id;
-    uint16_t             vni;
-    int                  ret;
-    ucs_status_t         status;
+    struct cxi_svc_desc svc_desc   = {};
+    ucs_rcache_params_t rcache_params;
+    uct_cxi_md_t *md;
+    uint32_t dev_id;
+    int svc_id;
+    uint16_t vni;
+    int ret;
+    ucs_status_t status;
 
     /* Translate "cxiN" name to numeric device index. */
     ret = uct_cxi_devname_to_id(md_name);
@@ -951,21 +900,19 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
 
     dev_id = (uint32_t)ret;
 
-    md = ucs_malloc(sizeof(*md), "uct_cxi_md");
+    md = ucs_calloc(1, sizeof(*md), "uct_cxi_md");
     if (md == NULL) {
         return UCS_ERR_NO_MEMORY;
     }
 
-    /* Open the CXI device.  cxil_open_device takes the numeric device ID. */
+    /* Open the CXI device; cxil_open_device takes the numeric device ID. */
     ret = cxil_open_device(dev_id, &md->cxi_dev);
     if (ret != 0) {
-        ucs_error("cxil_open_device dev_id %u failed: %s",
-                  dev_id, strerror(-ret));
+        ucs_error("cxil_open_device dev_id %u failed: %s", dev_id,
+                  strerror(-ret));
         status = UCS_ERR_NO_DEVICE;
         goto err_free_md;
     }
-
-    nid = md->cxi_dev->info.nid;
 
     /* Service ID and VNI: launcher variables, else membership discovery. */
     status = uct_cxi_get_rgroup_vni(md->cxi_dev, dev_id, &svc_id, &vni);
@@ -973,18 +920,19 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
         ucs_error("cxi no usable service found for device %s (dev_id %u): "
                   "checked SLINGSHOT_SVC_IDS/SLINGSHOT_DEVICES/"
                   "SLINGSHOT_VNIS and pre-configured service membership "
-                  "(uid/gid/unrestricted)", md_name, dev_id);
+                  "(uid/gid/unrestricted)",
+                  md_name, dev_id);
         goto err_close_dev;
     }
 
-    ucs_debug("cxi opening device %s dev_id %u svc_id %d vni %u",
-              md_name, dev_id, svc_id, (unsigned)vni);
+    ucs_debug("cxi opening device %s dev_id %u svc_id %d vni %u", md_name,
+              dev_id, svc_id, (unsigned)vni);
 
     /* Fail fast on an unknown or disabled service rather than on alloc_lni. */
     ret = cxil_get_svc(md->cxi_dev, (unsigned)svc_id, &svc_desc);
     if (ret != 0) {
-        ucs_error("cxil_get_svc dev %s svc_id %d failed: %s",
-                  md_name, svc_id, strerror(-ret));
+        ucs_error("cxil_get_svc dev %s svc_id %d failed: %s", md_name, svc_id,
+                  strerror(-ret));
         status = UCS_ERR_NO_DEVICE;
         goto err_close_dev;
     }
@@ -997,17 +945,18 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     }
 
     /* The LNI is the authorization gate: EKEYREVOKED if the credential is
-         * missing or mismatched. */
+     * missing or mismatched. */
     ret = cxil_alloc_lni(md->cxi_dev, &md->cxi_lni, (unsigned)svc_id);
     if (ret != 0) {
-        ucs_error("cxil_alloc_lni dev %s svc_id %d failed: %s",
-                  md_name, svc_id, strerror(-ret));
+        ucs_error("cxil_alloc_lni dev %s svc_id %d failed: %s", md_name, svc_id,
+                  strerror(-ret));
         status = UCS_ERR_IO_ERROR;
         goto err_close_dev;
     }
 
     /* Fill UCT MD fields. */
-    status = uct_cxi_device_init(&md->device, md_name, dev_id, nid);
+    status = uct_cxi_device_init(&md->device, md_name, dev_id,
+                                 md->cxi_dev->info.nid);
     if (status != UCS_OK) {
         goto err_destroy_lni;
     }
@@ -1018,12 +967,10 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
     md->svc_id          = (uint32_t)svc_id;
     md->vni             = vni;
     md->pid_bits        = (uint8_t)md->cxi_dev->info.pid_bits;
-    md->rcache          = NULL;
-    md->ats_md          = NULL;
     md->dmabuf_enabled  = (cfg->enable_dmabuf != UCS_NO);
 
     /* ATS replaces per-buffer pinning and takes priority over the rcache. Set
-         * up before uct_md_vfs_init, destroyed before the LNI. */
+     * up before uct_md_vfs_init, destroyed before the LNI. */
     if (cfg->enable_ats != UCS_NO) {
         if (uct_cxi_ats_check(md->cxi_lni)) {
             status = uct_cxi_ats_init(md);
@@ -1049,7 +996,7 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
 
     /* The rcache avoids repeated map/unmap of overlapping ranges (not with
      * ATS). Create before uct_md_vfs_init, destroy before the LNI. */
-    if (md->ats_md == NULL && cfg->enable_rcache != UCS_NO) {
+    if ((md->ats_md == NULL) && (cfg->enable_rcache != UCS_NO)) {
         ucs_rcache_set_params(&rcache_params, &cfg->rcache);
         rcache_params.region_struct_size = sizeof(uct_cxi_rcache_region_t);
         rcache_params.ucm_events         = UCM_EVENT_VM_UNMAPPED;
@@ -1065,8 +1012,8 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
         } else {
             ucs_assert(md->rcache == NULL);
             if (cfg->enable_rcache == UCS_YES) {
-                ucs_error("cxi failed to create rcache for %s: %s",
-                          md_name, ucs_status_string(status));
+                ucs_error("cxi failed to create rcache for %s: %s", md_name,
+                          ucs_status_string(status));
                 status = UCS_ERR_IO_ERROR;
                 goto err_destroy_lni;
             }
@@ -1080,10 +1027,9 @@ ucs_status_t uct_cxi_md_open(uct_component_h component, const char *md_name,
 
     ucs_debug("cxi md open device %s nid 0x%x svc_id %u vni %u lni_id %u "
               "ats %s rcache %s",
-              md->device.name, nid, md->svc_id, (unsigned)md->vni,
-              md->cxi_lni->id,
-              md->ats_md  != NULL ? "enabled" : "disabled",
-              md->rcache  != NULL ? "enabled" : "disabled");
+              md->device.name, md->device.nid, md->svc_id, (unsigned)md->vni,
+              md->cxi_lni->id, (md->ats_md != NULL) ? "enabled" : "disabled",
+              (md->rcache != NULL) ? "enabled" : "disabled");
 
     *md_p = &md->super;
     return UCS_OK;
@@ -1094,27 +1040,20 @@ err_destroy_lni:
         ucs_warn("cxil_destroy_lni failed during md_open cleanup: %s",
                  strerror(-ret));
     }
-
 err_close_dev:
     cxil_close_device(md->cxi_dev);
-
 err_free_md:
     ucs_free(md);
     return status;
 }
 
-
-/* -------------------------------------------------------------------------
- * component registration
- * -------------------------------------------------------------------------
- */
-
+/* clang-format off */
 uct_component_t uct_cxi_component = {
     .query_md_resources = uct_cxi_query_md_resources,
     .md_open            = uct_cxi_md_open,
-    .cm_open            = (uct_component_cm_open_func_t)ucs_empty_function_return_unsupported,
+    .cm_open            = UCT_CXI_MD_UNSUPPORTED(uct_component_cm_open_func_t),
     .rkey_unpack        = uct_cxi_rkey_unpack,
-    .rkey_ptr           = (uct_component_rkey_ptr_func_t)ucs_empty_function_return_unsupported,
+    .rkey_ptr           = UCT_CXI_MD_UNSUPPORTED(uct_component_rkey_ptr_func_t),
     .rkey_release       = uct_cxi_rkey_release,
     .rkey_compare       = uct_base_rkey_compare,
     .name               = "cxi",
@@ -1126,6 +1065,6 @@ uct_component_t uct_cxi_component = {
     },
     .cm_config          = UCS_CONFIG_EMPTY_GLOBAL_LIST_ENTRY,
     .tl_list            = UCT_COMPONENT_TL_LIST_INITIALIZER(&uct_cxi_component),
-    .flags              = 0,
     .md_vfs_init        = (uct_component_md_vfs_init_func_t)ucs_empty_function
 };
+/* clang-format on */
