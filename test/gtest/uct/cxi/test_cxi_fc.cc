@@ -784,7 +784,7 @@ class test_cxi_fc_bytes : public test_cxi_fc_credits {
 public:
     void init() override
     {
-        modify_config("CXI_FC_BYTE_WINDOW", "32k");
+        modify_config("CXI_FC_BYTE_WINDOW", "96k");
         m_received = 0;
         test_cxi_rma_base::init();
     }
@@ -798,14 +798,14 @@ UCS_TEST_P(test_cxi_fc_bytes, byte_credits_limit_large_sends)
     const size_t len      = sender().iface_attr().cap.am.max_zcopy;
     unsigned     received = 0;
 
-    ASSERT_EQ(8192u, len);
+    ASSERT_EQ(24576u, len);
     ASSERT_UCS_OK(uct_iface_set_am_handler(receiver().iface(), 1,
                                            count_am_handler, &received, 0));
     cxi_connect(sender(), 0, receiver());
     uct_ep_h        ep   = sender().ep(0);
     uct_cxi_peer_t *peer = peer_of(sender(), 0);
 
-    ASSERT_EQ(32u * 1024 / UCT_CXI_FC_UNIT, (unsigned)peer->tx.avail_units[UCT_CXI_FC_AM]);
+    ASSERT_EQ(96u * 1024 / UCT_CXI_FC_UNIT, (unsigned)peer->tx.avail_units[UCT_CXI_FC_AM]);
 
     std::vector<uint8_t> buf(len, 0x5A);
     uct_mem_h            memh = reg(sender(), buf.data(), len);
@@ -928,7 +928,9 @@ public:
 
         modify_config("CXI_AM_MAX_ZCOPY", "128k");
         m_entities.push_back(uct_test::create_entity(0)); /* sender   */
+        /* The eager tag size raises the AM size to at least itself. */
         modify_config("CXI_AM_MAX_ZCOPY", "8k");
+        modify_config("CXI_TAG_EAGER_MAX", "8k");
         m_entities.push_back(uct_test::create_entity(0)); /* receiver */
     }
 };

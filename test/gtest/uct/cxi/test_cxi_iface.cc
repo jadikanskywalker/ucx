@@ -272,30 +272,30 @@ protected:
 
 /**
  * By default the ring and the RX EQ are sized for 8 peers at their full
- * window (512 messages, 1 MiB), and the advertised AM size is the IB RC one --
- * whether flow control is on or not, so that the two are compared with the
- * same buffers (see test_cxi_iface_no_fc).
+ * window (512 messages, 1 MiB), and the advertised AM and eager tag sizes are
+ * 24 KiB -- whether flow control is on or not, so that the two are compared
+ * with the same buffers (see test_cxi_iface_no_fc).
  */
 void check_default_sizes()
 {
     uct_cxi_iface_t *iface = cxi_iface();
 
-    EXPECT_EQ(8192u, iface->am.max_zcopy);
-    EXPECT_EQ(8192u, iface->am.max_msg);
-    EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
+    EXPECT_EQ(24576u, iface->am.max_zcopy);
+    EXPECT_EQ(24576u, iface->am.max_msg);
+    EXPECT_EQ(24576u, get_entity().iface_attr().cap.am.max_zcopy);
 
     /* 8 x 1 MiB outstanding, 1 MiB buffers of which at least
-     * 1 MiB - 8 - 8 KiB are used before one is retired: 8 of them, and 2. */
+     * 1 MiB - 8 - 24 KiB are used before one is retired: 8 of them, and 2. */
     EXPECT_EQ(1024u * 1024, iface->am.buf_size);
     EXPECT_EQ(10u, iface->am.num_bufs);
 
     /* The tag overflow ring: 8 x 512 KiB outstanding, 1 MiB buffers of which
-     * at least 1 MiB - 256 KiB are used before one is retired: 5, and 2, so no
+     * at least 1 MiB - 24 KiB are used before one is retired: 4, and 2, so no
      * larger than the AM ring. Advertised sizes do not follow the ring. */
     ASSERT_NE(nullptr, iface->tag.pte);
-    EXPECT_EQ(256u * 1024, iface->tag.max_msg);
+    EXPECT_EQ(24u * 1024, iface->tag.max_msg);
     EXPECT_EQ(1024u * 1024, iface->tag.buf_size);
-    EXPECT_EQ(7u, iface->tag.num_bufs);
+    EXPECT_EQ(6u, iface->tag.num_bufs);
     EXPECT_LE(iface->tag.num_bufs * iface->tag.buf_size,
               iface->am.num_bufs * iface->am.buf_size);
     EXPECT_EQ((size_t)UINT32_MAX,
@@ -332,7 +332,7 @@ UCS_TEST_P(test_cxi_iface_16_senders, sized_for_more_senders)
     EXPECT_EQ(1024u * 1024, iface->am.buf_size);
     EXPECT_EQ(18u, iface->am.num_bufs);
     EXPECT_EQ(1024u * 1024, iface->tag.buf_size);
-    EXPECT_EQ(12u, iface->tag.num_bufs); /* 8 MiB / 768 KiB, and 2 */
+    EXPECT_EQ(10u, iface->tag.num_bufs); /* 8 MiB / 1000 KiB, and 2 */
     EXPECT_EQ(16u * 512, iface->tag.unexp_max);
     EXPECT_EQ(16u * 512 + 512 * 3 + 64 + 128, iface->rx_eq.num_events);
 }
@@ -410,11 +410,34 @@ UCS_TEST_P(test_cxi_iface_big_buffers, buffer_size_is_not_message_size)
     uct_cxi_iface_t *iface = cxi_iface();
 
     EXPECT_EQ(2u * 1024 * 1024, iface->am.buf_size);
-    EXPECT_EQ(8192u, get_entity().iface_attr().cap.am.max_zcopy);
+    EXPECT_EQ(24576u, get_entity().iface_attr().cap.am.max_zcopy);
     EXPECT_EQ(1024u * 1024 / UCT_CXI_FC_UNIT, iface->fc.unit_window[UCT_CXI_FC_AM]);
 }
 
 #endif /* UCT_CXI_DISABLE_FC */
+
+/**
+ * UCP copies an unexpected eager tag message into a buffer sized for the
+ * largest AM, so the advertised AM size must cover the eager tag size even when
+ * TAG_EAGER_MAX is set above AM_MAX_ZCOPY.
+ */
+class test_cxi_iface_tag_eager_above_am : public test_cxi_iface_sized {
+protected:
+    void configure() override
+    {
+        modify_config("CXI_TAG_EAGER_MAX", "64k");
+    }
+};
+
+UCS_TEST_P(test_cxi_iface_tag_eager_above_am, am_covers_tag_eager)
+{
+    uct_cxi_iface_t *iface = cxi_iface();
+    uct_iface_attr_t attr  = get_entity().iface_attr();
+
+    EXPECT_EQ(64u * 1024, attr.cap.tag.eager.max_zcopy);
+    EXPECT_EQ(64u * 1024, attr.cap.am.max_zcopy);
+    EXPECT_EQ(64u * 1024, iface->am.max_msg);
+}
 
 /** Without flow control the buffers are the same as with it: the windows still
  * say what they are sized for, so a comparison of the two is of the credit
@@ -443,3 +466,4 @@ _UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_too_small, cxi)
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_big_buffers, cxi)
 #endif
 _UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_no_fc, cxi)
+_UCT_INSTANTIATE_TEST_CASE(test_cxi_iface_tag_eager_above_am, cxi)

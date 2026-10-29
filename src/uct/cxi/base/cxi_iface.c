@@ -179,11 +179,13 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, am_rx_buf_size),
      UCS_CONFIG_TYPE_MEMUNITS},
 
-    {"AM_MAX_ZCOPY", "8k",
+    {"AM_MAX_ZCOPY", "24k",
      "Largest AM zcopy header + payload in bytes, as advertised to the\n"
      "upper layer. Together with MAX_BCOPY it sets the largest message the\n"
-     "AM receive buffers must take. The default matches the IB RC segment\n"
-     "size; larger messages use rendezvous. At most 16 MiB - 1.",
+     "AM receive buffers must take. Raised to TAG_EAGER_MAX if smaller with\n"
+     "tag offload: UCP copies an unexpected eager message into a buffer\n"
+     "sized for the largest AM. Larger messages use rendezvous. At most\n"
+     "16 MiB - 1.",
      ucs_offsetof(uct_cxi_iface_config_t, am_max_zcopy),
      UCS_CONFIG_TYPE_MEMUNITS},
 
@@ -212,13 +214,13 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      ucs_offsetof(uct_cxi_iface_config_t, tag_ovf_buf_size),
      UCS_CONFIG_TYPE_MEMUNITS},
 
-    {"TAG_EAGER_MAX", "256k",
+    {"TAG_EAGER_MAX", "24k",
      "Maximum eager tag message in bytes, as advertised (bcopy is also\n"
      "limited by MAX_BCOPY). Larger messages use rendezvous. The default is\n"
-     "the most UCP sends eagerly unless told to (UCX_RNDV_SEND_NBR_THRESH).\n"
-     "Also the overflow buffers' min_free, so that any message fits in what\n"
-     "is left of a linked buffer, and half their minimum size. Peers must\n"
-     "use the same value.",
+     "about the most UCP sends eagerly. The advertised AM size is raised to\n"
+     "at least this (see AM_MAX_ZCOPY). Also the overflow buffers' min_free,\n"
+     "so that any message fits in what is left of a linked buffer, and half\n"
+     "their minimum size. Peers must use the same value.",
      ucs_offsetof(uct_cxi_iface_config_t, tag_eager_max),
      UCS_CONFIG_TYPE_MEMUNITS},
 
@@ -265,10 +267,10 @@ static ucs_config_field_t uct_cxi_iface_config_table[] = {
      "Tag matching buffer credits granted to each peer: how many bytes one\n"
      "peer may have outstanding in this interface's tag overflow buffers at\n"
      "a time (counted in 64-byte units). Must be at least TAG_EAGER_MAX. The\n"
-     "default is two maximum-size messages: a message that matches a posted\n"
-     "receive is charged only until its ACK, so this is ample for bandwidth,\n"
-     "and it keeps the overflow ring no larger than the AM ring. Without flow\n"
-     "control it is the load the overflow ring is sized for.",
+     "default holds many maximum-size messages: a message that matches a\n"
+     "posted receive is charged only until its ACK, so this is ample for\n"
+     "bandwidth, and it keeps the overflow ring no larger than the AM ring.\n"
+     "Without flow control it is the load the overflow ring is sized for.",
      ucs_offsetof(uct_cxi_iface_config_t, fc_tag_byte_window),
      UCS_CONFIG_TYPE_MEMUNITS},
 
@@ -732,12 +734,16 @@ ucs_status_t uct_cxi_query_devices(uct_md_h md,
     return UCS_OK;
 }
 
-/* The largest AM we advertise (AM_MAX_ZCOPY), and the largest message of any
- * kind a receive buffer must hold (its min_free). */
+/* The largest AM we advertise (AM_MAX_ZCOPY, but at least \a tag_max_msg: UCP
+ * copies an unexpected eager message into a buffer sized for the largest AM),
+ * and the largest message of any kind a receive buffer must hold (its
+ * min_free). */
 static void uct_cxi_iface_set_am_limits(uct_cxi_iface_t *self,
-                                        const uct_cxi_iface_config_t *config)
+                                        const uct_cxi_iface_config_t *config,
+                                        size_t tag_max_msg)
 {
-    size_t max_msg = ucs_max(config->am_max_zcopy, config->max_bcopy);
+    size_t max_zcopy = ucs_max(config->am_max_zcopy, tag_max_msg);
+    size_t max_msg   = ucs_max(max_zcopy, config->max_bcopy);
 
     if (max_msg > UCT_CXI_AM_MAX_MSG_LIMIT) {
         ucs_warn("cxi AM_MAX_ZCOPY=%zu / MAX_BCOPY=%zu exceed the %u bytes "
@@ -747,7 +753,7 @@ static void uct_cxi_iface_set_am_limits(uct_cxi_iface_t *self,
         max_msg = UCT_CXI_AM_MAX_MSG_LIMIT;
     }
 
-    self->am.max_zcopy = ucs_min(config->am_max_zcopy, max_msg);
+    self->am.max_zcopy = ucs_min(max_zcopy, max_msg);
     self->am.max_msg   = max_msg;
 }
 
@@ -922,6 +928,7 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
     size_t                     byte_credits = 0;
     size_t                     tag_byte_credits = 0;
     size_t                     tag_receives = 0;
+    size_t                     tag_max_msg;
     uint32_t                   slot_window  = 0;
     uint32_t                   unit_window[UCT_CXI_FC_NUM_CLASSES] = {};
     unsigned                   active_senders;
@@ -945,14 +952,14 @@ UCS_CLASS_INIT_FUNC(uct_cxi_iface_t, uct_md_h md, uct_worker_h worker,
      * a pool cap becomes half the default RX depth, EQ_SIZE and TX_EQ_SIZE
      * UCT_CXI_EQ_NUM_EVENTS; an explicit value is used exactly. TX_EQ_SIZE
      * also caps the sends in flight (tx.max_inflight). */
-    uct_cxi_iface_set_am_limits(self, config);
+    tag_max_msg = uct_cxi_iface_tag_requested(config, params) ?
+                          uct_cxi_tag_max_msg(config) : 0;
+    uct_cxi_iface_set_am_limits(self, config, tag_max_msg);
     /* Rings and RX EQ are sized for the peers' windows with flow control on or
      * off, so the two compare the credit scheme alone. */
     active_senders = ucs_max(config->fc_active_senders, 1u);
-    uct_cxi_fc_windows(config, self->am.max_msg,
-                       uct_cxi_iface_tag_requested(config, params) ?
-                               uct_cxi_tag_max_msg(config) : 0,
-                       &slot_window, unit_window);
+    uct_cxi_fc_windows(config, self->am.max_msg, tag_max_msg, &slot_window,
+                       unit_window);
     msg_credits      = (size_t)active_senders * slot_window;
     byte_credits     = (size_t)active_senders * unit_window[UCT_CXI_FC_AM] *
                        UCT_CXI_FC_UNIT;

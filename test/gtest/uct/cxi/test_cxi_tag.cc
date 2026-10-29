@@ -297,8 +297,7 @@ UCS_TEST_P(test_cxi_tag, tag_eager_short_tracked_until_ack)
  *
  * eager_cb is handed each payload where it sits in the ring (no staging
  * copy), so every message must still arrive intact and with its own tag and
- * immediate even though later arrivals are landing next to it, and the large
- * ones push the ring through buffer rotations (auto-unlink and repost).
+ * immediate even though later arrivals are landing next to it.
  */
 UCS_TEST_P(test_cxi_tag, unexpected_burst_sizes)
 {
@@ -306,7 +305,9 @@ UCS_TEST_P(test_cxi_tag, unexpected_burst_sizes)
     /* bcopy is limited to the bounce buffer size, zcopy goes up to the eager
      * limit. */
     static const size_t    BCOPY_SIZES[] = {1, 100, 1024, 8192};
-    static const size_t    ZCOPY_SIZES[] = {100 * 1024, 250 * 1024};
+    const size_t           max_zcopy =
+            sender().iface_attr().cap.tag.eager.max_zcopy;
+    const size_t           ZCOPY_SIZES[] = {max_zcopy / 2, max_zcopy};
 
     struct sent_msg {
         uct_tag_t            tag;
