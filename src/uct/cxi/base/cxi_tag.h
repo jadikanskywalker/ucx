@@ -184,9 +184,9 @@ typedef struct uct_cxi_rdzv_get_op {
  * and UCP guarantees it is not completed yet (as rc_mlx5's implementation). */
 
 
-/* PTE lifecycle, called from iface open and close. open_tag_pte is a no-op
- * (tag.pte stays NULL) without both HW_TM callbacks or with
- * UCX_CXI_TAG_ENABLE=no: UCP then matches in software over AM. */
+/* PTE lifecycle, called from iface open and close.
+ * open_tag_pte is a no-op (tag.pte stays NULL) without both HW_TM callbacks or
+ * with UCX_CXI_TAG_ENABLE=no: UCP then matches in software over AM. */
 ucs_status_t uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self,
                                          struct cxil_lni *lni,
                                          const uct_cxi_iface_config_t *config,

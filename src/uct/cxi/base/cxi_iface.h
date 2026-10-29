@@ -495,8 +495,6 @@ struct uct_cxi_iface {
         /* Largest message that can land in a buffer: max(max_zcopy,
          * max_bcopy) */
         size_t               max_msg;
-        /* Messages received */
-        uint32_t             rx_total;
         uct_cxi_pte_fc_t     fc;
     } am;
 
@@ -544,6 +542,9 @@ void uct_cxi_tx_emit_failed(const void *obj, const char *what, int ret);
 ucs_status_t
 uct_cxi_iface_tgt_post_wait(uct_cxi_iface_t *iface, const void *cmd, int ret);
 
+/** Pool ops for objects only software reads: the NIC never DMAs into them. */
+extern ucs_mpool_ops_t uct_cxi_host_mpool_ops;
+
 /** Enable \a pte and wait for its STATE_CHANGE on \a eq; fails on a timeout. */
 ucs_status_t uct_cxi_iface_pte_enable(uct_cxi_iface_t *iface,
                                       struct cxil_pte *pte, uct_cxi_eq_t *eq);
@@ -590,6 +591,32 @@ uct_cxi_iface_tgt_post(uct_cxi_iface_t *iface, const void *cmd)
     }
 
     return uct_cxi_iface_tgt_post_wait(iface, cmd, ret);
+}
+
+/**
+ * Fill what the AM and tag overflow ring LEs share: Put-only, the NIC advances
+ * start per message (manage_local, with the relaxed ordering it requires), no
+ * link or unlink events since the last PUT carries auto_unlinked, and oversized
+ * messages are rejected rather than truncated.
+ */
+static UCS_F_ALWAYS_INLINE void
+uct_cxi_ring_le_init(struct c_target_cmd *le, const struct cxil_pte *pte,
+                     enum c_ptl_list ptl_list, int buf_idx, int restart_seq)
+{
+    le->command.opcode       = C_CMD_TGT_APPEND;
+    le->ptl_list             = ptl_list;
+    le->ptlte_index          = pte->ptn;
+    le->op_put               = 1;
+    le->manage_local         = 1;
+    le->unrestricted_body_ro = 1;
+    le->unrestricted_end_ro  = 1;
+    le->event_link_disable   = 1;
+    le->event_unlink_disable = 1;
+    le->no_truncate          = 1;
+    le->restart_seq          = restart_seq;
+    le->match_id             = CXI_MATCH_ID_ANY;
+    le->buffer_id            = (uint16_t)buf_idx;
+    le->ignore_bits          = UINT64_MAX;
 }
 
 UCS_CLASS_DECLARE(uct_cxi_iface_t, uct_md_h, uct_worker_h,

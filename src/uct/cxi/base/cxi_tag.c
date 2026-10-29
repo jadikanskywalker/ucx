@@ -50,41 +50,23 @@ uct_cxi_tag_ep_iface(uct_cxi_ep_t *ep)
     return ucs_derived_of(ep->super.super.iface, uct_cxi_iface_t);
 }
 
-/* Plain host-memory pools -- the NIC never DMAs into or out of these
- * (software-Get tracking), so no registration is needed. */
-static ucs_mpool_ops_t uct_cxi_tag_host_mpool_ops = {
-    .chunk_alloc   = ucs_mpool_chunk_malloc,
-    .chunk_release = ucs_mpool_chunk_free,
-    .obj_init      = NULL,
-    .obj_cleanup   = NULL,
-    .obj_str       = NULL
-};
-
-
-/* -------------------------------------------------------------------------
- * PTE lifecycle
- * -------------------------------------------------------------------------
- */
 
 /*
- * Allocate the entries that hold unexpected messages until they are reported
- * (uct_cxi_unexp_report_t): one registered array of tag.unexp_max, the most the
- * credits let senders have outstanding (or tag.max_outstanding if more).
- * Registered because each entry is also the landing buffer of its address read
- * (LAC 0: the senders' RMA PTEs reach only that). Plus the streams (at most one
- * per entry) and the table to find them, sized so it never grows (khash can
- * still rehash when deleted keys pile up; a failed put is reported as a stream
- * that could not be made).
+ * Allocate the unexpected-message entries (uct_cxi_unexp_report_t): a
+ * registered array of tag.unexp_max, as each entry is also the landing buffer
+ * of its address read (LAC 0). Plus the streams (at most one per entry) and the
+ * table to find them, sized so it never grows.
  */
 static ucs_status_t
 uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
-    size_t       page = ucs_get_page_size();
-    size_t       len  = ucs_align_up(self->tag.unexp_max *
-                                     sizeof(uct_cxi_unexp_report_t), page);
+    size_t page = ucs_get_page_size();
+    size_t len  = ucs_align_up(self->tag.unexp_max *
+                                       sizeof(uct_cxi_unexp_report_t),
+                               page);
     ucs_status_t status;
-    unsigned     i;
-    int          ret;
+    unsigned i;
+    int ret;
 
     /* The fields that are looked at along a stream's chain share the first
      * cache line. */
@@ -94,13 +76,6 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
     kh_init_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
     ucs_list_head_init(&self->tag.unexp_wait);
     ucs_list_head_init(&self->tag.unexp_live);
-    self->tag.unexp_held        = 0;
-    self->tag.unexp_seq         = 0;
-    self->tag.unexp_ents        = NULL;
-    self->tag.unexp_free        = NULL;
-    self->tag.unexp_ents_len    = 0;
-    self->tag.unexp_stream_pool = NULL;
-    self->tag.unexp_stream_free = NULL;
 
     self->tag.unexp_stream_pool = ucs_calloc(self->tag.unexp_max,
                                              sizeof(uct_cxi_unexp_stream_t),
@@ -109,10 +84,9 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
         status = UCS_ERR_NO_MEMORY;
         goto err_streams;
     }
-    for (i = 0; i < self->tag.unexp_max; i++) {
+    for (i = 0; i + 1 < self->tag.unexp_max; i++) {
         self->tag.unexp_stream_pool[i].next_free =
-                (i + 1 < self->tag.unexp_max) ?
-                &self->tag.unexp_stream_pool[i + 1] : NULL;
+                &self->tag.unexp_stream_pool[i + 1];
     }
     self->tag.unexp_stream_free = &self->tag.unexp_stream_pool[0];
     if (kh_resize(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams,
@@ -121,7 +95,7 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
         goto err_streams;
     }
 
-    ret = ucs_posix_memalign((void **)&self->tag.unexp_ents, page, len,
+    ret = ucs_posix_memalign((void**)&self->tag.unexp_ents, page, len,
                              "cxi-tag-unexp-reports");
     if (ret != 0) {
         self->tag.unexp_ents = NULL;
@@ -146,10 +120,8 @@ uct_cxi_iface_tag_unexp_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
     }
 
     self->tag.unexp_ents_len = len;
-    for (i = 0; i < self->tag.unexp_max; i++) {
-        self->tag.unexp_ents[i].next_free =
-                (i + 1 < self->tag.unexp_max) ?
-                &self->tag.unexp_ents[i + 1] : NULL;
+    for (i = 0; i + 1 < self->tag.unexp_max; i++) {
+        self->tag.unexp_ents[i].next_free = &self->tag.unexp_ents[i + 1];
     }
     self->tag.unexp_free = &self->tag.unexp_ents[0];
     return UCS_OK;
@@ -159,7 +131,6 @@ err_free:
     self->tag.unexp_ents = NULL;
 err_streams:
     ucs_free(self->tag.unexp_stream_pool);
-    self->tag.unexp_stream_pool = NULL;
     kh_destroy_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
     return status;
 }
@@ -173,86 +144,54 @@ static void uct_cxi_iface_tag_unexp_cleanup(uct_cxi_iface_t *self)
 
     uct_cxi_do_unmap(&self->tag.unexp_ents_mh);
     ucs_free(self->tag.unexp_ents);
-    self->tag.unexp_ents     = NULL;
-    self->tag.unexp_free     = NULL;
-    self->tag.unexp_ents_len = 0;
+    self->tag.unexp_ents = NULL;
     ucs_free(self->tag.unexp_stream_pool);
-    self->tag.unexp_stream_pool = NULL;
-    self->tag.unexp_stream_free = NULL;
     kh_destroy_inplace(uct_cxi_unexp_stream_hash, &self->tag.unexp_streams);
 }
 
-/* Build tag.recv_le, the priority LE of every posted receive but for the slot,
- * buffer and tag (filled by uct_cxi_iface_tag_recv_zcopy()). Needs tag.ptn. */
+/*
+ * Build tag.recv_le, the priority LE of every posted receive but for the slot,
+ * buffer and tag (filled by uct_cxi_iface_tag_recv_zcopy()). Needs tag.ptn.
+ *
+ * manage_local is needed even for a single-message LE: Cassini then ignores the
+ * initiator's remote_offset (as libfabric). The automatic use_once unlink
+ * raises no event but the explicit UNLINK of tag_recv_cancel() does, so every
+ * priority-list C_EVENT_UNLINK confirms a cancel. Truncated delivery is allowed
+ * to report UCS_ERR_TRUNCATED.
+ */
 static void uct_cxi_iface_tag_init_recv_le(uct_cxi_iface_t *self)
 {
     struct c_target_cmd *le = &self->tag.recv_le;
 
-    le->command.opcode        = C_CMD_TGT_APPEND;
-    le->ptl_list              = C_PTL_LIST_PRIORITY;
-    le->ptlte_index           = self->tag.ptn;
-    le->op_put                = 1;
-    le->op_get                = 0;
-    le->use_once              = 1;
-    le->manage_local          = 1; /* mandatory even for a single-message LE:
-                                    * makes Cassini ignore the initiator's
-                                    * remote_offset (as libfabric) */
-    le->unexpected_hdr_disable = 0; /* no effect on priority-list APPENDs;
-                                     * left at the default */
-    le->unrestricted_body_ro  = 1;
-    le->unrestricted_end_ro   = 1;
-    le->event_link_disable    = 1; /* no append-ack needed */
-    le->event_unlink_disable  = 1; /* No event for the automatic use_once
-                                    * unlink. The explicit UNLINK of
-                                    * tag_recv_cancel() keeps its event, so
-                                    * every priority-list C_EVENT_UNLINK is a
-                                    * cancel confirmation. */
-    le->no_truncate           = 0; /* allow truncated delivery so
-                                   * UCS_ERR_TRUNCATED can be reported,
-                                   * unlike AM which rejects outright */
-    le->restart_seq           = 0;
-    le->match_id              = CXI_MATCH_ID_ANY;
+    memset(le, 0, sizeof(*le));
+    le->command.opcode       = C_CMD_TGT_APPEND;
+    le->ptl_list             = C_PTL_LIST_PRIORITY;
+    le->ptlte_index          = self->tag.ptn;
+    le->op_put               = 1;
+    le->use_once             = 1;
+    le->manage_local         = 1;
+    le->unrestricted_body_ro = 1;
+    le->unrestricted_end_ro  = 1;
+    le->event_link_disable   = 1;
+    le->event_unlink_disable = 1;
+    le->match_id             = CXI_MATCH_ID_ANY;
 }
 
-/* Append one overflow-list LE for ring buffer \a buf_idx: shaped like
- * uct_cxi_iface_post_am_le, with the flags of a real overflow list (see the
- * file header). */
+/* Append one overflow-list LE for ring buffer \a buf_idx. */
 static ucs_status_t
 uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
                               int restart_seq)
 {
+    void *buf = self->tag.rx_base + (size_t)buf_idx * self->tag.buf_size;
     struct c_target_cmd le = {};
-    ucs_status_t        status;
+    ucs_status_t status;
 
-    le.command.opcode         = C_CMD_TGT_APPEND;
-    le.ptl_list               = C_PTL_LIST_OVERFLOW;
-    le.ptlte_index            = self->tag.pte->ptn;
-    le.op_put                 = 1;
-    le.op_get                 = 0;
-    le.use_once               = 0;
-    le.manage_local           = 1;
-    le.unrestricted_body_ro   = 1;
-    le.unrestricted_end_ro    = 1;
-    le.event_link_disable     = 1;
-    le.event_unlink_disable   = 1; /* repost driven by auto_unlinked on the
-                                     * terminal C_EVENT_PUT, not this event
-                                     * -- see tag_handle_ovf_arrival() */
-    le.no_truncate            = 1; /* reject oversized unexpected messages
-                                     * rather than silently truncate */
-    le.unexpected_hdr_disable = 0; /* real overflow-list semantics -- see
-                                     * file header */
-    le.restart_seq            = restart_seq;
-    le.match_id               = CXI_MATCH_ID_ANY;
-    le.buffer_id              = (uint16_t)buf_idx;
-    le.lac                    = self->tag.rx_mh.cxi_md->lac;
-    le.start                  = self->tag.rx_mh.iova_offset +
-                                (uint64_t)(uintptr_t)(self->tag.rx_base +
-                                                       (size_t)buf_idx *
-                                                       self->tag.buf_size);
-    le.length                 = self->tag.buf_size;
-    le.min_free               = self->tag.max_msg;
-    le.ignore_bits            = UINT64_MAX;
-    le.match_bits             = 0;
+    uct_cxi_ring_le_init(&le, self->tag.pte, C_PTL_LIST_OVERFLOW, buf_idx,
+                         restart_seq);
+    le.lac      = self->tag.rx_mh.cxi_md->lac;
+    le.start    = uct_cxi_mem_iova(&self->tag.rx_mh, buf);
+    le.length   = self->tag.buf_size;
+    le.min_free = self->tag.max_msg;
 
     status = uct_cxi_iface_tgt_post(self, &le);
     if (ucs_unlikely(UCS_STATUS_IS_ERR(status))) {
@@ -260,22 +199,18 @@ uct_cxi_iface_post_tag_ovf_le(uct_cxi_iface_t *self, int buf_idx,
                   ucs_status_string(status));
         return status;
     }
-    ucs_debug("cxi TAG overflow LE APPEND buf=%d ptn=%u start=0x%lx "
-             "len=%zu restart_seq=%d", buf_idx, self->tag.pte->ptn,
-             (unsigned long)le.start, self->tag.buf_size, restart_seq);
+
+    ucs_debug("cxi TAG overflow LE APPEND buf=%d ptn=%u start=0x%lx len=%zu "
+              "restart_seq=%d",
+              buf_idx, self->tag.pte->ptn, (unsigned long)le.start,
+              self->tag.buf_size, restart_seq);
     return UCS_OK;
 }
 
 /*
- * Number and size of the overflow buffers. \a outstanding is the most bytes
- * peers may have sent and not had processed (active senders x tag byte window).
- *
- * As for the AM ring (uct_cxi_iface_size_am_ring, here without an 8-byte
- * header): messages are placed back to back and a buffer retires once less than
- * max_msg is left, so each takes at least (buf_size - max_msg) bytes. Messages
- * are processed in match order and a retired buffer is reposted after its last
- * message, so unprocessed bytes sit in the buffers after the current one. Allow
- * for those, the current buffer and one more linked:
+ * Number and size of the overflow buffers for \a outstanding bytes in flight
+ * (active senders x tag byte window). As for the AM ring, without the 8-byte
+ * header:
  *
  *    num_bufs = floor(outstanding / (buf_size - max_msg)) + 2
  */
@@ -283,9 +218,9 @@ static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
                                         const uct_cxi_iface_config_t *config,
                                         size_t outstanding)
 {
-    size_t        max_msg  = self->tag.max_msg;
-    size_t        min_size = 2 * max_msg;
-    size_t        buf_size;
+    size_t max_msg  = self->tag.max_msg;
+    size_t min_size = 2 * max_msg;
+    size_t buf_size;
     unsigned long num_bufs;
     unsigned long needed;
 
@@ -299,7 +234,8 @@ static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
     if (buf_size < min_size) {
         if (config->tag_ovf_buf_size != UCS_MEMUNITS_AUTO) {
             ucs_warn("cxi TAG_OVERFLOW_BUF_SIZE=%zu is too small for %zu-byte "
-                     "messages: using %zu", buf_size, max_msg, min_size);
+                     "messages: using %zu",
+                     buf_size, max_msg, min_size);
         }
         buf_size = min_size;
     }
@@ -313,8 +249,8 @@ static void uct_cxi_iface_size_tag_ring(uct_cxi_iface_t *self,
         if (needed > num_bufs) {
             ucs_warn("cxi TAG_OVERFLOW_NUM_BUFS=%lu is below the %lu that "
                      "FC_ACTIVE_SENDERS peers at their full window need: the "
-                     "ring can run out of buffers under load", num_bufs,
-                     needed);
+                     "ring can run out of buffers under load",
+                     num_bufs, needed);
         }
     }
 
@@ -339,7 +275,7 @@ int uct_cxi_iface_tag_requested(const uct_cxi_iface_config_t *config,
     return (config->tag_enable != UCS_NO) &&
            ucs_test_all_flags(params->field_mask,
                               UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB |
-                              UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB);
+                                      UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB);
 }
 
 size_t uct_cxi_tag_max_msg(const uct_cxi_iface_config_t *config)
@@ -353,17 +289,25 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
                            const uct_iface_params_t *params,
                            size_t slot_credits, size_t byte_credits)
 {
+    struct cxi_pt_alloc_opts pt_opts = {
+        .is_matching    = 1,
+        .use_long_event = 1,
+        .en_flowctrl    = 1
+    };
+    ucs_mpool_params_t mp_params;
     ucs_status_t status;
-    int          ret;
-    unsigned     i;
+    size_t total;
+    unsigned i;
+    int ret;
 
     memset(&self->tag, 0, sizeof(self->tag));
     self->tag.ptn = -1;
 
     if (!uct_cxi_iface_tag_requested(config, params)) {
-        /* No HW tag offload (UCP supplied no unexpected callbacks, or the
-         * operator forced it off): tag.pte stays NULL, no TAG capability is
-         * advertised and UCP matches in software over AM. Not an error. */
+        /*
+         * No HW tag offload (no unexpected callbacks from UCP, or forced off):
+         * tag.pte stays NULL and UCP matches in software over AM.
+         */
         return UCS_OK;
     }
 
@@ -372,15 +316,17 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     self->tag.rndv_cb   = params->rndv_cb;
     self->tag.rndv_arg  = params->rndv_arg;
 
-    /* UCT_CXI_TAG_MAX_OUTSTANDING_MAX leaves the two buffer_ids that
-     * SEARCH_AND_DELETE and the fences use below the hardware's real 65535
-     * ceiling. */
+    /*
+     * Leaves the two buffer_ids of SEARCH_AND_DELETE and the fences below
+     * 65535.
+     */
     self->tag.max_outstanding = ucs_min(config->tag_max_outstanding,
                                         UCT_CXI_TAG_MAX_OUTSTANDING_MAX);
 
-    /* A message fits what is left of its buffer when that is at least min_free
-     * (the largest message); a buffer of twice that holds one message before
-     * retiring, as for the AM ring. */
+    /*
+     * A buffer of twice min_free (the largest message) holds one message before
+     * retiring.
+     */
     self->tag.max_msg = uct_cxi_tag_max_msg(config);
     if (self->tag.max_msg < config->tag_eager_max) {
         ucs_warn("cxi TAG_EAGER_MAX=%zu exceeds the %u bytes that min_free can "
@@ -389,14 +335,16 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     }
     uct_cxi_iface_size_tag_ring(self, config, byte_credits);
 
-    /* Unexpected messages at once: each one the windows allow in the overflow
-     * list holds at least an eager message's slots until reported; with small
-     * windows, a receive per message is the most there are. */
+    /*
+     * Unexpected messages at once: bounded by the windows (an eager message's
+     * slots each) and, if small, by a receive per message.
+     */
     self->tag.unexp_max = ucs_max(self->tag.max_outstanding,
                                   slot_credits / UCT_CXI_FC_SLOTS_TAG_EAGER);
     if (self->tag.unexp_max > UCT_CXI_TAG_UNEXP_MAX_LIMIT) {
         ucs_warn("cxi TAG wants room for %zu unexpected messages, limited to "
-                 "%u", self->tag.unexp_max, UCT_CXI_TAG_UNEXP_MAX_LIMIT);
+                 "%u",
+                 self->tag.unexp_max, UCT_CXI_TAG_UNEXP_MAX_LIMIT);
         self->tag.unexp_max = UCT_CXI_TAG_UNEXP_MAX_LIMIT;
     }
 
@@ -407,7 +355,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         return UCS_ERR_NO_MEMORY;
     }
     self->tag.free_list = ucs_malloc(self->tag.max_outstanding *
-                                     sizeof(*self->tag.free_list),
+                                             sizeof(*self->tag.free_list),
                                      "cxi-tag-free-list");
     if (self->tag.free_list == NULL) {
         status = UCS_ERR_NO_MEMORY;
@@ -427,13 +375,14 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     }
 
     /* The posted receives that can still take an unexpected message. */
-    self->tag.pend     = ucs_calloc(UCT_CXI_TAG_PEND_SIZE,
-                                    sizeof(*self->tag.pend), "cxi-tag-pend");
+    self->tag.pend = ucs_calloc(UCT_CXI_TAG_PEND_SIZE, sizeof(*self->tag.pend),
+                                "cxi-tag-pend");
     self->tag.slot_pos = ucs_calloc(self->tag.max_outstanding,
                                     sizeof(*self->tag.slot_pos),
                                     "cxi-tag-slot-pos");
-    self->tag.fences   = ucs_calloc(UCT_CXI_TAG_PEND_SIZE,
-                                    sizeof(*self->tag.fences), "cxi-tag-fences");
+
+    self->tag.fences = ucs_calloc(UCT_CXI_TAG_PEND_SIZE,
+                                  sizeof(*self->tag.fences), "cxi-tag-fences");
     if ((self->tag.pend == NULL) || (self->tag.slot_pos == NULL) ||
         (self->tag.fences == NULL)) {
         status = UCS_ERR_NO_MEMORY;
@@ -441,8 +390,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     }
     self->tag.fence_interval = ucs_max(config->tag_fence_interval, 1u);
 
-    /* Per-peer unexpected-rndv header cache -- see uct_cxi_rndv_peer_hdr_t
-     * in cxi_iface.h. Growable, starts empty; never fails to init. */
+    /* Per-peer unexpected-rndv header cache (uct_cxi_rndv_peer_hdr_t). */
     kh_init_inplace(uct_cxi_rndv_peer_hash, &self->tag.rndv_peer_cache);
     kh_init_inplace(uct_cxi_eager_pair_hash, &self->tag.eager_pairs);
     if (kh_resize(uct_cxi_eager_pair_hash, &self->tag.eager_pairs,
@@ -455,53 +403,41 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
 
     /* Pool of software-issued rendezvous Gets (uct_cxi_rdzv_get_op_t), capped
      * like max_outstanding. */
-    {
-        ucs_mpool_params_t mp_params;
-        unsigned           grow = ucs_min(64u, self->tag.max_outstanding);
-
-        ucs_mpool_params_reset(&mp_params);
-        mp_params.elem_size       = sizeof(uct_cxi_rdzv_get_op_t);
-        mp_params.elems_per_chunk = ucs_max(grow, 1u);
-        mp_params.max_elems       = self->tag.max_outstanding;
-        mp_params.ops             = &uct_cxi_tag_host_mpool_ops;
-        mp_params.name            = "cxi-tag-rdzv-get-op";
-        status = ucs_mpool_init(&mp_params, &self->tag.rdzv_get_op_pool);
-        if (status != UCS_OK) {
-            goto err_free_rndv_peer_cache;
-        }
+    ucs_mpool_params_reset(&mp_params);
+    mp_params.elem_size       = sizeof(uct_cxi_rdzv_get_op_t);
+    mp_params.elems_per_chunk = ucs_max(ucs_min(64u, self->tag.max_outstanding),
+                                        1u);
+    mp_params.max_elems       = self->tag.max_outstanding;
+    mp_params.ops             = &uct_cxi_host_mpool_ops;
+    mp_params.name            = "cxi-tag-rdzv-get-op";
+    status = ucs_mpool_init(&mp_params, &self->tag.rdzv_get_op_pool);
+    if (status != UCS_OK) {
+        goto err_free_rndv_peer_cache;
     }
 
-    /* Unexpected messages held before they are reported -- see
-     * uct_cxi_unexp_report_t in cxi_tag.h. */
     status = uct_cxi_iface_tag_unexp_init(self, lni);
     if (status != UCS_OK) {
         goto err_cleanup_rdzv_get_op_pool;
     }
 
-    /* Overflow ring: one contiguous allocation, single cxil_map -- same
-     * shape as am.rx_base/am.rx_mh. */
-    {
-        size_t total = (size_t)self->tag.num_bufs * self->tag.buf_size;
-
-        ret = ucs_posix_memalign((void **)&self->tag.rx_base,
-                                 ucs_get_page_size(), total,
-                                 "cxi-tag-rx-buf");
-        if (ret != 0) {
-            status = UCS_ERR_NO_MEMORY;
-            goto err_free_rndv_peer_cache;
-        }
-        status = uct_cxi_do_map(lni, self->tag.rx_base, total,
-                                UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
-                                &self->tag.rx_mh);
-        if (status != UCS_OK) {
-            ucs_free(self->tag.rx_base);
-            self->tag.rx_base = NULL;
-            goto err_free_rndv_peer_cache;
-        }
+    /* Overflow ring: one allocation, one cxil_map, as for the AM ring. */
+    total = (size_t)self->tag.num_bufs * self->tag.buf_size;
+    ret   = ucs_posix_memalign((void**)&self->tag.rx_base, ucs_get_page_size(),
+                               total, "cxi-tag-rx-buf");
+    if (ret != 0) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_free_rndv_peer_cache;
+    }
+    status = uct_cxi_do_map(lni, self->tag.rx_base, total,
+                            UCT_DMABUF_FD_INVALID, 0, UCS_MEMORY_TYPE_HOST,
+                            &self->tag.rx_mh);
+    if (status != UCS_OK) {
+        ucs_free(self->tag.rx_base);
+        self->tag.rx_base = NULL;
+        goto err_free_rndv_peer_cache;
     }
 
-    /* One ref-count/repost-pending slot per overflow buffer generation --
-     * see cxi_iface.h's doc comment on ovf_refcnt. */
+    /* One ref-count/repost-pending slot per overflow buffer. */
     self->tag.ovf_refcnt = ucs_calloc(self->tag.num_bufs,
                                       sizeof(*self->tag.ovf_refcnt),
                                       "cxi-tag-ovf-refcnt");
@@ -517,14 +453,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         goto err_free_ovf_refcnt;
     }
 
-    {
-        struct cxi_pt_alloc_opts pt_opts = {
-            .is_matching    = 1,
-            .use_long_event = 1,
-            .en_flowctrl    = 1
-        };
-        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->tag.pte);
-    }
+    ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->tag.pte);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte TAG: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -533,8 +462,8 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
     self->tag.ptn = self->tag.pte->ptn;
     uct_cxi_iface_tag_init_recv_le(self);
 
-    ret = cxil_map_pte(self->tag.pte, self->domain, (int)UCT_CXI_PTE_TAG,
-                       false, &self->tag.pte_map);
+    ret = cxil_map_pte(self->tag.pte, self->domain, (int)UCT_CXI_PTE_TAG, false,
+                       &self->tag.pte_map);
     if (ret != 0) {
         ucs_error("cxi cxil_map_pte TAG: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -546,8 +475,7 @@ uct_cxi_iface_open_tag_pte(uct_cxi_iface_t *self, struct cxil_lni *lni,
         goto err_unmap_pte;
     }
 
-    /* Post all overflow-ring buffers -- priority LEs are posted purely
-     * on-demand, one per uct_iface_tag_recv_zcopy() call, never up front. */
+    /* Priority LEs are posted per uct_iface_tag_recv_zcopy(), not up front. */
     for (i = 0; i < self->tag.num_bufs; i++) {
         status = uct_cxi_iface_post_tag_ovf_le(self, (int)i, 0);
         if (status != UCS_OK) {
@@ -643,22 +571,21 @@ void uct_cxi_iface_close_tag_pte(uct_cxi_iface_t *self)
 }
 
 
-/* The address table (iface->rdzv.addr_table): one registered slot per 8-bit
- * rendezvous id, so a peer's read never falls outside it. LAC 0, as the RMA PTE
- * it is read through. */
+/*
+ * The address table (iface->rdzv.addr_table): one registered slot per 8-bit
+ * rendezvous id, in LAC 0 as the RMA PTE it is read through.
+ */
 static ucs_status_t
 uct_cxi_iface_rdzv_table_init(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
-    size_t       page = ucs_get_page_size();
-    size_t       len  = ucs_align_up(UCT_CXI_RDZV_MAX_OUTSTANDING_MAX *
-                                     sizeof(uint64_t), page);
+    size_t page = ucs_get_page_size();
+    size_t len  = ucs_align_up(UCT_CXI_RDZV_MAX_OUTSTANDING_MAX *
+                                       sizeof(uint64_t),
+                               page);
     ucs_status_t status;
-    int          ret;
+    int ret;
 
-    self->rdzv.addr_table     = NULL;
-    self->rdzv.addr_table_len = 0;
-
-    ret = ucs_posix_memalign((void **)&self->rdzv.addr_table, page, len,
+    ret = ucs_posix_memalign((void**)&self->rdzv.addr_table, page, len,
                              "cxi-rdzv-addr-table");
     if (ret != 0) {
         self->rdzv.addr_table = NULL;
@@ -698,37 +625,41 @@ static void uct_cxi_iface_rdzv_table_cleanup(uct_cxi_iface_t *self)
 
     uct_cxi_do_unmap(&self->rdzv.addr_table_mh);
     ucs_free(self->rdzv.addr_table);
-    self->rdzv.addr_table     = NULL;
-    self->rdzv.addr_table_len = 0;
+    self->rdzv.addr_table = NULL;
 }
 
 /*
  * Open the rendezvous source-exposure PTE: matching mode, one persistent
- * wildcard LE over the whole address range, as libfabric's default rendezvous
- * source PTE. Matching mode only puts the Get on the wire format that carries
- * match_bits, for O(1) id correlation (see uct_cxi_rdzv_op_t). op_get only: it
- * is never Put to. LAC 0, opened only when tag offload is enabled.
+ * wildcard LE over the whole address range (as libfabric). Matching mode puts
+ * the Get on the wire format with match_bits, for O(1) id correlation. Opened
+ * only with tag offload.
  */
-ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
-                                         struct cxil_lni *lni)
+ucs_status_t
+uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self, struct cxil_lni *lni)
 {
-    uct_cxi_md_t              *md = uct_cxi_iface_md(self);
-    ucs_status_t               status;
-    int                        ret;
-    uint32_t                   i;
+    uct_cxi_md_t *md                 = uct_cxi_iface_md(self);
+    struct cxi_pt_alloc_opts pt_opts = {
+        .is_matching = 1,
+        .en_flowctrl = 1
+    };
+    struct c_target_cmd le           = {};
+    ucs_status_t status;
+    uint32_t i;
+    int ret;
 
     memset(&self->rdzv, 0, sizeof(self->rdzv));
     self->rdzv.ptn = -1;
 
     self->rdzv.max_outstanding = ucs_min(self->tag.max_outstanding,
                                          UCT_CXI_RDZV_MAX_OUTSTANDING_MAX);
+
     self->rdzv.ops = ucs_calloc(self->rdzv.max_outstanding,
-                               sizeof(*self->rdzv.ops), "cxi-rdzv-ops");
+                                sizeof(*self->rdzv.ops), "cxi-rdzv-ops");
     if (self->rdzv.ops == NULL) {
         return UCS_ERR_NO_MEMORY;
     }
     self->rdzv.free_ids = ucs_malloc(self->rdzv.max_outstanding *
-                                     sizeof(*self->rdzv.free_ids),
+                                             sizeof(*self->rdzv.free_ids),
                                      "cxi-rdzv-free-ids");
     if (self->rdzv.free_ids == NULL) {
         status = UCS_ERR_NO_MEMORY;
@@ -744,13 +675,7 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         goto err_free_ids;
     }
 
-    {
-        struct cxi_pt_alloc_opts pt_opts = {
-            .is_matching = 1,
-            .en_flowctrl = 1
-        };
-        ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->rdzv.pte);
-    }
+    ret = cxil_alloc_pte(lni, self->rx_eq.evtq, &pt_opts, &self->rdzv.pte);
     if (ret != 0) {
         ucs_error("cxi cxil_alloc_pte RDZV: %s", strerror(-ret));
         status = UCS_ERR_IO_ERROR;
@@ -758,10 +683,10 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
     }
     self->rdzv.ptn = self->rdzv.pte->ptn;
 
-    /* pid_idx must be the device's rdzv_get_idx: a NIC-auto-issued rendezvous
-     * Get targets that fixed value (anything else gives C_RC_PTLTE_NOT_FOUND).
-     * Unlike every other PTE here software does not choose it; libfabric reads
-     * the same field. */
+    /*
+     * pid_idx must be the device's rdzv_get_idx: the NIC's auto-issued
+     * rendezvous Get targets that fixed value.
+     */
     ret = cxil_map_pte(self->rdzv.pte, self->domain,
                        (int)md->cxi_dev->info.rdzv_get_idx, false,
                        &self->rdzv.pte_map);
@@ -776,37 +701,28 @@ ucs_status_t uct_cxi_iface_open_rdzv_pte(uct_cxi_iface_t *self,
         goto err_unmap_pte;
     }
 
-    /* The whole-LAC catch-all LE: fully wildcarded and unrestricted-flavored
-     * (unrestricted_body_ro/end_ro), as libfabric's default one. */
-    {
-        struct c_target_cmd le = {};
-        le.command.opcode        = C_CMD_TGT_APPEND;
-        le.ptl_list              = C_PTL_LIST_PRIORITY;
-        le.ptlte_index           = self->rdzv.pte->ptn;
-        le.op_put                = 0;
-        le.op_get                = 1;
-        le.unrestricted_body_ro  = 1;
-        le.unrestricted_end_ro   = 1;
-        le.event_link_disable    = 1;
-        le.event_unlink_disable  = 1;
-        le.lac                   = 0;
-        le.start                 = 0;
-        le.length                = (1ULL << 56) - 1;
-        le.match_id              = CXI_MATCH_ID_ANY; /* accept any initiator
-                                                      * (the zero default
-                                                      * matches one bogus
-                                                      * identity) */
-        le.match_bits            = 0;
-        le.ignore_bits           = UINT64_MAX;
+    /* The whole-LAC catch-all LE: fully wildcarded and unrestricted-flavored,
+     * as libfabric's default one. match_id must be ANY, as zero matches one
+     * bogus initiator. */
+    le.command.opcode       = C_CMD_TGT_APPEND;
+    le.ptl_list             = C_PTL_LIST_PRIORITY;
+    le.ptlte_index          = self->rdzv.pte->ptn;
+    le.op_get               = 1;
+    le.unrestricted_body_ro = 1;
+    le.unrestricted_end_ro  = 1;
+    le.event_link_disable   = 1;
+    le.event_unlink_disable = 1;
+    le.length               = (1ULL << 56) - 1;
+    le.match_id             = CXI_MATCH_ID_ANY;
+    le.ignore_bits          = UINT64_MAX;
 
-        ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
-        if (ret != 0) {
-            ucs_error("cxi RDZV APPEND LE: %d", ret);
-            status = UCS_ERR_IO_ERROR;
-            goto err_unmap_pte;
-        }
-        cxi_cq_ring(self->tgt.cmdq);
+    ret = cxi_cq_emit_target(self->tgt.cmdq, &le);
+    if (ret != 0) {
+        ucs_error("cxi RDZV APPEND LE: %d", ret);
+        status = UCS_ERR_IO_ERROR;
+        goto err_unmap_pte;
     }
+    cxi_cq_ring(self->tgt.cmdq);
 
     self->rdzv.enabled = 1;
     ucs_debug("cxi RDZV PTE ptn %u enabled", self->rdzv.pte->ptn);

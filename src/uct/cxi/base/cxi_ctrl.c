@@ -26,17 +26,6 @@
 /* Built with the flow control, its only client (see Makefile.am). */
 #ifndef UCT_CXI_DISABLE_FC
 
-/* Plain host memory: control requests and handshake records are only ever read
- * by software. */
-ucs_mpool_ops_t uct_cxi_host_mpool_ops = {
-    .chunk_alloc   = ucs_mpool_chunk_malloc,
-    .chunk_release = ucs_mpool_chunk_free,
-    .obj_init      = NULL,
-    .obj_cleanup   = NULL,
-    .obj_str       = NULL
-};
-
-
 /* Allocate and enable the control PTE, and post its one list entry. */
 static ucs_status_t
 uct_cxi_ctrl_open_pte(uct_cxi_iface_t *iface, struct cxil_lni *lni)
